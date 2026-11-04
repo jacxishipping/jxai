@@ -332,6 +332,25 @@ int main(int argc, char* argv[]) {
         return 0;
     }
 
+    if (mode == "tok-debug") {
+        std::string inspect_path = (argc > 2) ? argv[2] : "models/test_qwen.gguf";
+        std::string text = (argc > 3) ? argv[3] : "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\nWhat is 2 + 2?<|im_end|>\n<|im_start|>assistant\n";
+        MoETransformerEngine eng;
+        std::string err;
+        if (!eng.load_model(inspect_path, err)) {
+            std::cerr << "Failed to load model: " << err << "\n";
+            return 1;
+        }
+        const auto& tok = eng.tokenizer();
+        auto enc = tok.encode(text, false);
+        std::cout << "Encoded " << enc.size() << " tokens:\n";
+        for (uint32_t t : enc) {
+            std::cout << "  [" << t << "] '" << tok.decode_token_raw(t) << "'\n";
+        }
+        std::cout << "Decoded: " << tok.decode(enc) << "\n";
+        return 0;
+    }
+
     std::string model_path = "models/qwen2moe_stream_q4.gguf";
     std::string prompt = "Explain the MoE streaming and PILOT prefetch architecture.";
     bool has_cli_prompt = false;

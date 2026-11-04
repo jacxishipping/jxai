@@ -59,32 +59,60 @@ void MoETransformerEngine::rms_norm(float* out, const float* x, const float* wei
 void MoETransformerEngine::apply_rope(
     float* q, float* k,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
-    uint32_t pos, float freq_base, float yarn_scale
+    uint32_t pos, float freq_base, float yarn_scale, bool is_neox
 ) {
     uint32_t rdim = std::min(head_dim, rope_dim);
     float pos_scaled = static_cast<float>(pos) / std::max(1e-4f, yarn_scale);
 
-    for (uint32_t d = 0; d + 1 < rdim; d += 2) {
-        float freq = 1.0f / std::pow(freq_base, static_cast<float>(d) / static_cast<float>(rdim));
-        float angle = pos_scaled * freq;
-        float cos_a = std::cos(angle);
-        float sin_a = std::sin(angle);
+    if (is_neox) {
+        uint32_t half = rdim / 2;
+        for (uint32_t d = 0; d < half; ++d) {
+            float freq = 1.0f / std::pow(freq_base, (2.0f * static_cast<float>(d)) / static_cast<float>(rdim));
+            float angle = pos_scaled * freq;
+            float cos_a = std::cos(angle);
+            float sin_a = std::sin(angle);
 
-        for (uint32_t h = 0; h < n_heads; ++h) {
-            float* qh = q + h * head_dim + d;
-            float q0 = qh[0];
-            float q1 = qh[1];
-            qh[0] = q0 * cos_a - q1 * sin_a;
-            qh[1] = q0 * sin_a + q1 * cos_a;
+            for (uint32_t h = 0; h < n_heads; ++h) {
+                float* qh = q + h * head_dim;
+                float q0 = qh[d];
+                float q1 = qh[d + half];
+                qh[d]        = q0 * cos_a - q1 * sin_a;
+                qh[d + half] = q0 * sin_a + q1 * cos_a;
+            }
+
+            if (k) {
+                for (uint32_t h = 0; h < n_kv_heads; ++h) {
+                    float* kh = k + h * head_dim;
+                    float k0 = kh[d];
+                    float k1 = kh[d + half];
+                    kh[d]        = k0 * cos_a - k1 * sin_a;
+                    kh[d + half] = k0 * sin_a + k1 * cos_a;
+                }
+            }
         }
+    } else {
+        for (uint32_t d = 0; d + 1 < rdim; d += 2) {
+            float freq = 1.0f / std::pow(freq_base, static_cast<float>(d) / static_cast<float>(rdim));
+            float angle = pos_scaled * freq;
+            float cos_a = std::cos(angle);
+            float sin_a = std::sin(angle);
 
-        if (k) {
-            for (uint32_t h = 0; h < n_kv_heads; ++h) {
-                float* kh = k + h * head_dim + d;
-                float k0 = kh[0];
-                float k1 = kh[1];
-                kh[0] = k0 * cos_a - k1 * sin_a;
-                kh[1] = k0 * sin_a + k1 * cos_a;
+            for (uint32_t h = 0; h < n_heads; ++h) {
+                float* qh = q + h * head_dim + d;
+                float q0 = qh[0];
+                float q1 = qh[1];
+                qh[0] = q0 * cos_a - q1 * sin_a;
+                qh[1] = q0 * sin_a + q1 * cos_a;
+            }
+
+            if (k) {
+                for (uint32_t h = 0; h < n_kv_heads; ++h) {
+                    float* kh = k + h * head_dim + d;
+                    float k0 = kh[0];
+                    float k1 = kh[1];
+                    kh[0] = k0 * cos_a - k1 * sin_a;
+                    kh[1] = k0 * sin_a + k1 * cos_a;
+                }
             }
         }
     }
@@ -374,10 +402,13 @@ std::vector<float> MoETransformerEngine::forward_token(
 
         // 4. Rotary Position Embeddings (RoPE / YaRN) & KV-Cache Append
         double ta0 = now_ms();
+        bool is_neox = (hp_.arch == "qwen2" || hp_.arch == "qwen2moe" || hp_.arch == "olmoe" ||
+                        hp_.arch == "phi" || hp_.arch == "deepseek" || hp_.arch == "deepseek2" ||
+                        hp_.arch == "glm" || hp_.arch == "gptneox");
         apply_rope(
             q.data(), k.data(),
             hp_.n_heads, hp_.n_kv_heads, hp_.head_dim, hp_.rope_dim,
-            pos, hp_.rope_freq_base, hp_.yarn_scale
+            pos, hp_.rope_freq_base, hp_.yarn_scale, is_neox
         );
 
         float* k_slot = slot.k_cache[l].data() + static_cast<size_t>(pos) * kv_dim;
@@ -706,6 +737,11 @@ void MoETransformerEngine::generate_stream(
     }
 
     if (!continue_assistant || !has_existing_context) {
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx_);
+            get_or_create_slot(slot_id).clear();
+        }
+
         std::string prompt_to_encode = prompt;
         if (prompt_to_encode.find("<|im_start|>") == std::string::npos &&
             prompt_to_encode.find("<|user|>") == std::string::npos &&
@@ -713,7 +749,7 @@ void MoETransformerEngine::generate_stream(
             if (hp_.arch == "olmoe" || tokenizer_.token_to_id("<|user|>") >= 0) {
                 prompt_to_encode = "<|user|>\n" + prompt_to_encode + "\n<|assistant|>\n";
             } else if (hp_.arch == "qwen2" || tokenizer_.token_to_id("<|im_start|>") >= 0) {
-                prompt_to_encode = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + prompt_to_encode + "<|im_end|>\n<|im_start|>assistant\n";
+                prompt_to_encode = "<|im_start|>system\nYou are a helpful assistant. Please answer concisely in English.<|im_end|>\n<|im_start|>user\n" + prompt_to_encode + "<|im_end|>\n<|im_start|>assistant\n";
             }
         }
 
@@ -757,7 +793,7 @@ void MoETransformerEngine::generate_stream(
 
         uint32_t next_id = sample_next_token(logits, hist, sampler_cfg);
         if (next_id == tokenizer_.eos_id() || next_id == tokenizer_.im_end_id() ||
-            next_id == 50279 || next_id == 50280 || next_id == 151645) {
+            next_id == 50279 || next_id == 50280 || next_id == 151645 || next_id == 151643) {
             break;
         }
 

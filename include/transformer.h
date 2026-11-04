@@ -110,7 +110,7 @@ public:
     static void apply_rope(
         float* q, float* k,
         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
-        uint32_t pos, float freq_base, float yarn_scale = 1.0f
+        uint32_t pos, float freq_base, float yarn_scale = 1.0f, bool is_neox = true
     );
     static void softmax(float* x, int64_t size);
     static float silu(float x) { return x / (1.0f + std::exp(-x)); }
