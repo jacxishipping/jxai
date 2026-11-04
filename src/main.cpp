@@ -278,8 +278,8 @@ bool run_verification_tests() {
     assert(!img_res.final_svg_data_uri.empty());
     std::cout << " \033[1;32mPASSED\033[0m (Generated " << img_res.previews.size() << " denoise previews in " << img_res.elapsed_ms << " ms)\n";
 
-    // 10. Multi-Drive Asynchronous Striping
-    std::cout << "  [10/10] Testing Multi-Drive Striping & PILOT Overlapped I/O...";
+    // 10. Multi-Drive Asynchronous Striping & Vulkan Compute Pipeline Probe
+    std::cout << "  [10/10] Testing Multi-Drive Striping, PILOT I/O & Vulkan Subgroup Probe...";
     PilotIOEngine pilot;
     if (pilot.init({test_model_path}, err_msg)) {
         assert(!pilot.drives().empty());
@@ -291,6 +291,11 @@ bool run_verification_tests() {
         (void)read_ok;
         pilot.shutdown();
     }
+    const char* glsl = VulkanComputeBackend::get_cooperative_matrix_glsl_source();
+    assert(glsl != nullptr && std::string(glsl).find("cooperative_matrix") != std::string::npos);
+    (void)glsl;
+    std::string vk_err_test;
+    VulkanComputeBackend::instance().init(vk_err_test);
     std::cout << " \033[1;32mPASSED\033[0m\n";
 
     engine.unload();

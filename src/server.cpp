@@ -13,6 +13,7 @@
 #endif
 
 #include "server.h"
+#include "vulkan_backend.h"
 #include <fstream>
 #include <sstream>
 #include <thread>
@@ -409,7 +410,9 @@ void HttpServer::handle_client(uintptr_t client_sock) {
            << "\"avail_ram_bytes\":" << hw.avail_ram_bytes << ","
            << "\"vram_budget_bytes\":" << hw.vram_budget_bytes << ","
            << "\"bypass_io\":" << (io.bypass_io_supported() ? "true" : "false") << ","
-           << "\"direct_dma\":" << (io.direct_dma_active() ? "true" : "false")
+           << "\"direct_dma\":" << (io.direct_dma_active() ? "true" : "false") << ","
+           << "\"vulkan_available\":" << (moe::VulkanComputeBackend::instance().is_available() ? "true" : "false") << ","
+           << "\"vulkan_device\":\"" << json_escape(moe::VulkanComputeBackend::instance().device_info().device_name) << "\""
            << "},"
            << "\"tiers\":{"
            << "\"vram_experts\":" << tm.vram_resident_count() << ","

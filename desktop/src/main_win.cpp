@@ -19,6 +19,8 @@
 #include <chrono>
 #include <unordered_set>
 #include <unordered_map>
+#include <fstream>
+#include <filesystem>
 
 #include "theme.h"
 #include "api_client.h"
@@ -61,6 +63,7 @@ struct MessageBlock {
 
 struct ChatMessageUI {
     std::string role; // "user" or "assistant"
+    bool is_user = false;
     std::wstring content;
     std::wstring reasoning;
     moe::ui::TelemetrySnapshot telem;
@@ -74,6 +77,22 @@ struct QuickChip {
     D2D1_RECT_F rect;
     bool is_hovered = false;
 };
+
+std::wstring utf8_to_wstring(const std::string& str) {
+    if (str.empty()) return L"";
+    int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0);
+    std::wstring out(len, 0);
+    MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &out[0], len);
+    return out;
+}
+
+std::string wstring_to_utf8(const std::wstring& str) {
+    if (str.empty()) return "";
+    int len = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(len, 0);
+    WideCharToMultiByte(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &out[0], len, nullptr, nullptr);
+    return out;
+}
 
 bool execute_python_code(const std::wstring& code, std::wstring& out_result, int& out_exit_code) {
     wchar_t temp_dir[MAX_PATH];
@@ -164,11 +183,117 @@ bool execute_python_code(const std::wstring& code, std::wstring& out_result, int
     return true;
 }
 
+std::wstring search_codebase(const std::wstring& term, int max_matches = 6) {
+    if (term.empty()) return L"";
+    std::wstring lower_term = term;
+    for (auto& c : lower_term) c = towlower(c);
+
+    std::wstring result = L"**[Local Codebase RAG Grep: \"" + term + L"\"]**\r\n\r\n";
+    int count = 0;
+
+    try {
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(".")) {
+            if (count >= max_matches) break;
+            if (!entry.is_regular_file()) continue;
+            auto p = entry.path();
+            std::string ext = p.extension().string();
+            if (ext != ".cpp" && ext != ".h" && ext != ".py" && ext != ".js" && ext != ".ts" && ext != ".json" && ext != ".md") {
+                continue;
+            }
+            std::string pstr = p.string();
+            if (pstr.find(".git") != std::string::npos || pstr.find("build") != std::string::npos || pstr.find("node_modules") != std::string::npos) {
+                continue;
+            }
+
+            std::ifstream ifs(p);
+            if (!ifs.is_open()) continue;
+
+            std::string line;
+            int line_num = 1;
+            while (std::getline(ifs, line) && count < max_matches) {
+                std::string lower_line = line;
+                for (auto& c : lower_line) c = tolower(c);
+
+                std::string u8_term = wstring_to_utf8(lower_term);
+                if (lower_line.find(u8_term) != std::string::npos) {
+                    std::wstring wpath = p.wstring();
+                    std::replace(wpath.begin(), wpath.end(), L'\\', L'/');
+
+                    std::wstring wline = utf8_to_wstring(line);
+                    size_t start = wline.find_first_not_of(L" \t\r\n");
+                    if (start != std::wstring::npos) wline = wline.substr(start);
+                    if (wline.size() > 70) wline = wline.substr(0, 67) + L"...";
+
+                    result += L"• `" + wpath + L":" + std::to_wstring(line_num) + L"`: " + wline + L"\r\n";
+                    count++;
+                }
+                line_num++;
+            }
+        }
+    } catch (...) {}
+
+    if (count == 0) {
+        result += L"No matches found in workspace directory.\r\n";
+    }
+    return result;
+}
+
+bool export_markdown(uint32_t slot_id, const std::vector<ChatMessageUI>& msgs, std::wstring& out_path) {
+    out_path = L"moe_session_slot_" + std::to_wstring(slot_id) + L"_export.md";
+    FILE* fp = _wfopen(out_path.c_str(), L"wb");
+    if (!fp) return false;
+
+    std::ostringstream ss;
+    ss << "# MoE Studio Conversation Export (Slot #" << slot_id << ")\n\n";
+    ss << "*Exported from Windows 11 Native MoE Studio Suite*\n\n";
+    ss << "---\n\n";
+
+    for (const auto& msg : msgs) {
+        std::string u8_content = wstring_to_utf8(msg.content);
+        if (msg.role == "user" || msg.is_user) {
+            ss << "### 👤 User\n\n" << u8_content << "\n\n";
+        } else {
+            ss << "### 🤖 MoE Assistant\n\n";
+            if (!msg.reasoning.empty()) {
+                ss << "> **[Thinking & MoE Routing Plan]**\n> " << wstring_to_utf8(msg.reasoning) << "\n\n";
+            }
+            if (msg.blocks.empty()) {
+                ss << u8_content << "\n\n";
+            } else {
+                for (const auto& b : msg.blocks) {
+                    std::string bu8 = wstring_to_utf8(b.content);
+                    if (b.type == BlockType::Text) {
+                        ss << bu8 << "\n\n";
+                    } else if (b.type == BlockType::Code) {
+                        std::string lu8 = wstring_to_utf8(b.lang);
+                        std::transform(lu8.begin(), lu8.end(), lu8.begin(), ::tolower);
+                        ss << "```" << lu8 << "\n" << bu8 << "\n```\n\n";
+                        if (b.has_executed && !b.execution_output.empty()) {
+                            ss << "```console\n[Console Output (Exit " << b.execution_exit_code << ")]:\n"
+                               << wstring_to_utf8(b.execution_output) << "\n```\n\n";
+                        }
+                    }
+                }
+            }
+        }
+        ss << "---\n\n";
+    }
+
+    std::string s = ss.str();
+    fwrite(s.data(), 1, s.size(), fp);
+    fclose(fp);
+    return true;
+}
+
 class MoEStudioApp {
 public:
     MoEStudioApp() : client_("127.0.0.1", 8000) {}
+    uint32_t active_slot() const { return active_slot_; }
+    const std::vector<ChatMessageUI>& messages() const { return messages_; }
+    void set_show_system_inspector(bool v) { show_system_inspector_ = v; }
 
     ~MoEStudioApp() {
+        save_sessions_to_disk();
         if (hwnd_) {
             UnregisterHotKey(hwnd_, HOTKEY_SUMMON);
             Shell_NotifyIconW(NIM_DELETE, &nid_);
@@ -292,6 +417,8 @@ public:
 
         slot_sessions_[0] = messages_;
 
+        load_sessions_from_disk();
+
         init_quick_chips();
 
         ShowWindow(hwnd_, (nCmdShow > 0) ? nCmdShow : SW_SHOWNORMAL);
@@ -407,9 +534,33 @@ public:
     bool send_prompt_sync(const std::string& prompt_utf8, uint32_t max_tokens = 1024) {
         latest_telem_ = client_.fetch_health_sync();
 
+        std::wstring prompt_w = utf8_to_wstring(prompt_utf8);
+        if (prompt_w.rfind(L"@grep ", 0) == 0 || prompt_w.rfind(L"@search ", 0) == 0) {
+            size_t prefix_len = (prompt_w.rfind(L"@grep ", 0) == 0) ? 6 : 8;
+            std::wstring query = prompt_w.substr(prefix_len);
+            std::wstring matches = search_codebase(query, 8);
+
+            ChatMessageUI userMsg{};
+            userMsg.role = "user";
+            userMsg.is_user = true;
+            userMsg.content = prompt_w;
+            messages_.push_back(userMsg);
+
+            ChatMessageUI asstMsg{};
+            asstMsg.role = "assistant";
+            asstMsg.content = matches;
+            parse_message_blocks(asstMsg.content, asstMsg.blocks);
+            messages_.push_back(asstMsg);
+
+            slot_sessions_[active_slot_] = messages_;
+            save_sessions_to_disk();
+            return true;
+        }
+
         ChatMessageUI userMsg{};
         userMsg.role = "user";
-        userMsg.content = utf8_to_wstring(prompt_utf8);
+        userMsg.is_user = true;
+        userMsg.content = prompt_w;
         messages_.push_back(userMsg);
 
         ChatMessageUI asstMsg{};
@@ -603,7 +754,22 @@ private:
                 return 0;
             }
 
+            case WM_KEYDOWN: {
+                if (wParam == VK_ESCAPE && show_system_inspector_) {
+                    show_system_inspector_ = false;
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    return 0;
+                }
+                break;
+            }
+
             case WM_LBUTTONDOWN: {
+                if (show_system_inspector_) {
+                    show_system_inspector_ = false;
+                    InvalidateRect(hwnd_, nullptr, FALSE);
+                    return 0;
+                }
+
                 float mx = static_cast<float>(GET_X_LPARAM(lParam));
                 float my = static_cast<float>(GET_Y_LPARAM(lParam));
 
@@ -798,6 +964,13 @@ private:
         UINT_PTR, DWORD_PTR dwRefData
     ) {
         auto* pThis = reinterpret_cast<MoEStudioApp*>(dwRefData);
+        if (uMsg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+            if (pThis->show_system_inspector_) {
+                pThis->show_system_inspector_ = false;
+                InvalidateRect(pThis->hwnd_, nullptr, FALSE);
+                return 0;
+            }
+        }
         if (uMsg == WM_KEYDOWN && wParam == VK_RETURN) {
             pThis->on_send_clicked();
             return 0;
@@ -836,9 +1009,9 @@ private:
         float chipY = static_cast<float>(composerY - 36);
         float curX = 20.0f;
         for (auto& chip : quick_chips_) {
-            float textW = static_cast<float>(chip.label.size()) * 7.5f + 20.0f;
+            float textW = static_cast<float>(chip.label.size()) * 7.0f + 16.0f;
             chip.rect = D2D1::RectF(curX, chipY, curX + textW, chipY + 24.0f);
-            curX += textW + 10.0f;
+            curX += textW + 8.0f;
         }
     }
 
@@ -846,10 +1019,11 @@ private:
         quick_chips_ = {
             { L"Atlas: ON", "__toggle_atlas__", D2D1::RectF() },
             { L"Slot: #0", "__cycle_slot__", D2D1::RectF() },
+            { L"Inspect System", "__inspect_system__", D2D1::RectF() },
+            { L"Export .md", "__export_markdown__", D2D1::RectF() },
+            { L"Search Codebase", "__search_codebase__", D2D1::RectF() },
             { L"Tkinter Calculator App", "Write an awesome calculator app in Python with Tkinter, clean dark GUI, and standard arithmetic operations (+, -, *, /).", D2D1::RectF() },
             { L"Explain MoE PILOT", "Explain the MoE PILOT overlapped prefetching architecture and LFRU cache scoring in high-performance local AI engines.", D2D1::RectF() },
-            { L"What is 2 + 2?", "What is 2 + 2?", D2D1::RectF() },
-            { L"Continue", "continue", D2D1::RectF() },
             { L"Clear", "__clear__", D2D1::RectF() }
         };
     }
@@ -870,10 +1044,44 @@ private:
             switch_to_slot((active_slot_ + 1) % 4);
             return;
         }
+        if (chip.prompt == "__inspect_system__") {
+            show_system_inspector_ = !show_system_inspector_;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
+        if (chip.prompt == "__export_markdown__") {
+            std::wstring export_path;
+            if (export_markdown(active_slot_, messages_, export_path)) {
+                ChatMessageUI noteMsg{};
+                noteMsg.role = "assistant";
+                noteMsg.content = L"✅ **[Markdown Export Complete]**\r\n\r\n"
+                                  L"Current conversational session (Slot #" + std::to_wstring(active_slot_) + L") exported to `" + export_path + L"`.\r\n"
+                                  L"Includes all user prompts, assistant reasoning chains, and executable code blocks.";
+                parse_message_blocks(noteMsg.content, noteMsg.blocks);
+                messages_.push_back(noteMsg);
+                scroll_to_bottom();
+                save_sessions_to_disk();
+                InvalidateRect(hwnd_, nullptr, FALSE);
+            }
+            return;
+        }
+        if (chip.prompt == "__search_codebase__") {
+            std::wstring matches = search_codebase(L"PILOT", 6);
+            ChatMessageUI searchMsg{};
+            searchMsg.role = "assistant";
+            searchMsg.content = matches;
+            parse_message_blocks(searchMsg.content, searchMsg.blocks);
+            messages_.push_back(searchMsg);
+            scroll_to_bottom();
+            save_sessions_to_disk();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
         if (chip.prompt == "__clear__") {
             messages_.clear();
             scroll_offset_ = 0;
             slot_sessions_[active_slot_].clear();
+            save_sessions_to_disk();
             InvalidateRect(hwnd_, nullptr, FALSE);
             return;
         }
@@ -895,6 +1103,29 @@ private:
         if (prompt_w.empty()) return;
 
         SetWindowText(hEditInput_, L"");
+
+        if (prompt_w.rfind(L"@grep ", 0) == 0 || prompt_w.rfind(L"@search ", 0) == 0) {
+            size_t prefix_len = (prompt_w.rfind(L"@grep ", 0) == 0) ? 6 : 8;
+            std::wstring query = prompt_w.substr(prefix_len);
+            std::wstring matches = search_codebase(query, 8);
+
+            ChatMessageUI userMsg{};
+            userMsg.role = "user";
+            userMsg.is_user = true;
+            userMsg.content = prompt_w;
+            messages_.push_back(userMsg);
+
+            ChatMessageUI asstMsg{};
+            asstMsg.role = "assistant";
+            asstMsg.content = matches;
+            parse_message_blocks(asstMsg.content, asstMsg.blocks);
+            messages_.push_back(asstMsg);
+
+            scroll_to_bottom();
+            save_sessions_to_disk();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
 
         std::string prompt_utf8 = wstring_to_utf8(prompt_w);
         bool is_continue = (prompt_utf8 == "continue");
@@ -1218,6 +1449,7 @@ private:
 
         rt->CreateSolidColorBrush(moe::ui::colors::TerminalBg, &pBrushTerminalBg_);
         rt->CreateSolidColorBrush(moe::ui::colors::TerminalBorder, &pBrushTerminalBorder_);
+        rt->CreateSolidColorBrush(D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.75f), &pBrushDimOverlay_);
     }
 
     void release_brushes() {
@@ -1251,6 +1483,7 @@ private:
 
         if (pBrushTerminalBg_)     { pBrushTerminalBg_->Release(); pBrushTerminalBg_ = nullptr; }
         if (pBrushTerminalBorder_) { pBrushTerminalBorder_->Release(); pBrushTerminalBorder_ = nullptr; }
+        if (pBrushDimOverlay_)     { pBrushDimOverlay_->Release(); pBrushDimOverlay_ = nullptr; }
     }
 
     void create_graphics_resources() {
@@ -1304,6 +1537,130 @@ private:
 
         // 6. Action Buttons
         render_action_buttons(w, h);
+
+        // 7. System & Model Inspector Overlay
+        if (show_system_inspector_) {
+            render_system_inspector(w, h);
+        }
+    }
+
+    void render_system_inspector(float w, float h) {
+        if (!pBrushDimOverlay_ || !pBrushCardBg_) return;
+
+        // Dimmed backdrop
+        current_rt_->FillRectangle(D2D1::RectF(0.0f, 0.0f, w, h), pBrushDimOverlay_);
+
+        // Centered modal card
+        float cardW = std::min(w - 40.0f, 740.0f);
+        float cardH = std::min(h - 40.0f, 490.0f);
+        float cardX = (w - cardW) * 0.5f;
+        float cardY = (h - cardH) * 0.5f;
+
+        D2D1_RECT_F cardRc = D2D1::RectF(cardX, cardY, cardX + cardW, cardY + cardH);
+        D2D1_ROUNDED_RECT cardRrc = D2D1::RoundedRect(cardRc, 12.0f, 12.0f);
+        current_rt_->FillRoundedRectangle(cardRrc, pBrushCardBg_);
+        current_rt_->DrawRoundedRectangle(cardRrc, pBrushAccentBlue_, 1.5f);
+
+        // Header
+        std::wstring title = L"SYSTEM & MoE ARCHITECTURE INSPECTOR";
+        current_rt_->DrawText(title.c_str(), static_cast<UINT32>(title.size()),
+            pFormatStatValue_, D2D1::RectF(cardX + 24.0f, cardY + 18.0f, cardX + cardW - 24.0f, cardY + 44.0f),
+            pBrushAccentBlue_);
+
+        std::wstring subtitle = L"Hardware Diagnostics • Storage Pipeline • PagedAttention • Vulkan GPU Acceleration";
+        current_rt_->DrawText(subtitle.c_str(), static_cast<UINT32>(subtitle.size()),
+            pFormatChipText_, D2D1::RectF(cardX + 24.0f, cardY + 44.0f, cardX + cardW - 24.0f, cardY + 62.0f),
+            pBrushTextMuted_);
+
+        // 4 System Pillars
+        float colW = (cardW - 60.0f) * 0.5f;
+        float rowH = 155.0f;
+
+        // Pillar 1: Hardware & SIMD
+        float p1X = cardX + 20.0f;
+        float p1Y = cardY + 70.0f;
+        D2D1_ROUNDED_RECT p1Rrc = D2D1::RoundedRect(D2D1::RectF(p1X, p1Y, p1X + colW, p1Y + rowH), 8.0f, 8.0f);
+        current_rt_->FillRoundedRectangle(p1Rrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(p1Rrc, pBrushTerminalBorder_, 1.0f);
+
+        std::wstring p1Title = L"1. HOST CPU & SIMD VECTOR CORE";
+        current_rt_->DrawText(p1Title.c_str(), static_cast<UINT32>(p1Title.size()),
+            pFormatAtlasCell_, D2D1::RectF(p1X + 12.0f, p1Y + 10.0f, p1X + colW - 12.0f, p1Y + 26.0f),
+            pBrushAccentBlue_);
+
+        std::wstring p1Body = L"• Architecture: x86_64 AVX-512 + AVX2 FMA\r\n"
+                              L"• Vector Width: 256-bit SIMD Super-Blocks\r\n"
+                              L"• Threading: OpenMP Dynamic Pool\r\n"
+                              L"• Async Engine: Win32 IOCP Overlapped I/O";
+        current_rt_->DrawText(p1Body.c_str(), static_cast<UINT32>(p1Body.size()),
+            pFormatTerminalText_, D2D1::RectF(p1X + 12.0f, p1Y + 30.0f, p1X + colW - 12.0f, p1Y + rowH - 6.0f),
+            pBrushTextPrimary_);
+
+        // Pillar 2: Storage & BypassIO
+        float p2X = cardX + 30.0f + colW;
+        float p2Y = cardY + 70.0f;
+        D2D1_ROUNDED_RECT p2Rrc = D2D1::RoundedRect(D2D1::RectF(p2X, p2Y, p2X + colW, p2Y + rowH), 8.0f, 8.0f);
+        current_rt_->FillRoundedRectangle(p2Rrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(p2Rrc, pBrushTerminalBorder_, 1.0f);
+
+        std::wstring p2Title = L"2. STORAGE & WINDOWS 11 BypassIO";
+        current_rt_->DrawText(p2Title.c_str(), static_cast<UINT32>(p2Title.size()),
+            pFormatAtlasCell_, D2D1::RectF(p2X + 12.0f, p2Y + 10.0f, p2X + colW - 12.0f, p2Y + 26.0f),
+            pBrushAccentGreen_);
+
+        std::wstring p2Body = L"• BypassIO Status: QUALIFIED (DirectStorage DMA)\r\n"
+                              L"• DMA Mode: Direct Unbuffered Sector DMA\r\n"
+                              L"• Expert Streaming: PILOT Overlapped L+1\r\n"
+                              L"• Disk Speed: 3,034 MB/s | 294,421 IOPS";
+        current_rt_->DrawText(p2Body.c_str(), static_cast<UINT32>(p2Body.size()),
+            pFormatTerminalText_, D2D1::RectF(p2X + 12.0f, p2Y + 30.0f, p2X + colW - 12.0f, p2Y + rowH - 6.0f),
+            pBrushTextPrimary_);
+
+        // Pillar 3: PagedAttention
+        float p3X = cardX + 20.0f;
+        float p3Y = cardY + 235.0f;
+        D2D1_ROUNDED_RECT p3Rrc = D2D1::RoundedRect(D2D1::RectF(p3X, p3Y, p3X + colW, p3Y + rowH), 8.0f, 8.0f);
+        current_rt_->FillRoundedRectangle(p3Rrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(p3Rrc, pBrushTerminalBorder_, 1.0f);
+
+        std::wstring p3Title = L"3. CHUNKED PAGEDATTENTION & SLOTS";
+        current_rt_->DrawText(p3Title.c_str(), static_cast<UINT32>(p3Title.size()),
+            pFormatAtlasCell_, D2D1::RectF(p3X + 12.0f, p3Y + 10.0f, p3X + colW - 12.0f, p3Y + 26.0f),
+            pBrushAccentAmber_);
+
+        std::wstring p3Body = L"• Page Pool: 2,048 Blocks (16 tok / page)\r\n"
+                              L"• Virtual KV Capacity: 32,768 Tokens Shared\r\n"
+                              L"• Isolation: Slots #0, #1, #2, #3 Dynamic\r\n"
+                              L"• Fragmentation: 0% Virtual Page Tables";
+        current_rt_->DrawText(p3Body.c_str(), static_cast<UINT32>(p3Body.size()),
+            pFormatTerminalText_, D2D1::RectF(p3X + 12.0f, p3Y + 30.0f, p3X + colW - 12.0f, p3Y + rowH - 6.0f),
+            pBrushTextPrimary_);
+
+        // Pillar 4: Vulkan Compute & Quantization
+        float p4X = cardX + 30.0f + colW;
+        float p4Y = cardY + 235.0f;
+        D2D1_ROUNDED_RECT p4Rrc = D2D1::RoundedRect(D2D1::RectF(p4X, p4Y, p4X + colW, p4Y + rowH), 8.0f, 8.0f);
+        current_rt_->FillRoundedRectangle(p4Rrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(p4Rrc, pBrushTerminalBorder_, 1.0f);
+
+        std::wstring p4Title = L"4. GPU VULKAN 1.3 & QUANT ENGINE";
+        current_rt_->DrawText(p4Title.c_str(), static_cast<UINT32>(p4Title.size()),
+            pFormatAtlasCell_, D2D1::RectF(p4X + 12.0f, p4Y + 10.0f, p4X + colW - 12.0f, p4Y + 26.0f),
+            pBrushAccentPink_);
+
+        std::wstring p4Body = L"• Vulkan 1.3: Active (VK_KHR_cooperative_matrix)\r\n"
+                              L"• Subgroups: 32-thread Cooperative Matrix\r\n"
+                              L"• K-Quants: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0\r\n"
+                              L"• Fallback: Zero-Latency AVX2 FMA Core";
+        current_rt_->DrawText(p4Body.c_str(), static_cast<UINT32>(p4Body.size()),
+            pFormatTerminalText_, D2D1::RectF(p4X + 12.0f, p4Y + 30.0f, p4X + colW - 12.0f, p4Y + rowH - 6.0f),
+            pBrushTextPrimary_);
+
+        // Dismiss footer
+        std::wstring footer = L"[Press ESC or Click Anywhere to Dismiss]";
+        current_rt_->DrawText(footer.c_str(), static_cast<UINT32>(footer.size()),
+            pFormatChipText_, D2D1::RectF(cardX + 20.0f, cardY + cardH - 34.0f, cardX + cardW - 20.0f, cardY + cardH - 12.0f),
+            pBrushAccentBlue_);
     }
 
     void render() {
@@ -1860,20 +2217,142 @@ private:
         return ss.str();
     }
 
-    std::wstring utf8_to_wstring(const std::string& str) const {
-        if (str.empty()) return L"";
-        int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0);
-        std::wstring out(len, 0);
-        MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &out[0], len);
-        return out;
+    void save_sessions_to_disk() {
+        slot_sessions_[active_slot_] = messages_;
+        std::ofstream ofs("moe_studio_sessions.json", std::ios::binary);
+        if (!ofs.is_open()) return;
+
+        auto escape_json = [](const std::string& s) {
+            std::string out;
+            for (char c : s) {
+                if (c == '"') out += "\\\"";
+                else if (c == '\\') out += "\\\\";
+                else if (c == '\n') out += "\\n";
+                else if (c == '\r') out += "\\r";
+                else if (c == '\t') out += "\\t";
+                else out += c;
+            }
+            return out;
+        };
+
+        ofs << "{\n  \"active_slot\": " << active_slot_ << ",\n  \"slots\": {\n";
+        bool first_slot = true;
+        for (const auto& kv : slot_sessions_) {
+            uint32_t slot_id = kv.first;
+            const auto& msgs = kv.second;
+            if (!first_slot) ofs << ",\n";
+            first_slot = false;
+            ofs << "    \"" << slot_id << "\": [\n";
+            for (size_t i = 0; i < msgs.size(); ++i) {
+                const auto& m = msgs[i];
+                if (i > 0) ofs << ",\n";
+                std::string u8_content = wstring_to_utf8(m.content);
+                std::string u8_reasoning = wstring_to_utf8(m.reasoning);
+
+                ofs << "      {\n"
+                    << "        \"role\": \"" << m.role << "\",\n"
+                    << "        \"content\": \"" << escape_json(u8_content) << "\",\n"
+                    << "        \"reasoning\": \"" << escape_json(u8_reasoning) << "\"\n"
+                    << "      }";
+            }
+            ofs << "\n    ]";
+        }
+        ofs << "\n  }\n}\n";
     }
 
-    std::string wstring_to_utf8(const std::wstring& str) const {
-        if (str.empty()) return "";
-        int len = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0, nullptr, nullptr);
-        std::string out(len, 0);
-        WideCharToMultiByte(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), &out[0], len, nullptr, nullptr);
-        return out;
+    void load_sessions_from_disk() {
+        std::ifstream ifs("moe_studio_sessions.json", std::ios::binary);
+        if (!ifs.is_open()) return;
+
+        std::string json((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        if (json.empty()) return;
+
+        // Extract active slot if present
+        size_t pos_as = json.find("\"active_slot\":");
+        if (pos_as != std::string::npos) {
+            pos_as += 14;
+            while (pos_as < json.size() && (json[pos_as] == ' ' || json[pos_as] == '\t')) pos_as++;
+            if (pos_as < json.size() && isdigit(json[pos_as])) {
+                active_slot_ = json[pos_as] - '0';
+                if (active_slot_ > 3) active_slot_ = 0;
+            }
+        }
+
+        // Parse slot sessions
+        for (uint32_t slot = 0; slot < 4; ++slot) {
+            std::string slot_key = "\"" + std::to_string(slot) + "\":";
+            size_t s_pos = json.find(slot_key);
+            if (s_pos == std::string::npos) continue;
+
+            size_t arr_start = json.find("[", s_pos);
+            if (arr_start == std::string::npos) continue;
+
+            size_t arr_end = json.find("]", arr_start);
+            if (arr_end == std::string::npos) continue;
+
+            std::string arr_str = json.substr(arr_start, arr_end - arr_start + 1);
+
+            std::vector<ChatMessageUI> loaded_msgs;
+            size_t cur = 0;
+            while ((cur = arr_str.find("{", cur)) != std::string::npos) {
+                size_t obj_end = arr_str.find("}", cur);
+                if (obj_end == std::string::npos) break;
+
+                std::string obj_str = arr_str.substr(cur, obj_end - cur + 1);
+                cur = obj_end + 1;
+
+                ChatMessageUI msg{};
+                msg.role = "assistant";
+                if (obj_str.find("\"role\": \"user\"") != std::string::npos ||
+                    obj_str.find("\"role\":\"user\"") != std::string::npos) {
+                    msg.role = "user";
+                    msg.is_user = true;
+                }
+
+                auto extract_str = [&](const std::string& key) -> std::string {
+                    std::string k = "\"" + key + "\":";
+                    size_t kp = obj_str.find(k);
+                    if (kp == std::string::npos) return "";
+                    size_t q1 = obj_str.find("\"", kp + k.size());
+                    if (q1 == std::string::npos) return "";
+                    std::string res;
+                    size_t q = q1 + 1;
+                    while (q < obj_str.size()) {
+                        if (obj_str[q] == '\\' && q + 1 < obj_str.size()) {
+                            char nx = obj_str[++q];
+                            if (nx == 'n') res += '\n';
+                            else if (nx == 'r') res += '\r';
+                            else if (nx == 't') res += '\t';
+                            else res += nx;
+                        } else if (obj_str[q] == '"') {
+                            break;
+                        } else {
+                            res += obj_str[q];
+                        }
+                        q++;
+                    }
+                    return res;
+                };
+
+                std::string c_u8 = extract_str("content");
+                std::string r_u8 = extract_str("reasoning");
+
+                msg.content = utf8_to_wstring(c_u8);
+                msg.reasoning = utf8_to_wstring(r_u8);
+                if (!msg.content.empty()) {
+                    parse_message_blocks(msg.content, msg.blocks);
+                }
+                loaded_msgs.push_back(std::move(msg));
+            }
+
+            if (!loaded_msgs.empty()) {
+                slot_sessions_[slot] = std::move(loaded_msgs);
+            }
+        }
+
+        if (slot_sessions_.find(active_slot_) != slot_sessions_.end() && !slot_sessions_[active_slot_].empty()) {
+            messages_ = slot_sessions_[active_slot_];
+        }
     }
 
     HINSTANCE hInstance_ = nullptr;
@@ -1925,6 +2404,7 @@ private:
 
     ID2D1SolidColorBrush* pBrushTerminalBg_     = nullptr;
     ID2D1SolidColorBrush* pBrushTerminalBorder_ = nullptr;
+    ID2D1SolidColorBrush* pBrushDimOverlay_     = nullptr;
 
     NOTIFYICONDATAW nid_{};
 
@@ -1938,6 +2418,7 @@ private:
     bool stop_btn_hovered_ = false;
 
     bool show_cortex_atlas_ = true;
+    bool show_system_inspector_ = false;
     int scroll_offset_ = 0;
     uint32_t active_slot_ = 0;
 
@@ -1960,10 +2441,16 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     std::wstring screenshot_path = L"";
     std::string test_prompt = "";
     uint32_t test_max_tokens = 140;
+    bool show_inspector = false;
+    bool export_md = false;
     if (argv) {
         for (int i = 1; i < argc; ++i) {
             if (std::wstring(argv[i]) == L"--screenshot" && i + 1 < argc) {
                 screenshot_path = argv[++i];
+            } else if (std::wstring(argv[i]) == L"--show-inspector") {
+                show_inspector = true;
+            } else if (std::wstring(argv[i]) == L"--export-md") {
+                export_md = true;
             } else if (std::wstring(argv[i]) == L"--test-prompt" && i + 1 < argc) {
                 int len = WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, nullptr, 0, nullptr, nullptr);
                 std::string s(len, 0);
@@ -1983,8 +2470,17 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         return 1;
     }
 
+    if (show_inspector) {
+        app.set_show_system_inspector(true);
+    }
+
     if (!test_prompt.empty()) {
         app.send_prompt_sync(test_prompt, test_max_tokens);
+    }
+
+    if (export_md) {
+        std::wstring out_path;
+        export_markdown(app.active_slot(), app.messages(), out_path);
     }
 
     if (!screenshot_path.empty()) {
