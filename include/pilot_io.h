@@ -70,9 +70,14 @@ public:
     const std::vector<DriveStripeInfo>& drives() const { return drives_; }
     uint64_t total_bytes_streamed() const { return total_bytes_streamed_.load(); }
     uint64_t total_io_ops() const { return total_io_ops_.load(); }
+    bool bypass_io_supported() const { return bypass_io_supported_; }
+    bool direct_dma_active() const { return direct_dma_active_; }
 
 private:
     size_t select_drive_index(uint32_t stripe_hint) const;
+
+    bool bypass_io_supported_ = false;
+    bool direct_dma_active_ = false;
 
     std::vector<DriveStripeInfo> drives_;
     std::vector<size_t> weighted_drive_table_;

@@ -619,6 +619,7 @@ private:
     void init_quick_chips() {
         quick_chips_ = {
             { L"Atlas: ON", "__toggle_atlas__", D2D1::RectF() },
+            { L"Slot: #0", "__cycle_slot__", D2D1::RectF() },
             { L"Tkinter Calculator App", "Write an awesome calculator app in Python with Tkinter, clean dark GUI, and standard arithmetic operations (+, -, *, /).", D2D1::RectF() },
             { L"Explain MoE PILOT", "Explain the MoE PILOT overlapped prefetching architecture and LFRU cache scoring in high-performance local AI engines.", D2D1::RectF() },
             { L"What is 2 + 2?", "What is 2 + 2?", D2D1::RectF() },
@@ -628,6 +629,16 @@ private:
     }
 
     void handle_chip_click(const QuickChip& chip) {
+        if (chip.prompt == "__cycle_slot__") {
+            active_slot_ = (active_slot_ + 1) % 4;
+            for (auto& c : quick_chips_) {
+                if (c.prompt == "__cycle_slot__") {
+                    c.label = L"Slot: #" + std::to_wstring(active_slot_);
+                }
+            }
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
         if (chip.prompt == "__toggle_atlas__") {
             show_cortex_atlas_ = !show_cortex_atlas_;
             for (auto& c : quick_chips_) {
@@ -1284,9 +1295,9 @@ private:
             double total_reqs = std::max<double>(1.0, latest_telem_.hits + latest_telem_.reads);
             double hit_pct = (latest_telem_.hits / total_reqs) * 100.0;
 
-            std::wstring fText = L"Top-2 Router: Pipelined IOCP Prefetch\r\n"
-                                 L"LFRU Hit Ratio: " + format_float(hit_pct, 1) + L"%\r\n"
-                                 L"Active Streams: 1 (Slot #" + std::to_wstring(active_slot_) + L")";
+            std::wstring fText = L"Top-2 Router: BypassIO / Direct DMA\r\n"
+                                 L"PagedAttention: 16-tok/blk | Slot #" + std::to_wstring(active_slot_) + L"\r\n"
+                                 L"LFRU Hit Ratio: " + format_float(hit_pct, 1) + L"%";
             current_rt_->DrawText(fText.c_str(), static_cast<UINT32>(fText.size()), pFormatAtlasCell_,
                 D2D1::RectF(fRc.left + 8.0f, fRc.top + 6.0f, fRc.right - 8.0f, fRc.bottom - 4.0f), pBrushTextSecondary_);
         }

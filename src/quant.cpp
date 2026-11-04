@@ -372,6 +372,85 @@ void dequantize_row_q4_K(const void* vx, float* y, int64_t k) {
     }
 }
 
+void quantize_row_q5_K(const float* x, void* vy, int64_t k) {
+    const int64_t nb = k / 256;
+    auto* y = static_cast<block_q5_K*>(vy);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float* xb = x + i * 256;
+        float amax = 0.0f;
+        for (int j = 0; j < 256; ++j) {
+            amax = std::max(amax, std::fabs(xb[j]));
+        }
+        float d = amax / 15.5f;
+        y[i].d = fp32_to_fp16(d);
+        y[i].dmin = fp32_to_fp16(d * 16.0f);
+        std::memset(y[i].scales, 1, 12);
+        std::memset(y[i].qh, 0, 32);
+
+        const float actual_d = fp16_to_fp32(y[i].d);
+        const float id = (actual_d != 0.0f) ? (1.0f / actual_d) : 0.0f;
+
+        for (int sb = 0; sb < 8; ++sb) {
+            const int qh_offset = (sb * 32) / 8;
+            const int qs_offset = sb * 16;
+            for (int l = 0; l < 32; ++l) {
+                float v = xb[sb * 32 + l] * id + 16.0f;
+                uint8_t q5 = static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(v)), 0, 31));
+                uint8_t q_low = q5 & 0x0F;
+                uint8_t qh_bit = (q5 >> 4) & 1;
+
+                if ((l % 2) == 0) {
+                    y[i].qs[qs_offset + l / 2] = q_low;
+                } else {
+                    y[i].qs[qs_offset + l / 2] |= (q_low << 4);
+                }
+                y[i].qh[qh_offset + l / 8] |= (qh_bit << (l % 8));
+            }
+        }
+    }
+}
+
+void quantize_row_q6_K(const float* x, void* vy, int64_t k) {
+    const int64_t nb = k / 256;
+    auto* y = static_cast<block_q6_K*>(vy);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float* xb = x + i * 256;
+        float amax = 0.0f;
+        for (int j = 0; j < 256; ++j) {
+            amax = std::max(amax, std::fabs(xb[j]));
+        }
+        float d = amax / 31.5f;
+        y[i].d = fp32_to_fp16(d);
+        for (int sb = 0; sb < 16; ++sb) {
+            y[i].scales[sb] = 1;
+        }
+        std::memset(y[i].ql, 0, 128);
+        std::memset(y[i].qh, 0, 64);
+
+        const float actual_d = fp16_to_fp32(y[i].d);
+        const float id = (actual_d != 0.0f) ? (1.0f / actual_d) : 0.0f;
+
+        for (int sb = 0; sb < 16; ++sb) {
+            for (int l = 0; l < 16; ++l) {
+                int idx = sb * 16 + l;
+                float v = xb[idx] * id + 32.0f;
+                uint8_t q6 = static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(v)), 0, 63));
+                uint8_t ql = q6 & 0x0F;
+                uint8_t qh = (q6 >> 4) & 0x03;
+
+                if ((idx % 2) == 0) {
+                    y[i].ql[idx / 2] = ql;
+                } else {
+                    y[i].ql[idx / 2] |= (ql << 4);
+                }
+                y[i].qh[idx / 4] |= (qh << (2 * (idx % 4)));
+            }
+        }
+    }
+}
+
 void dequantize_row_q5_K(const void* vx, float* y, int64_t k) {
     const int64_t nb = k / 256;
     const auto* x = static_cast<const block_q5_K*>(vx);

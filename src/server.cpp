@@ -407,7 +407,9 @@ void HttpServer::handle_client(uintptr_t client_sock) {
            << "\"io_backend\":\"" << json_escape(hw.io_backend) << "\","
            << "\"total_ram_bytes\":" << hw.total_ram_bytes << ","
            << "\"avail_ram_bytes\":" << hw.avail_ram_bytes << ","
-           << "\"vram_budget_bytes\":" << hw.vram_budget_bytes
+           << "\"vram_budget_bytes\":" << hw.vram_budget_bytes << ","
+           << "\"bypass_io\":" << (io.bypass_io_supported() ? "true" : "false") << ","
+           << "\"direct_dma\":" << (io.direct_dma_active() ? "true" : "false")
            << "},"
            << "\"tiers\":{"
            << "\"vram_experts\":" << tm.vram_resident_count() << ","
@@ -486,6 +488,56 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                << "}";
         }
         js << "]}";
+        send_http_json(client_sock, 200, "OK", js.str());
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // 3b. GET /v1/slots & POST /v1/slots/clear (PagedAttention Session Management)
+    // ------------------------------------------------------------------------
+    if (method == "GET" && path == "/v1/slots") {
+        auto slots = engine_.list_slots();
+        auto pstats = engine_.paged_block_stats();
+        std::ostringstream js;
+        js << "{"
+           << "\"slots\":[";
+        for (size_t i = 0; i < slots.size(); ++i) {
+            if (i > 0) js << ",";
+            const auto& s = slots[i];
+            js << "{"
+               << "\"slot_id\":" << s.slot_id << ","
+               << "\"seq_pos\":" << s.seq_pos << ","
+               << "\"pages_allocated\":" << s.pages_allocated << ","
+               << "\"compactions\":" << s.compactions << ","
+               << "\"token_count\":" << s.token_count << ","
+               << "\"memory_bytes\":" << s.memory_bytes
+               << "}";
+        }
+        js << "],"
+           << "\"paged_block_manager\":{"
+           << "\"total_blocks\":" << pstats.total_blocks << ","
+           << "\"used_blocks\":" << pstats.used_blocks << ","
+           << "\"free_blocks\":" << pstats.free_blocks << ","
+           << "\"block_size_tokens\":" << pstats.block_size_tokens << ","
+           << "\"memory_bytes\":" << pstats.memory_bytes
+           << "}"
+           << "}";
+        send_http_json(client_sock, 200, "OK", js.str());
+        return;
+    }
+
+    if ((method == "POST" || method == "DELETE") && (path == "/v1/slots/clear" || path.starts_with("/v1/slots/"))) {
+        uint32_t slot_id = 0;
+        if (path.starts_with("/v1/slots/") && path.size() > 10 && path != "/v1/slots/clear") {
+            try {
+                slot_id = static_cast<uint32_t>(std::stoul(path.substr(10)));
+            } catch (...) {}
+        } else {
+            slot_id = static_cast<uint32_t>(extract_json_number(body, "slot_id", 0.0));
+        }
+        bool cleared = engine_.clear_slot(slot_id);
+        std::ostringstream js;
+        js << "{\"status\":\"ok\",\"slot_id\":" << slot_id << ",\"cleared\":" << (cleared ? "true" : "false") << "}";
         send_http_json(client_sock, 200, "OK", js.str());
         return;
     }

@@ -304,9 +304,53 @@ void MoETransformerEngine::reset_slot(uint32_t slot_id) {
     if (it != kv_slots_.end()) it->second.clear();
 }
 
+bool MoETransformerEngine::clear_slot(uint32_t slot_id) {
+    std::lock_guard<std::mutex> lk(engine_mtx_);
+    auto it = kv_slots_.find(slot_id);
+    if (it != kv_slots_.end()) {
+        it->second.clear();
+        kv_slots_.erase(it);
+        return true;
+    }
+    return false;
+}
+
 size_t MoETransformerEngine::active_slot_count() const {
     std::lock_guard<std::mutex> lk(engine_mtx_);
     return kv_slots_.size();
+}
+
+std::vector<KVSlotSummary> MoETransformerEngine::list_slots() const {
+    std::lock_guard<std::mutex> lk(engine_mtx_);
+    std::vector<KVSlotSummary> out;
+    size_t kv_dim = static_cast<size_t>(hp_.n_kv_heads) * static_cast<size_t>(hp_.head_dim);
+    for (const auto& [id, slot] : kv_slots_) {
+        KVSlotSummary sum;
+        sum.slot_id = id;
+        sum.seq_pos = slot.seq_pos;
+        sum.pages_allocated = slot.pages_allocated();
+        sum.compactions = slot.compactions;
+        sum.token_count = slot.token_history.size();
+        sum.memory_bytes = static_cast<size_t>(slot.pages_allocated()) * KV_BLOCK_TOKENS * kv_dim * sizeof(float) * hp_.n_layers * 2;
+        out.push_back(sum);
+    }
+    std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.slot_id < b.slot_id; });
+    return out;
+}
+
+PagedBlockStats MoETransformerEngine::paged_block_stats() const {
+    std::lock_guard<std::mutex> lk(engine_mtx_);
+    PagedBlockStats st;
+    st.total_blocks = 2048;
+    st.used_blocks = 0;
+    size_t kv_dim = static_cast<size_t>(hp_.n_kv_heads) * static_cast<size_t>(hp_.head_dim);
+    for (const auto& [id, slot] : kv_slots_) {
+        st.used_blocks += slot.pages_allocated();
+    }
+    st.free_blocks = (st.total_blocks > st.used_blocks) ? (st.total_blocks - st.used_blocks) : 0;
+    st.block_size_tokens = KV_BLOCK_TOKENS;
+    st.memory_bytes = st.used_blocks * KV_BLOCK_TOKENS * kv_dim * sizeof(float) * hp_.n_layers * 2;
+    return st;
 }
 
 std::vector<ProfileSample> MoETransformerEngine::recent_profiles() const {

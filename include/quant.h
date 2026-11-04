@@ -92,6 +92,8 @@ void quantize_row_q4_0(const float* x, void* vy, int64_t k);
 void quantize_row_q8_0(const float* x, void* vy, int64_t k);
 void quantize_row_iq4_nl(const float* x, void* vy, int64_t k);
 void quantize_row_q4_K(const float* x, void* vy, int64_t k);
+void quantize_row_q5_K(const float* x, void* vy, int64_t k);
+void quantize_row_q6_K(const float* x, void* vy, int64_t k);
 void quantize_row_f16(const float* x, void* vy, int64_t k);
 void quantize_row_bf16(const float* x, void* vy, int64_t k);
 void quantize_row_fp8_e4m3(const float* x, void* vy, int64_t k);

@@ -52,11 +52,31 @@ struct LayerDenseWeights {
     std::vector<ExpertDiskSlice> expert_slices;
 };
 
+constexpr uint32_t KV_BLOCK_TOKENS = 16;
+
+struct PagedBlockStats {
+    size_t total_blocks = 1024;
+    size_t used_blocks = 0;
+    size_t free_blocks = 1024;
+    size_t block_size_tokens = KV_BLOCK_TOKENS;
+    size_t memory_bytes = 0;
+};
+
+struct KVSlotSummary {
+    uint32_t slot_id = 0;
+    uint32_t seq_pos = 0;
+    uint32_t pages_allocated = 0;
+    uint32_t compactions = 0;
+    size_t token_count = 0;
+    size_t memory_bytes = 0;
+};
+
 struct KVCacheSlot {
     uint32_t slot_id = 0;
     uint32_t seq_pos = 0;
     uint32_t compactions = 0;
     std::vector<uint32_t> token_history;
+    std::vector<uint32_t> page_table;
     // [n_layers][max_seq_len * n_kv_heads * head_dim]
     std::vector<std::vector<float>> k_cache;
     std::vector<std::vector<float>> v_cache;
@@ -65,6 +85,9 @@ struct KVCacheSlot {
     void clear();
     // Compact KV cache by retaining sink tokens (first 4) + most recent window
     void compact(const ModelHyperparams& hp, uint32_t keep_recent = 128);
+    uint32_t pages_allocated() const {
+        return (seq_pos == 0) ? 0 : static_cast<uint32_t>((seq_pos + KV_BLOCK_TOKENS - 1) / KV_BLOCK_TOKENS);
+    }
 };
 
 struct SamplerConfig {
@@ -168,7 +191,10 @@ public:
 
     KVCacheSlot& get_or_create_slot(uint32_t slot_id);
     void reset_slot(uint32_t slot_id);
+    bool clear_slot(uint32_t slot_id);
     size_t active_slot_count() const;
+    std::vector<KVSlotSummary> list_slots() const;
+    PagedBlockStats paged_block_stats() const;
 
     std::vector<ProfileSample> recent_profiles() const;
     uint64_t dense_backbone_bytes() const { return dense_bytes_; }

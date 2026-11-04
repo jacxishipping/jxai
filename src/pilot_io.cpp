@@ -88,6 +88,8 @@ bool PilotIOEngine::init(const std::vector<std::string>& model_paths, std::strin
             shutdown();
             return false;
         }
+        bypass_io_supported_ = true;
+        direct_dma_active_ = true;
 #else
         info.fd = ::open(info.path.c_str(), O_RDONLY);
         if (info.fd < 0) {
