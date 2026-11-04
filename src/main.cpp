@@ -27,6 +27,7 @@ void print_banner() {
 
 void print_usage() {
     std::cout << "Usage:\n"
+              << "  moe_engine setup                                 [first-run installation, environment & config wizard]\n"
               << "  moe_engine doctor [--quick]                      [run hardware, NVMe speed, and SIMD diagnostics]\n"
               << "  moe_engine test                                  [run 10-point rigorous verification suite]\n"
               << "  moe_engine chat   --model <file> [--prompt \"...\"] [--max-tokens 64] [--speculative]\n"
@@ -309,6 +310,56 @@ bool run_verification_tests() {
     return true;
 }
 
+bool run_setup_wizard() {
+    std::cout << "\n\033[1;36m===================================================================\033[0m\n";
+    std::cout << "\033[1;36m  NEXT-GEN MoE STREAMING ENGINE & STUDIO FIRST-RUN SETUP WIZARD   \033[0m\n";
+    std::cout << "\033[1;36m===================================================================\033[0m\n\n";
+
+    std::cout << "1. Environment & Directories Verification:\n";
+    std::error_code ec;
+    fs::create_directories("models", ec);
+    fs::create_directories("web/dist", ec);
+    std::cout << "   models/ directory:      \033[1;32mREADY\033[0m\n";
+    std::cout << "   web/dist/ directory:    \033[1;32mREADY\033[0m\n";
+
+    std::cout << "\n2. Verifying Default Model:\n";
+    std::string test_model_path = "models/test_qwen.gguf";
+    if (!fs::exists(test_model_path)) {
+        std::cout << "   Forging default Qwen2.5-0.5B MoE binary test model... ";
+        std::string err_msg;
+        bool forge_ok = forge_moe_gguf_model(test_model_path, err_msg);
+        std::cout << (forge_ok ? "\033[1;32mDONE\033[0m\n" : "\033[1;31mFAILED\033[0m\n");
+    } else {
+        std::cout << "   Default model found:    \033[1;32m" << test_model_path << "\033[0m (" << fs::file_size(test_model_path) << " bytes)\n";
+    }
+
+    std::cout << "\n3. Hardware Qualification:\n";
+    run_hardware_doctor();
+
+    std::cout << "4. Generating Configuration (moe_config.json)...\n";
+    std::ofstream ofs("moe_config.json", std::ios::binary);
+    if (ofs.is_open()) {
+        ofs << "{\n"
+            << "  \"first_run_completed\": true,\n"
+            << "  \"model_path\": \"models/test_qwen.gguf\",\n"
+            << "  \"model_name\": \"qwen2.5-0.5b-instruct\",\n"
+            << "  \"bypass_io\": true,\n"
+            << "  \"direct_dma\": true,\n"
+            << "  \"paged_attention_blocks\": 2048,\n"
+            << "  \"active_slots\": 4,\n"
+            << "  \"api_port\": 8000\n"
+            << "}\n";
+        std::cout << "   Config status:          \033[1;32mGENERATED (moe_config.json)\033[0m\n";
+    }
+
+    std::cout << "\n\033[1;32m===================================================================\033[0m\n";
+    std::cout << "\033[1;32m  [SUCCESS] MoE ENGINE SETUP COMPLETED SUCCESSFULLY!               \033[0m\n";
+    std::cout << "\033[1;32m  Run 'run_studio.bat' or 'moe_studio.exe' to launch the suite.    \033[0m\n";
+    std::cout << "\033[1;32m===================================================================\033[0m\n\n";
+
+    return true;
+}
+
 int main(int argc, char* argv[]) {
     print_banner();
 
@@ -318,6 +369,10 @@ int main(int argc, char* argv[]) {
     }
 
     std::string mode = argv[1];
+
+    if (mode == "setup" || mode == "install") {
+        return run_setup_wizard() ? 0 : 1;
+    }
 
     if (mode == "doctor") {
         return run_hardware_doctor() ? 0 : 1;

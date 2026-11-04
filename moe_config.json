@@ -1,0 +1,10 @@
+{
+  "first_run_completed": true,
+  "model_path": "models/test_qwen.gguf",
+  "model_name": "qwen2.5-0.5b-instruct",
+  "bypass_io": true,
+  "direct_dma": true,
+  "paged_attention_blocks": 2048,
+  "active_slots": 4,
+  "api_port": 8000
+}
