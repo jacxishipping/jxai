@@ -33,8 +33,10 @@ public:
     uint32_t im_end_id() const { return im_end_id_; }
     uint32_t think_start_id() const { return think_start_id_; }
     uint32_t think_end_id() const { return think_end_id_; }
+    bool is_byte_level_bpe() const { return is_byte_level_bpe_; }
 
     const std::vector<std::string>& vocab() const { return vocab_; }
+    const std::unordered_map<std::string, int32_t>& merges() const { return merge_ranks_; }
     int32_t token_to_id(const std::string& tok) const;
 
 private:
@@ -47,6 +49,7 @@ private:
     std::vector<std::pair<std::string, uint32_t>> special_tokens_;
     uint32_t byte_fallback_[256] = {0};
     bool has_byte_fallback_ = false;
+    bool is_byte_level_bpe_ = false;
 
     uint32_t bos_id_ = 1;
     uint32_t eos_id_ = 2;

@@ -36,3 +36,10 @@ desktop/src-tauri/target/
 .DS_Store
 Thumbs.db
 
+# Model weights & temporary files
+models/
+*.gguf
+*.safetensors
+*.tmp
+
+

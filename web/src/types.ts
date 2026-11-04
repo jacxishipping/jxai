@@ -65,18 +65,23 @@ export interface EngineHealth {
   };
 }
 
+export interface ChatTelemetry {
+  tok_per_sec: number;
+  wall_ms: number;
+  io_wait_ms: number;
+  cache_hits: number;
+  disk_reads: number;
+  ttft_ms?: number;
+  queue_latency_ms?: number;
+  cache_slot?: number;
+}
+
 export interface ChatMessage {
   id: string;
   role: 'user' | 'assistant' | 'system';
   content: string;
   reasoning_content?: string;
-  telemetry?: {
-    tok_per_sec: number;
-    wall_ms: number;
-    io_wait_ms: number;
-    cache_hits: number;
-    disk_reads: number;
-  };
+  telemetry?: ChatTelemetry;
 }
 
 export interface SystemOneScore {
@@ -93,6 +98,8 @@ export interface SystemOneResult {
   generated_tokens: number;
   recommended: string;
   options: SystemOneScore[];
+  entropy?: number;
+  confidence?: 'Very High' | 'High' | 'Moderate' | 'Low' | 'Ambiguous';
 }
 
 export interface ImagePreview {
@@ -113,3 +120,4 @@ export interface ImageResult {
   previews: ImagePreview[];
 }
 
+export type SupportedLanguage = 'en' | 'it' | 'de' | 'zh-CN' | 'zh-TW' | 'id' | 'pt-BR';

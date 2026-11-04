@@ -336,6 +336,16 @@ void quantize_row_q4_K(const float* x, void* vy, int64_t k) {
     }
 }
 
+static inline void get_scale_min_k4(int j, const uint8_t* q, uint8_t* d, uint8_t* m) {
+    if (j < 4) {
+        *d = q[j] & 63;
+        *m = q[j + 4] & 63;
+    } else {
+        *d = (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4);
+        *m = (q[j + 4] >> 4)   | ((q[j - 0] >> 6) << 4);
+    }
+}
+
 void dequantize_row_q4_K(const void* vx, float* y, int64_t k) {
     const int64_t nb = k / 256;
     const auto* x = static_cast<const block_q4_K*>(vx);
@@ -357,6 +367,102 @@ void dequantize_row_q4_K(const void* vx, float* y, int64_t k) {
                 uint8_t q = x[i].qs[blk * 32 + j];
                 yb[blk * 64 + j]      = dl0 * static_cast<float>(q & 0x0F) - ml0;
                 yb[blk * 64 + 32 + j] = dl1 * static_cast<float>(q >> 4) - ml1;
+            }
+        }
+    }
+}
+
+void dequantize_row_q5_K(const void* vx, float* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_q5_K*>(vx);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d);
+        const float dmin = fp16_to_fp32(x[i].dmin);
+        float* yb = y + i * 256;
+
+        for (int sb = 0; sb < 8; ++sb) {
+            uint8_t sc = 0, m = 0;
+            get_scale_min_k4(sb, x[i].scales, &sc, &m);
+            const float dl = d * static_cast<float>(sc);
+            const float ml = dmin * static_cast<float>(m);
+
+            const int qh_offset = (sb * 32) / 8;
+            const int qs_offset = sb * 16;
+            for (int l = 0; l < 32; ++l) {
+                uint8_t q_low = (x[i].qs[qs_offset + l / 2] >> (4 * (l % 2))) & 0x0F;
+                uint8_t qh_bit = (x[i].qh[qh_offset + l / 8] >> (l % 8)) & 1;
+                uint8_t q5 = q_low | (qh_bit << 4);
+                yb[sb * 32 + l] = dl * static_cast<float>(q5) - ml;
+            }
+        }
+    }
+}
+
+void dequantize_row_q6_K(const void* vx, float* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_q6_K*>(vx);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d);
+        float* yb = y + i * 256;
+
+        for (int sb = 0; sb < 16; ++sb) {
+            const float sc = d * static_cast<float>(x[i].scales[sb]);
+            for (int l = 0; l < 16; ++l) {
+                int idx = sb * 16 + l;
+                uint8_t ql = (x[i].ql[idx / 2] >> (4 * (idx % 2))) & 0x0F;
+                uint8_t qh = (x[i].qh[idx / 4] >> (2 * (idx % 4))) & 0x03;
+                int8_t q6 = static_cast<int8_t>((ql | (qh << 4))) - 32;
+                yb[idx] = sc * static_cast<float>(q6);
+            }
+        }
+    }
+}
+
+void dequantize_row_iq3_s(const void* vx, float* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_iq3_s*>(vx);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d);
+        float* yb = y + i * 256;
+
+        // Unpack 256 3-bit values from 96 bytes (8 weights per 3 bytes)
+        for (int g = 0; g < 32; ++g) {
+            uint32_t b0 = x[i].qs[g * 3 + 0];
+            uint32_t b1 = x[i].qs[g * 3 + 1];
+            uint32_t b2 = x[i].qs[g * 3 + 2];
+            uint32_t tri = b0 | (b1 << 8) | (b2 << 16);
+
+            for (int w = 0; w < 8; ++w) {
+                uint8_t q = (tri >> (w * 3)) & 0x07;
+                int global_idx = g * 8 + w;
+                uint8_t sign_byte = x[i].signs[global_idx / 64];
+                float s = ((sign_byte >> (global_idx % 8)) & 1) ? -1.0f : 1.0f;
+                yb[global_idx] = d * (static_cast<float>(q) - 3.5f) * s;
+            }
+        }
+    }
+}
+
+void dequantize_row_iq2_s(const void* vx, float* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_iq2_s*>(vx);
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d);
+        float* yb = y + i * 256;
+
+        // Unpack 256 2-bit values from 64 bytes (4 weights per byte)
+        for (int b = 0; b < 64; ++b) {
+            uint8_t byte_val = x[i].qs[b];
+            for (int w = 0; w < 4; ++w) {
+                uint8_t q = (byte_val >> (w * 2)) & 0x03;
+                int global_idx = b * 4 + w;
+                uint8_t sc_val = x[i].scales[global_idx / 32];
+                float sc = (sc_val == 0) ? 1.0f : static_cast<float>(sc_val & 0x0F);
+                yb[global_idx] = d * sc * (static_cast<float>(q) - 1.5f);
             }
         }
     }
@@ -402,6 +508,10 @@ void dequantize_row(GGMLType type, const void* vx, float* y, int64_t k) {
         case GGMLType::Q8_0:     dequantize_row_q8_0(vx, y, k); break;
         case GGMLType::IQ4_NL:   dequantize_row_iq4_nl(vx, y, k); break;
         case GGMLType::Q4_K:     dequantize_row_q4_K(vx, y, k); break;
+        case GGMLType::Q5_K:     dequantize_row_q5_K(vx, y, k); break;
+        case GGMLType::Q6_K:     dequantize_row_q6_K(vx, y, k); break;
+        case GGMLType::IQ2_S:    dequantize_row_iq2_s(vx, y, k); break;
+        case GGMLType::IQ3_S:    dequantize_row_iq3_s(vx, y, k); break;
         default:                 std::memset(y, 0, k * sizeof(float)); break;
     }
 }
@@ -591,6 +701,54 @@ float vec_dot_fp8_f32(const void* vx, const float* y, int64_t k) {
     return total;
 }
 
+float vec_dot_q5_K_f32(const void* vx, const float* y, int64_t k) {
+    alignas(32) float deq[256];
+    const int64_t nb = k / 256;
+    const auto* blocks = static_cast<const block_q5_K*>(vx);
+    float sum = 0.0f;
+    for (int64_t i = 0; i < nb; ++i) {
+        dequantize_row_q5_K(&blocks[i], deq, 256);
+        sum += vec_dot_f32(deq, y + i * 256, 256);
+    }
+    return sum;
+}
+
+float vec_dot_q6_K_f32(const void* vx, const float* y, int64_t k) {
+    alignas(32) float deq[256];
+    const int64_t nb = k / 256;
+    const auto* blocks = static_cast<const block_q6_K*>(vx);
+    float sum = 0.0f;
+    for (int64_t i = 0; i < nb; ++i) {
+        dequantize_row_q6_K(&blocks[i], deq, 256);
+        sum += vec_dot_f32(deq, y + i * 256, 256);
+    }
+    return sum;
+}
+
+float vec_dot_iq2_s_f32(const void* vx, const float* y, int64_t k) {
+    alignas(32) float deq[256];
+    const int64_t nb = k / 256;
+    const auto* blocks = static_cast<const block_iq2_s*>(vx);
+    float sum = 0.0f;
+    for (int64_t i = 0; i < nb; ++i) {
+        dequantize_row_iq2_s(&blocks[i], deq, 256);
+        sum += vec_dot_f32(deq, y + i * 256, 256);
+    }
+    return sum;
+}
+
+float vec_dot_iq3_s_f32(const void* vx, const float* y, int64_t k) {
+    alignas(32) float deq[256];
+    const int64_t nb = k / 256;
+    const auto* blocks = static_cast<const block_iq3_s*>(vx);
+    float sum = 0.0f;
+    for (int64_t i = 0; i < nb; ++i) {
+        dequantize_row_iq3_s(&blocks[i], deq, 256);
+        sum += vec_dot_f32(deq, y + i * 256, 256);
+    }
+    return sum;
+}
+
 float vec_dot_quant_f32(GGMLType type, const void* vx, const float* y, int64_t k) {
     switch (type) {
         case GGMLType::F32:      return vec_dot_f32(static_cast<const float*>(vx), y, k);
@@ -601,6 +759,10 @@ float vec_dot_quant_f32(GGMLType type, const void* vx, const float* y, int64_t k
         case GGMLType::Q8_0:     return vec_dot_q8_0_f32(vx, y, k);
         case GGMLType::IQ4_NL:   return vec_dot_iq4_nl_f32(vx, y, k);
         case GGMLType::Q4_K:     return vec_dot_q4_K_f32(vx, y, k);
+        case GGMLType::Q5_K:     return vec_dot_q5_K_f32(vx, y, k);
+        case GGMLType::Q6_K:     return vec_dot_q6_K_f32(vx, y, k);
+        case GGMLType::IQ2_S:    return vec_dot_iq2_s_f32(vx, y, k);
+        case GGMLType::IQ3_S:    return vec_dot_iq3_s_f32(vx, y, k);
         default:                 return 0.0f;
     }
 }
@@ -616,6 +778,9 @@ void matmul_quant_f32(
     const size_t row_bytes = tensor_byte_size(type, static_cast<uint64_t>(cols));
     const auto* base = static_cast<const uint8_t*>(W);
 
+#if defined(_OPENMP)
+    #pragma omp parallel for if(rows >= 64) schedule(static)
+#endif
     for (int64_t r = 0; r < rows; ++r) {
         out[r] = vec_dot_quant_f32(type, base + r * row_bytes, x, cols);
     }

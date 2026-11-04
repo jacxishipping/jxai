@@ -1,17 +1,39 @@
 import React, { useState, useEffect } from 'react';
-import { MessageSquare, Activity, Image as ImageIcon, Target, Settings, Cpu, HardDrive } from 'lucide-react';
+import {
+  MessageSquare,
+  Activity,
+  Image as ImageIcon,
+  Target,
+  Settings,
+  Cpu,
+  Search,
+  Plus,
+  Sun,
+  Moon
+} from 'lucide-react';
 import { ChatWorkspace } from './components/ChatWorkspace';
 import { CortexAtlas } from './components/CortexAtlas';
 import { ProfilerDashboard } from './components/ProfilerDashboard';
 import { SystemOneWorkspace } from './components/SystemOneWorkspace';
 import { ImageWorkspace } from './components/ImageWorkspace';
 import { SettingsModal } from './components/SettingsModal';
-import { EngineHealth } from './types';
+import { EngineHealth, SupportedLanguage } from './types';
+import { translations } from './utils/i18n';
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'chat' | 'atlas' | 'profiler' | 'systemone' | 'images'>('chat');
   const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [isSearchOpen, setIsSearchOpen] = useState(false);
+  const [searchQuery, setSearchQuery] = useState('');
+  const [theme, setTheme] = useState<'dark' | 'light'>('dark');
+  const [language, setLanguage] = useState<SupportedLanguage>('en');
+  const [systemPrompt, setSystemPrompt] = useState(
+    'You are an expert AI assistant specializing in high-performance computing and local MoE streaming architectures.'
+  );
+  const [currentSlot, setCurrentSlot] = useState(0);
   const [health, setHealth] = useState<EngineHealth | null>(null);
+
+  const t = translations[language] || translations.en;
 
   const fetchHealth = async () => {
     try {
@@ -21,7 +43,7 @@ export const App: React.FC = () => {
         setHealth(data);
       }
     } catch {
-      // Offline fallback telemetry for client-only previews
+      // Offline fallback telemetry for client previews
       if (!health) {
         setHealth({
           status: 'ok',
@@ -77,109 +99,174 @@ export const App: React.FC = () => {
   // Global Keyboard Shortcuts
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
-      if ((e.ctrlKey || e.metaKey) && e.key === 'k') {
+      // Ctrl/Cmd + K: Open conversation search dialog
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'k') {
         e.preventDefault();
-        setIsSettingsOpen(prev => !prev);
+        setIsSearchOpen(prev => !prev);
       }
+      // Ctrl/Cmd + N: Create new chat (advances slot)
+      if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
+        e.preventDefault();
+        setCurrentSlot(prev => prev + 1);
+        setActiveTab('chat');
+      }
+      // Ctrl/Cmd + Shift + L: Toggle Light / Dark theme
+      if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'l') {
+        e.preventDefault();
+        setTheme(prev => (prev === 'dark' ? 'light' : 'dark'));
+      }
+      // Esc: Close open modal/dialogs
       if (e.key === 'Escape') {
         setIsSettingsOpen(false);
+        setIsSearchOpen(false);
       }
     };
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
+  const searchResults = [
+    { id: '1', title: 'Explain MoE streaming architecture', tab: 'chat' as const },
+    { id: '2', title: 'Interactive 3D Cortex Atlas', tab: 'atlas' as const },
+    { id: '3', title: 'Latency Profiler & Overlapped I/O', tab: 'profiler' as const },
+    { id: '4', title: 'System One Decision Engine', tab: 'systemone' as const },
+    { id: '5', title: 'Neural Latent Image Synthesis', tab: 'images' as const }
+  ].filter(item => item.title.toLowerCase().includes(searchQuery.toLowerCase()));
+
   return (
-    <div className="flex h-screen w-screen bg-[#070a12] text-slate-100 select-none overflow-hidden">
+    <div
+      className={`flex h-screen w-screen select-none overflow-hidden ${
+        theme === 'dark' ? 'bg-[#070a12] text-slate-100' : 'bg-slate-100 text-slate-900'
+      }`}
+    >
       {/* Primary Left Navigation Rail */}
-      <div className="w-16 h-full flex flex-col items-center justify-between py-5 border-r border-slate-800/80 bg-slate-950/60 z-20">
+      <div
+        className={`w-16 h-full flex flex-col items-center justify-between py-5 border-r z-20 ${
+          theme === 'dark'
+            ? 'border-slate-800/80 bg-slate-950/60'
+            : 'border-slate-300 bg-white shadow-sm'
+        }`}
+      >
         <div className="flex flex-col items-center space-y-6">
           {/* Logo */}
           <div className="w-10 h-10 rounded-2xl bg-gradient-to-tr from-blue-600 to-indigo-500 flex items-center justify-center shadow-lg shadow-blue-500/20">
             <Cpu className="w-5 h-5 text-white" />
           </div>
 
-          {/* Navigation Tabs */}
+          {/* New Chat Button */}
+          <button
+            onClick={() => {
+              setCurrentSlot(prev => prev + 1);
+              setActiveTab('chat');
+            }}
+            className="w-10 h-10 rounded-xl bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 flex items-center justify-center transition-all border border-blue-500/30"
+            title={`${t.newChat} (Ctrl+N) - Slot #${currentSlot + 1}`}
+          >
+            <Plus className="w-5 h-5" />
+          </button>
+
+          {/* Quick Search */}
+          <button
+            onClick={() => setIsSearchOpen(true)}
+            className="w-10 h-10 rounded-xl bg-slate-800/40 hover:bg-slate-800 text-slate-400 hover:text-slate-200 flex items-center justify-center transition-all"
+            title={`${t.searchDialogTitle} (Ctrl+K)`}
+          >
+            <Search className="w-4 h-4" />
+          </button>
+
+          {/* Workspaces */}
           <div className="flex flex-col items-center space-y-2">
             <button
               onClick={() => setActiveTab('chat')}
-              className={`p-3 rounded-xl transition-all ${
+              className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 ${
                 activeTab === 'chat'
-                  ? 'bg-blue-600/20 text-blue-400 border border-blue-500/30 shadow-md shadow-blue-500/10'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                  ? 'bg-blue-600 text-white shadow-lg shadow-blue-600/30'
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
               }`}
-              title="Streaming Chat Workspace"
+              title={t.chatTitle}
             >
               <MessageSquare className="w-5 h-5" />
             </button>
 
             <button
               onClick={() => setActiveTab('atlas')}
-              className={`p-3 rounded-xl transition-all ${
+              className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 ${
                 activeTab === 'atlas'
-                  ? 'bg-cyan-600/20 text-cyan-400 border border-cyan-500/30 shadow-md shadow-cyan-500/10'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                  ? 'bg-cyan-600 text-white shadow-lg shadow-cyan-600/30'
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
               }`}
-              title="3D Cortex Atlas"
+              title={t.atlasTitle}
             >
               <Activity className="w-5 h-5" />
             </button>
 
             <button
               onClick={() => setActiveTab('profiler')}
-              className={`p-3 rounded-xl transition-all ${
+              className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 ${
                 activeTab === 'profiler'
-                  ? 'bg-emerald-600/20 text-emerald-400 border border-emerald-500/30 shadow-md shadow-emerald-500/10'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                  ? 'bg-emerald-600 text-white shadow-lg shadow-emerald-600/30'
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
               }`}
-              title="Latency & Tier Profiler"
+              title={t.profilerTitle}
             >
-              <HardDrive className="w-5 h-5" />
+              <Cpu className="w-5 h-5" />
             </button>
 
             <button
               onClick={() => setActiveTab('systemone')}
-              className={`p-3 rounded-xl transition-all ${
+              className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 ${
                 activeTab === 'systemone'
-                  ? 'bg-purple-600/20 text-purple-400 border border-purple-500/30 shadow-md shadow-purple-500/10'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                  ? 'bg-purple-600 text-white shadow-lg shadow-purple-600/30'
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
               }`}
-              title="System One Decision Engine"
+              title={t.systemOneTitle}
             >
               <Target className="w-5 h-5" />
             </button>
 
             <button
               onClick={() => setActiveTab('images')}
-              className={`p-3 rounded-xl transition-all ${
+              className={`w-10 h-10 rounded-xl flex items-center justify-center transition-all duration-200 ${
                 activeTab === 'images'
-                  ? 'bg-pink-600/20 text-pink-400 border border-pink-500/30 shadow-md shadow-pink-500/10'
-                  : 'text-slate-400 hover:text-slate-200 hover:bg-slate-900'
+                  ? 'bg-pink-600 text-white shadow-lg shadow-pink-600/30'
+                  : 'text-slate-400 hover:bg-slate-800 hover:text-slate-200'
               }`}
-              title="Neural Latent Image Synthesis"
+              title={t.imageTitle}
             >
               <ImageIcon className="w-5 h-5" />
             </button>
           </div>
         </div>
 
-        {/* Settings Button */}
-        <button
-          onClick={() => setIsSettingsOpen(true)}
-          className="p-3 rounded-xl text-slate-400 hover:text-slate-200 hover:bg-slate-900 transition-all"
-          title="Engine Settings (Ctrl+K)"
-        >
-          <Settings className="w-5 h-5" />
-        </button>
+        {/* Bottom Actions: Theme Toggle & Settings */}
+        <div className="flex flex-col items-center space-y-3">
+          <button
+            onClick={() => setTheme(prev => (prev === 'dark' ? 'light' : 'dark'))}
+            className="w-10 h-10 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-slate-200 flex items-center justify-center transition-colors"
+            title={`${t.toggleTheme} (Ctrl+Shift+L)`}
+          >
+            {theme === 'dark' ? <Sun className="w-4 h-4 text-amber-400" /> : <Moon className="w-4 h-4 text-indigo-500" />}
+          </button>
+
+          <button
+            onClick={() => setIsSettingsOpen(true)}
+            className="w-10 h-10 rounded-xl text-slate-400 hover:bg-slate-800 hover:text-slate-200 flex items-center justify-center transition-colors"
+            title={t.settingsTitle}
+          >
+            <Settings className="w-5 h-5" />
+          </button>
+        </div>
       </div>
 
-      {/* Main Workspace Area */}
-      <div className="flex-1 h-full overflow-hidden">
-        {activeTab === 'chat' && <ChatWorkspace health={health} onRefreshHealth={fetchHealth} />}
-        {activeTab === 'atlas' && <CortexAtlas />}
-        {activeTab === 'profiler' && <ProfilerDashboard health={health} />}
-        {activeTab === 'systemone' && <SystemOneWorkspace />}
-        {activeTab === 'images' && <ImageWorkspace />}
+      {/* Main Content Area */}
+      <div className="flex-1 h-full overflow-hidden relative">
+        {activeTab === 'chat' && (
+          <ChatWorkspace health={health} t={t} currentSlot={currentSlot} onRefreshHealth={fetchHealth} />
+        )}
+        {activeTab === 'atlas' && <CortexAtlas t={t} />}
+        {activeTab === 'profiler' && <ProfilerDashboard health={health} t={t} />}
+        {activeTab === 'systemone' && <SystemOneWorkspace t={t} />}
+        {activeTab === 'images' && <ImageWorkspace t={t} />}
       </div>
 
       {/* Settings Modal */}
@@ -187,7 +274,56 @@ export const App: React.FC = () => {
         isOpen={isSettingsOpen}
         onClose={() => setIsSettingsOpen(false)}
         health={health}
+        language={language}
+        onSelectLanguage={setLanguage}
+        t={t}
+        systemPrompt={systemPrompt}
+        onSaveSystemPrompt={setSystemPrompt}
       />
+
+      {/* Ctrl+K Conversation Search Dialog */}
+      {isSearchOpen && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-start justify-center pt-24 p-6">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-lg p-5 shadow-2xl space-y-4">
+            <div className="flex items-center space-x-3 border-b border-slate-800 pb-3">
+              <Search className="w-5 h-5 text-blue-400" />
+              <input
+                type="text"
+                autoFocus
+                value={searchQuery}
+                onChange={e => setSearchQuery(e.target.value)}
+                placeholder={t.searchPlaceholder}
+                className="w-full bg-transparent text-sm text-slate-100 placeholder-slate-500 focus:outline-none font-sans"
+              />
+              <span className="text-xs font-mono text-slate-500 px-1.5 py-0.5 rounded border border-slate-800">
+                Esc
+              </span>
+            </div>
+
+            <div className="space-y-1.5 max-h-64 overflow-y-auto">
+              {searchResults.length > 0 ? (
+                searchResults.map(item => (
+                  <button
+                    key={item.id}
+                    onClick={() => {
+                      setActiveTab(item.tab);
+                      setIsSearchOpen(false);
+                    }}
+                    className="w-full px-3.5 py-2.5 rounded-xl text-left text-xs font-mono text-slate-300 hover:bg-slate-800 hover:text-white transition-colors flex items-center justify-between"
+                  >
+                    <span>{item.title}</span>
+                    <span className="text-[10px] uppercase text-slate-500">{item.tab}</span>
+                  </button>
+                ))
+              ) : (
+                <div className="text-center py-6 text-xs text-slate-500 font-mono">
+                  No matching sessions or commands found.
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

@@ -37,6 +37,11 @@ struct LayerDenseWeights {
     const TensorDescriptor* wk = nullptr;
     const TensorDescriptor* wv = nullptr;
     const TensorDescriptor* wo = nullptr;
+    const TensorDescriptor* bq = nullptr;
+    const TensorDescriptor* bk = nullptr;
+    const TensorDescriptor* bv = nullptr;
+    const TensorDescriptor* attn_q_norm = nullptr;
+    const TensorDescriptor* attn_k_norm = nullptr;
     const TensorDescriptor* ffn_norm = nullptr;
     const TensorDescriptor* router_gate = nullptr; // [n_experts, dim]
 
@@ -139,7 +144,18 @@ public:
         uint32_t slot_id,
         bool enable_context_compaction,
         const SamplerConfig& sampler_cfg,
-        StreamCallback on_token
+        StreamCallback on_token,
+        bool continue_assistant = false,
+        bool enable_speculative = false,
+        uint32_t draft_count = 2
+    );
+
+    // Multi-Token Prediction (MTP) speculative batch verification helper
+    std::vector<uint32_t> verify_speculative_batch(
+        uint32_t slot_id,
+        const std::vector<uint32_t>& draft_tokens,
+        const SamplerConfig& sampler_cfg,
+        ProfileSample* out_profile = nullptr
     );
 
     // SystemOne zero-token-generation categorical decision engine

@@ -1,8 +1,13 @@
 import React, { useState } from 'react';
-import { Target, CheckCircle2, Loader2, Sparkles } from 'lucide-react';
+import { Target, CheckCircle2, Loader2, Sparkles, Gauge } from 'lucide-react';
 import { SystemOneResult } from '../types';
+import { Translations } from '../utils/i18n';
 
-export const SystemOneWorkspace: React.FC = () => {
+interface SystemOneWorkspaceProps {
+  t: Translations;
+}
+
+export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => {
   const [document, setDocument] = useState(
     'The kernel module detected an unexpected page-fault exception in the high-memory I/O driver pool under sustained NVMe streaming load. However, the LFRU fallback buffer caught the fault and routed the request without corruption.'
   );
@@ -11,10 +16,36 @@ export const SystemOneWorkspace: React.FC = () => {
   const [isLoading, setIsLoading] = useState(false);
   const [result, setResult] = useState<SystemOneResult | null>(null);
 
+  const calculateEntropyAndConfidence = (
+    options: { probability: number }[]
+  ): { entropy: number; confidence: 'Very High' | 'High' | 'Moderate' | 'Low' | 'Ambiguous' } => {
+    if (options.length <= 1) return { entropy: 0, confidence: 'Very High' };
+    let entropy = 0;
+    for (const opt of options) {
+      if (opt.probability > 1e-9) {
+        entropy -= opt.probability * Math.log2(opt.probability);
+      }
+    }
+    const maxEntropy = Math.log2(options.length);
+    const normalizedEntropy = maxEntropy > 0 ? entropy / maxEntropy : 0;
+
+    let confidence: 'Very High' | 'High' | 'Moderate' | 'Low' | 'Ambiguous' = 'Moderate';
+    if (normalizedEntropy < 0.2) confidence = 'Very High';
+    else if (normalizedEntropy < 0.45) confidence = 'High';
+    else if (normalizedEntropy < 0.7) confidence = 'Moderate';
+    else if (normalizedEntropy < 0.9) confidence = 'Low';
+    else confidence = 'Ambiguous';
+
+    return { entropy, confidence };
+  };
+
   const handleEvaluate = async () => {
     setIsLoading(true);
     try {
-      const opts = optionsStr.split(',').map(s => s.trim()).filter(Boolean);
+      const opts = optionsStr
+        .split(',')
+        .map(s => s.trim())
+        .filter(Boolean);
       const res = await fetch('/v1/systemone', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
@@ -26,7 +57,12 @@ export const SystemOneWorkspace: React.FC = () => {
       });
       if (res.ok) {
         const data = await res.json();
-        setResult(data);
+        const { entropy, confidence } = calculateEntropyAndConfidence(data.options || []);
+        setResult({
+          ...data,
+          entropy,
+          confidence
+        });
       }
     } catch (e) {
       console.error(e);
@@ -45,9 +81,9 @@ export const SystemOneWorkspace: React.FC = () => {
               <Target className="w-5 h-5" />
             </div>
             <div>
-              <h2 className="text-xl font-bold text-slate-100">System One Decision Engine</h2>
+              <h2 className="text-xl font-bold text-slate-100">{t.systemOneTitle}</h2>
               <p className="text-xs text-slate-400 font-mono">
-                Categorical Evaluation with Zero Token Generation Cost (LM Head Projections)
+                {t.zeroTokensGenerated}
               </p>
             </div>
           </div>
@@ -57,7 +93,7 @@ export const SystemOneWorkspace: React.FC = () => {
         <div className="p-6 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4 shadow-xl">
           <div>
             <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
-              Context Document
+              {t.evalDocument}
             </label>
             <textarea
               rows={4}
@@ -70,7 +106,7 @@ export const SystemOneWorkspace: React.FC = () => {
           <div className="grid grid-cols-2 gap-4">
             <div>
               <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
-                Evaluation Query
+                {t.evalQuery}
               </label>
               <input
                 type="text"
@@ -82,13 +118,13 @@ export const SystemOneWorkspace: React.FC = () => {
 
             <div>
               <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
-                Candidate Options (comma separated)
+                {t.candidateOptions}
               </label>
               <input
                 type="text"
                 value={optionsStr}
                 onChange={e => setOptionsStr(e.target.value)}
-                className="w-full bg-slate-950/80 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-purple-500/50"
+                className="w-full bg-slate-950/80 border border-slate-700/80 rounded-xl px-3.5 py-2.5 text-sm text-slate-100 focus:outline-none focus:ring-2 focus:ring-purple-500/50 font-mono"
               />
             </div>
           </div>
@@ -97,65 +133,85 @@ export const SystemOneWorkspace: React.FC = () => {
             <button
               onClick={handleEvaluate}
               disabled={isLoading || !document.trim()}
-              className="px-6 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-medium text-sm transition-all duration-200 disabled:opacity-50 flex items-center space-x-2 shadow-lg shadow-purple-600/20"
+              className="px-6 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-medium text-sm transition-all duration-200 disabled:opacity-50 flex items-center space-x-2 shadow-lg shadow-purple-600/20 cursor-pointer"
             >
               {isLoading ? (
                 <>
                   <Loader2 className="w-4 h-4 animate-spin" />
-                  <span>Computing Logits...</span>
+                  <span>Evaluating LM Head Logits...</span>
                 </>
               ) : (
                 <>
                   <Sparkles className="w-4 h-4" />
-                  <span>Score Decisions Instantly</span>
+                  <span>{t.evaluate}</span>
                 </>
               )}
             </button>
           </div>
         </div>
 
-        {/* Results Scoring Card */}
+        {/* Results & Shannon Entropy Visualization */}
         {result && (
-          <div className="p-6 rounded-2xl bg-slate-900/40 border border-purple-500/30 space-y-5 shadow-2xl">
+          <div className="p-6 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-6 shadow-xl">
+            {/* Top Recommended Banner */}
             <div className="flex items-center justify-between border-b border-slate-800 pb-4">
-              <div>
-                <span className="text-xs font-mono text-purple-400 font-semibold uppercase">
-                  Top Recommended Decision
+              <div className="flex items-center space-x-2.5">
+                <CheckCircle2 className="w-5 h-5 text-emerald-400" />
+                <span className="text-sm font-semibold text-slate-200">Recommended Selection:</span>
+                <span className="text-base font-bold text-white px-3 py-0.5 rounded-lg bg-emerald-950/80 border border-emerald-500/40 text-emerald-300">
+                  {result.recommended}
                 </span>
-                <div className="text-2xl font-bold text-white flex items-center space-x-2 mt-1">
-                  <CheckCircle2 className="w-6 h-6 text-emerald-400" />
-                  <span>{result.recommended}</span>
+              </div>
+              <div className="text-xs font-mono text-slate-400">
+                Evaluation Step: <span className="text-purple-400 font-bold">{result.wall_ms.toFixed(3)} ms</span> (0 Tokens Generated)
+              </div>
+            </div>
+
+            {/* Entropy & Confidence Gauges */}
+            <div className="grid grid-cols-2 gap-4">
+              <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 flex items-center space-x-3">
+                <Gauge className="w-5 h-5 text-cyan-400" />
+                <div>
+                  <div className="text-[11px] font-mono text-slate-400">{t.entropy} (H)</div>
+                  <div className="text-base font-bold font-mono text-cyan-300">
+                    {result.entropy !== undefined ? `${result.entropy.toFixed(3)} bits` : '--'}
+                  </div>
                 </div>
               </div>
 
-              <div className="text-right text-xs font-mono text-slate-400">
-                <div>Wall Time: <span className="text-emerald-400 font-bold">{result.wall_ms.toFixed(2)} ms</span></div>
-                <div>Tokens Generated: <span className="text-purple-400 font-bold">0 (Pure Math)</span></div>
+              <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 flex items-center space-x-3">
+                <Sparkles className="w-5 h-5 text-purple-400" />
+                <div>
+                  <div className="text-[11px] font-mono text-slate-400">{t.confidence}</div>
+                  <div className="text-base font-bold font-mono text-purple-300">
+                    {result.confidence || 'High'}
+                  </div>
+                </div>
               </div>
             </div>
 
             {/* Probability Bars */}
             <div className="space-y-3">
-              {result.options.map(opt => {
+              {result.options.map((opt, idx) => {
                 const pct = Math.round(opt.probability * 100);
-                const isTop = opt.option === result.recommended;
+                const isTop = idx === 0;
                 return (
-                  <div key={opt.option} className="space-y-1">
-                    <div className="flex items-center justify-between text-xs font-mono">
-                      <span className={isTop ? 'text-white font-bold' : 'text-slate-400'}>
-                        {opt.option}
+                  <div key={opt.option} className="space-y-1.5">
+                    <div className="flex justify-between text-xs font-mono">
+                      <span className={isTop ? 'text-white font-bold' : 'text-slate-300'}>
+                        {opt.option} {isTop && '★'}
                       </span>
-                      <span className={isTop ? 'text-emerald-400 font-bold' : 'text-slate-500'}>
-                        {pct}% (logit: {opt.logit.toFixed(3)})
+                      <span className="text-purple-400 font-bold">
+                        {pct}% ({opt.probability.toFixed(4)})
                       </span>
                     </div>
-                    <div className="w-full h-3 rounded-full bg-slate-800 overflow-hidden">
+                    <div className="w-full bg-slate-950 rounded-full h-3 overflow-hidden p-0.5 border border-slate-800">
                       <div
-                        style={{ width: `${pct}%` }}
+                        style={{ width: `${Math.max(2, pct)}%` }}
                         className={`h-full rounded-full transition-all duration-500 ${
                           isTop
-                            ? 'bg-gradient-to-r from-emerald-500 to-cyan-400 shadow-md shadow-emerald-500/30'
-                            : 'bg-slate-600'
+                            ? 'bg-gradient-to-r from-purple-500 to-indigo-500'
+                            : 'bg-slate-700'
                         }`}
                       />
                     </div>

@@ -294,7 +294,11 @@ bool ModelFile::parse_gguf(std::string& err_msg) {
     for (auto& td : temp_tensors) {
         td.abs_file_offset = data_offset_ + td.offset;
         if (td.abs_file_offset + td.byte_size > file_size_) {
-            err_msg = "Tensor exceeds file bounds: " + td.name;
+            err_msg = "Tensor exceeds file bounds: " + td.name +
+                      " (abs_offset: " + std::to_string(td.abs_file_offset) +
+                      ", byte_size: " + std::to_string(td.byte_size) +
+                      ", type: " + std::to_string(static_cast<int>(td.type)) +
+                      ", file_size: " + std::to_string(file_size_) + ")";
             return false;
         }
         td.mapped_ptr = mapped_base_ + td.abs_file_offset;

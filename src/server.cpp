@@ -499,11 +499,15 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         uint32_t max_tokens = static_cast<uint32_t>(std::clamp(extract_json_number(body, "max_tokens", 56.0), 1.0, 512.0));
         uint32_t slot_id = static_cast<uint32_t>(std::max(0.0, extract_json_number(body, "cache_slot", 0.0)));
         bool compaction = extract_json_bool(body, "context_compaction", true);
+        bool continue_asst = extract_json_bool(body, "continue_assistant", false);
+        bool speculative = extract_json_bool(body, "speculative", false);
+        uint32_t draft_count = static_cast<uint32_t>(std::clamp(extract_json_number(body, "draft_tokens", 2.0), 1.0, 4.0));
 
         SamplerConfig scfg;
-        scfg.temperature = static_cast<float>(extract_json_number(body, "temperature", 0.0)); // default deterministic
-        scfg.top_k = static_cast<uint32_t>(extract_json_number(body, "top_k", 1.0));
+        scfg.temperature = static_cast<float>(extract_json_number(body, "temperature", 0.7));
+        scfg.top_k = static_cast<uint32_t>(extract_json_number(body, "top_k", 40.0));
         scfg.top_p = static_cast<float>(extract_json_number(body, "top_p", 0.9));
+        scfg.repetition_penalty = static_cast<float>(extract_json_number(body, "repetition_penalty", 1.1));
 
         if (!stream) {
             std::string reasoning_acc;
@@ -515,7 +519,10 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                     if (is_reasoning) reasoning_acc += piece;
                     else content_acc += piece;
                     return true;
-                }
+                },
+                continue_asst,
+                speculative,
+                draft_count
             );
 
             std::ostringstream js;
@@ -577,7 +584,10 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                    << "}\n\n";
                 std::string chunk = ev.str();
                 return send_all(client_sock, chunk.data(), chunk.size());
-            }
+            },
+            continue_asst,
+            speculative,
+            draft_count
         );
 
         // If user explicitly asked for an interactive HTML or SVG preview, also emit a fenced HTML/SVG snippet chunk
@@ -672,23 +682,29 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     }
 
     // ------------------------------------------------------------------------
-    // 7. Static File Serving from `web/dist`
+    // 7. Static File Serving from `web_root_`
     // ------------------------------------------------------------------------
-    if (method == "GET") {
-        std::string rel = (path == "/" || path.empty()) ? "/index.html" : path;
-        if (rel.find("..") != std::string::npos) {
+    if (method == "GET" || method == "HEAD") {
+        std::string clean_path = path;
+        if (clean_path.empty() || clean_path == "/") clean_path = "/index.html";
+        if (clean_path.find("..") != std::string::npos) {
             send_http_json(client_sock, 403, "Forbidden", "{\"error\":\"Forbidden\"}");
             return;
         }
-        std::string full_path = web_root_ + rel;
-        if (!std::filesystem::exists(full_path)) {
+
+        std::filesystem::path root_p(web_root_);
+        std::string sub = clean_path.starts_with("/") ? clean_path.substr(1) : clean_path;
+        std::filesystem::path target_p = root_p / sub;
+
+        if (!std::filesystem::exists(target_p)) {
             // SPA fallback to index.html
-            full_path = web_root_ + "/index.html";
+            target_p = root_p / "index.html";
         }
-        if (std::filesystem::exists(full_path) && std::filesystem::is_regular_file(full_path)) {
-            std::ifstream ifs(full_path, std::ios::binary);
+
+        if (std::filesystem::exists(target_p) && std::filesystem::is_regular_file(target_p)) {
+            std::ifstream ifs(target_p, std::ios::binary);
             std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-            std::string mime = mime_type_for_path(full_path);
+            std::string mime = mime_type_for_path(target_p.string());
 
             std::ostringstream hdr;
             hdr << "HTTP/1.1 200 OK\r\n"
@@ -698,7 +714,9 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                 << "Connection: close\r\n\r\n";
             std::string h = hdr.str();
             send_all(client_sock, h.data(), h.size());
-            send_all(client_sock, content.data(), content.size());
+            if (method == "GET") {
+                send_all(client_sock, content.data(), content.size());
+            }
             return;
         }
     }

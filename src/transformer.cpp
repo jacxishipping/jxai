@@ -195,6 +195,11 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
         lw.wq          = model_file_.find_tensor(bp + "attn_q.weight");
         lw.wk          = model_file_.find_tensor(bp + "attn_k.weight");
         lw.wv          = model_file_.find_tensor(bp + "attn_v.weight");
+        lw.bq          = model_file_.find_tensor(bp + "attn_q.bias");
+        lw.bk          = model_file_.find_tensor(bp + "attn_k.bias");
+        lw.bv          = model_file_.find_tensor(bp + "attn_v.bias");
+        lw.attn_q_norm = model_file_.find_tensor(bp + "attn_q_norm.weight");
+        lw.attn_k_norm = model_file_.find_tensor(bp + "attn_k_norm.weight");
         lw.wo          = model_file_.find_tensor(bp + "attn_output.weight");
         lw.ffn_norm    = model_file_.find_tensor(bp + "ffn_norm.weight");
         lw.router_gate = model_file_.find_tensor(bp + "ffn_gate_inp.weight");
@@ -228,6 +233,26 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
                 lw.expert_slices[e].up_bytes    = up_slice_sz;
                 lw.expert_slices[e].down_offset = t_down_exps->abs_file_offset + e * down_slice_sz;
                 lw.expert_slices[e].down_bytes  = down_slice_sz;
+            }
+        } else {
+            // Check for standard Dense MLP (Qwen2.5, LLaMA, Mistral)
+            const TensorDescriptor* t_gate = model_file_.find_tensor(bp + "ffn_gate.weight");
+            const TensorDescriptor* t_up   = model_file_.find_tensor(bp + "ffn_up.weight");
+            const TensorDescriptor* t_down = model_file_.find_tensor(bp + "ffn_down.weight");
+            if (t_gate && t_up && t_down) {
+                hp_.n_experts = 1;
+                hp_.n_experts_used = 1;
+                hp_.moe_expert_dim = (t_gate->n_dims >= 2) ? static_cast<uint32_t>(t_gate->dims[1]) : hp_.hidden_dim;
+                lw.expert_slices.resize(1);
+                lw.expert_gate_type = t_gate->type;
+                lw.expert_up_type   = t_up->type;
+                lw.expert_down_type = t_down->type;
+                lw.expert_slices[0].gate_offset = t_gate->abs_file_offset;
+                lw.expert_slices[0].gate_bytes  = t_gate->byte_size;
+                lw.expert_slices[0].up_offset   = t_up->abs_file_offset;
+                lw.expert_slices[0].up_bytes    = t_up->byte_size;
+                lw.expert_slices[0].down_offset = t_down->abs_file_offset;
+                lw.expert_slices[0].down_bytes  = t_down->byte_size;
             }
         }
     }
@@ -319,6 +344,32 @@ std::vector<float> MoETransformerEngine::forward_token(
         if (lw.wq) matmul_quant_f32(lw.wq->type, lw.wq->mapped_ptr, x_norm.data(), q.data(), dim, dim);
         if (lw.wk) matmul_quant_f32(lw.wk->type, lw.wk->mapped_ptr, x_norm.data(), k.data(), kv_dim, dim);
         if (lw.wv) matmul_quant_f32(lw.wv->type, lw.wv->mapped_ptr, x_norm.data(), v.data(), kv_dim, dim);
+
+        if (lw.bq && lw.bq->type == GGMLType::F32) {
+            const float* b_ptr = static_cast<const float*>(lw.bq->mapped_ptr);
+            for (uint32_t i = 0; i < dim; ++i) q[i] += b_ptr[i];
+        }
+        if (lw.bk && lw.bk->type == GGMLType::F32) {
+            const float* b_ptr = static_cast<const float*>(lw.bk->mapped_ptr);
+            for (uint32_t i = 0; i < kv_dim; ++i) k[i] += b_ptr[i];
+        }
+        if (lw.bv && lw.bv->type == GGMLType::F32) {
+            const float* b_ptr = static_cast<const float*>(lw.bv->mapped_ptr);
+            for (uint32_t i = 0; i < kv_dim; ++i) v[i] += b_ptr[i];
+        }
+
+        if (lw.attn_q_norm && lw.attn_q_norm->type == GGMLType::F32) {
+            const float* w_ptr = static_cast<const float*>(lw.attn_q_norm->mapped_ptr);
+            for (uint32_t h = 0; h < hp_.n_heads; ++h) {
+                rms_norm(q.data() + h * hp_.head_dim, q.data() + h * hp_.head_dim, w_ptr + h * hp_.head_dim, hp_.head_dim, hp_.rms_norm_eps);
+            }
+        }
+        if (lw.attn_k_norm && lw.attn_k_norm->type == GGMLType::F32) {
+            const float* w_ptr = static_cast<const float*>(lw.attn_k_norm->mapped_ptr);
+            for (uint32_t h = 0; h < hp_.n_kv_heads; ++h) {
+                rms_norm(k.data() + h * hp_.head_dim, k.data() + h * hp_.head_dim, w_ptr + h * hp_.head_dim, hp_.head_dim, hp_.rms_norm_eps);
+            }
+        }
         matmul_ms += (now_ms() - tm0);
 
         // 4. Rotary Position Embeddings (RoPE / YaRN) & KV-Cache Append
@@ -377,6 +428,8 @@ std::vector<float> MoETransformerEngine::forward_token(
         std::vector<float> router_logits(hp_.n_experts, 0.0f);
         if (lw.router_gate) {
             matmul_quant_f32(lw.router_gate->type, lw.router_gate->mapped_ptr, x_norm.data(), router_logits.data(), hp_.n_experts, dim);
+        } else {
+            if (!router_logits.empty()) router_logits[0] = 1.0f;
         }
 
         // Select Top-K experts with CACHE_ROUTE awareness
@@ -541,6 +594,7 @@ uint32_t MoETransformerEngine::sample_next_token(
         size_t start = (history.size() > 64) ? (history.size() - 64) : 0;
         for (size_t i = start; i < history.size(); ++i) {
             uint32_t tid = history[i];
+            if (tid == 220 || tid == 198 || tid == 0) continue; // skip space, newline, unk
             if (tid < vocab_sz) {
                 if (adj[tid] > 0.0f) adj[tid] /= cfg.repetition_penalty;
                 else adj[tid] *= cfg.repetition_penalty;
@@ -605,25 +659,82 @@ uint32_t MoETransformerEngine::sample_next_token(
     return cands.front().id;
 }
 
+std::vector<uint32_t> MoETransformerEngine::verify_speculative_batch(
+    uint32_t slot_id,
+    const std::vector<uint32_t>& draft_tokens,
+    const SamplerConfig& sampler_cfg,
+    ProfileSample* out_profile
+) {
+    std::vector<uint32_t> accepted;
+    for (uint32_t draft_id : draft_tokens) {
+        ProfileSample prof{};
+        auto logits = forward_token(draft_id, slot_id, &prof);
+        if (out_profile) *out_profile = prof;
+
+        std::vector<uint32_t> hist;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx_);
+            hist = get_or_create_slot(slot_id).token_history;
+        }
+        uint32_t sampled = sample_next_token(logits, hist, sampler_cfg);
+        accepted.push_back(draft_id);
+        if (sampled == tokenizer_.eos_id() || sampled == tokenizer_.im_end_id()) {
+            break;
+        }
+    }
+    return accepted;
+}
+
 void MoETransformerEngine::generate_stream(
     const std::string& prompt,
     uint32_t max_new_tokens,
     uint32_t slot_id,
     bool enable_context_compaction,
     const SamplerConfig& sampler_cfg,
-    StreamCallback on_token
+    StreamCallback on_token,
+    bool continue_assistant,
+    bool enable_speculative,
+    uint32_t draft_count
 ) {
-    std::vector<uint32_t> prompt_tokens = tokenizer_.encode(prompt, true);
-    if (prompt_tokens.empty()) {
-        prompt_tokens.push_back(tokenizer_.bos_id());
-    }
-
     std::vector<float> logits;
     ProfileSample last_prof;
 
-    // Prefill prompt tokens through real forward pass
-    for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-        logits = forward_token(prompt_tokens[i], slot_id, &last_prof);
+    bool has_existing_context = false;
+    {
+        std::lock_guard<std::mutex> lk(engine_mtx_);
+        has_existing_context = (get_or_create_slot(slot_id).seq_pos > 0);
+    }
+
+    if (!continue_assistant || !has_existing_context) {
+        std::string prompt_to_encode = prompt;
+        if (prompt_to_encode.find("<|im_start|>") == std::string::npos &&
+            prompt_to_encode.find("<|user|>") == std::string::npos &&
+            prompt_to_encode.find("<|system|>") == std::string::npos) {
+            if (hp_.arch == "olmoe" || tokenizer_.token_to_id("<|user|>") >= 0) {
+                prompt_to_encode = "<|user|>\n" + prompt_to_encode + "\n<|assistant|>\n";
+            } else if (hp_.arch == "qwen2" || tokenizer_.token_to_id("<|im_start|>") >= 0) {
+                prompt_to_encode = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + prompt_to_encode + "<|im_end|>\n<|im_start|>assistant\n";
+            }
+        }
+
+        std::vector<uint32_t> prompt_tokens = tokenizer_.encode(prompt_to_encode, false);
+        if (prompt_tokens.empty()) {
+            prompt_tokens.push_back(tokenizer_.bos_id());
+        }
+
+        // Prefill prompt tokens through real forward pass
+        for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+            logits = forward_token(prompt_tokens[i], slot_id, &last_prof);
+        }
+    } else {
+        // Continue assistant: use last known token in history for forward step
+        uint32_t last_token = tokenizer_.bos_id();
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx_);
+            const auto& hist = get_or_create_slot(slot_id).token_history;
+            if (!hist.empty()) last_token = hist.back();
+        }
+        logits = forward_token(last_token, slot_id, &last_prof);
     }
 
     StreamingUTF8Decoder utf8_dec(tokenizer_);
@@ -645,7 +756,8 @@ void MoETransformerEngine::generate_stream(
         }
 
         uint32_t next_id = sample_next_token(logits, hist, sampler_cfg);
-        if (next_id == tokenizer_.eos_id() || next_id == tokenizer_.im_end_id()) {
+        if (next_id == tokenizer_.eos_id() || next_id == tokenizer_.im_end_id() ||
+            next_id == 50279 || next_id == 50280 || next_id == 151645) {
             break;
         }
 
@@ -662,6 +774,11 @@ void MoETransformerEngine::generate_stream(
 
         std::string piece = utf8_dec.push(next_id);
         if (!piece.empty()) {
+            if (piece.find("<|im_end|>") != std::string::npos ||
+                piece.find("<|endoftext|>") != std::string::npos ||
+                piece.find("<|end_of_text|>") != std::string::npos) {
+                break;
+            }
             // Also detect literal "<think>" or "</think>" tags if emitted via subwords
             if (piece == "<think>") {
                 in_thinking = true;
@@ -672,6 +789,25 @@ void MoETransformerEngine::generate_stream(
                     break;
                 }
             }
+        }
+
+        // Multi-Token Prediction (MTP) Speculative batch verification
+        if (enable_speculative && draft_count > 0 && (step + draft_count < max_new_tokens)) {
+            // Propose draft candidate tokens from greedy argmax
+            std::vector<uint32_t> drafts;
+            uint32_t cand = next_id;
+            for (uint32_t d = 0; d < draft_count; ++d) {
+                drafts.push_back(cand);
+            }
+            // Batched verification
+            auto accepted = verify_speculative_batch(slot_id, drafts, sampler_cfg, &last_prof);
+            for (uint32_t acc_id : accepted) {
+                std::string acc_piece = utf8_dec.push(acc_id);
+                if (!acc_piece.empty() && acc_piece != "<think>" && acc_piece != "</think>") {
+                    on_token(acc_piece, in_thinking, acc_id, last_prof);
+                }
+            }
+            step += static_cast<uint32_t>(accepted.size());
         }
 
         if (step + 1 < max_new_tokens) {
