@@ -882,6 +882,31 @@ private:
                     return 0;
                 }
 
+                if (show_settings_) {
+                    bool ch = (mx >= settings_close_btn_.left && mx <= settings_close_btn_.right &&
+                               my >= settings_close_btn_.top && my <= settings_close_btn_.bottom);
+                    if (ch != settings_close_hovered_) { settings_close_hovered_ = ch; need_redraw = true; }
+
+                    bool sh = (mx >= settings_save_btn_.left && mx <= settings_save_btn_.right &&
+                               my >= settings_save_btn_.top && my <= settings_save_btn_.bottom);
+                    if (sh != settings_save_hovered_) { settings_save_hovered_ = sh; need_redraw = true; }
+
+                    bool rh = (mx >= settings_reload_btn_.left && mx <= settings_reload_btn_.right &&
+                               my >= settings_reload_btn_.top && my <= settings_reload_btn_.bottom);
+                    if (rh != settings_reload_hovered_) { settings_reload_hovered_ = rh; need_redraw = true; }
+
+                    bool dh = (mx >= settings_defaults_btn_.left && mx <= settings_defaults_btn_.right &&
+                               my >= settings_defaults_btn_.top && my <= settings_defaults_btn_.bottom);
+                    if (dh != settings_defaults_hovered_) { settings_defaults_hovered_ = dh; need_redraw = true; }
+
+                    bool cnh = (mx >= settings_cancel_btn_.left && mx <= settings_cancel_btn_.right &&
+                                my >= settings_cancel_btn_.top && my <= settings_cancel_btn_.bottom);
+                    if (cnh != settings_cancel_hovered_) { settings_cancel_hovered_ = cnh; need_redraw = true; }
+
+                    if (need_redraw) InvalidateRect(hwnd_, nullptr, FALSE);
+                    return 0;
+                }
+
                 // Check quick chips hover
                 for (auto& chip : quick_chips_) {
                     bool hover = (mx >= chip.rect.left && mx <= chip.rect.right &&
@@ -938,6 +963,11 @@ private:
 
             case WM_KEYDOWN: {
                 if (wParam == VK_ESCAPE) {
+                    if (show_settings_) {
+                        show_settings_ = false;
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
                     if (show_wizard_) {
                         show_wizard_ = false;
                         InvalidateRect(hwnd_, nullptr, FALSE);
@@ -955,6 +985,199 @@ private:
             case WM_LBUTTONDOWN: {
                 float mx = static_cast<float>(GET_X_LPARAM(lParam));
                 float my = static_cast<float>(GET_Y_LPARAM(lParam));
+
+                if (show_settings_) {
+                    // Close or Cancel button
+                    if ((mx >= settings_close_btn_.left && mx <= settings_close_btn_.right &&
+                         my >= settings_close_btn_.top && my <= settings_close_btn_.bottom) ||
+                        (mx >= settings_cancel_btn_.left && mx <= settings_cancel_btn_.right &&
+                         my >= settings_cancel_btn_.top && my <= settings_cancel_btn_.bottom)) {
+                        show_settings_ = false;
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // Reload button
+                    if (mx >= settings_reload_btn_.left && mx <= settings_reload_btn_.right &&
+                        my >= settings_reload_btn_.top && my <= settings_reload_btn_.bottom) {
+                        config_.load_from_file("moe_config.json");
+                        config_.is_dirty = false;
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // Defaults button
+                    if (mx >= settings_defaults_btn_.left && mx <= settings_defaults_btn_.right &&
+                        my >= settings_defaults_btn_.top && my <= settings_defaults_btn_.bottom) {
+                        config_.reset_to_defaults();
+                        config_.is_dirty = true;
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // Model choices
+                    if (mx >= settings_mod_demo_btn_.left && mx <= settings_mod_demo_btn_.right &&
+                        my >= settings_mod_demo_btn_.top && my <= settings_mod_demo_btn_.bottom) {
+                        config_.model_path = "models/test_qwen.gguf";
+                        config_.model_name = "qwen2.5-0.5b-instruct";
+                        config_.is_dirty = true;
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (mx >= settings_mod_moe_btn_.left && mx <= settings_mod_moe_btn_.right &&
+                        my >= settings_mod_moe_btn_.top && my <= settings_mod_moe_btn_.bottom) {
+                        config_.model_path = "models/qwen2.5-moe-7b.gguf";
+                        config_.model_name = "qwen2.5-moe-7b-instruct";
+                        config_.is_dirty = true;
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (mx >= settings_mod_custom_btn_.left && mx <= settings_mod_custom_btn_.right &&
+                        my >= settings_mod_custom_btn_.top && my <= settings_mod_custom_btn_.bottom) {
+                        config_.model_path = "models/custom_model.gguf";
+                        config_.model_name = "custom-gguf-model";
+                        config_.is_dirty = true;
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // Toggles
+                    if (mx >= settings_bypass_toggle_btn_.left && mx <= settings_bypass_toggle_btn_.right &&
+                        my >= settings_bypass_toggle_btn_.top && my <= settings_bypass_toggle_btn_.bottom) {
+                        config_.bypass_io = !config_.bypass_io;
+                        config_.is_dirty = true;
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (mx >= settings_dma_toggle_btn_.left && mx <= settings_dma_toggle_btn_.right &&
+                        my >= settings_dma_toggle_btn_.top && my <= settings_dma_toggle_btn_.bottom) {
+                        config_.direct_dma = !config_.direct_dma;
+                        config_.is_dirty = true;
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // PagedAttention blocks stepper
+                    const int bvals[] = { 512, 1024, 2048, 4096 };
+                    if (mx >= settings_blocks_minus_btn_.left && mx <= settings_blocks_minus_btn_.right &&
+                        my >= settings_blocks_minus_btn_.top && my <= settings_blocks_minus_btn_.bottom) {
+                        int bidx = 2;
+                        for (int k = 0; k < 4; ++k) if (bvals[k] == config_.paged_attention_blocks) bidx = k;
+                        if (bidx > 0) { config_.paged_attention_blocks = bvals[bidx - 1]; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (mx >= settings_blocks_plus_btn_.left && mx <= settings_blocks_plus_btn_.right &&
+                        my >= settings_blocks_plus_btn_.top && my <= settings_blocks_plus_btn_.bottom) {
+                        int bidx = 2;
+                        for (int k = 0; k < 4; ++k) if (bvals[k] == config_.paged_attention_blocks) bidx = k;
+                        if (bidx < 3) { config_.paged_attention_blocks = bvals[bidx + 1]; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // Slots stepper
+                    const int svals[] = { 1, 2, 4, 8 };
+                    if (mx >= settings_slots_minus_btn_.left && mx <= settings_slots_minus_btn_.right &&
+                        my >= settings_slots_minus_btn_.top && my <= settings_slots_minus_btn_.bottom) {
+                        int sidx = 2;
+                        for (int k = 0; k < 4; ++k) if (svals[k] == config_.active_slots) sidx = k;
+                        if (sidx > 0) { config_.active_slots = svals[sidx - 1]; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (mx >= settings_slots_plus_btn_.left && mx <= settings_slots_plus_btn_.right &&
+                        my >= settings_slots_plus_btn_.top && my <= settings_slots_plus_btn_.bottom) {
+                        int sidx = 2;
+                        for (int k = 0; k < 4; ++k) if (svals[k] == config_.active_slots) sidx = k;
+                        if (sidx < 3) { config_.active_slots = svals[sidx + 1]; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // Context stepper
+                    const int cvals[] = { 4096, 8192, 16384, 32768 };
+                    if (mx >= settings_ctx_minus_btn_.left && mx <= settings_ctx_minus_btn_.right &&
+                        my >= settings_ctx_minus_btn_.top && my <= settings_ctx_minus_btn_.bottom) {
+                        int cidx = 3;
+                        for (int k = 0; k < 4; ++k) if (cvals[k] == config_.max_context) cidx = k;
+                        if (cidx > 0) { config_.max_context = cvals[cidx - 1]; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (mx >= settings_ctx_plus_btn_.left && mx <= settings_ctx_plus_btn_.right &&
+                        my >= settings_ctx_plus_btn_.top && my <= settings_ctx_plus_btn_.bottom) {
+                        int cidx = 3;
+                        for (int k = 0; k < 4; ++k) if (cvals[k] == config_.max_context) cidx = k;
+                        if (cidx < 3) { config_.max_context = cvals[cidx + 1]; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // Port stepper
+                    const int pvals[] = { 8000, 8080, 9000 };
+                    if (mx >= settings_port_minus_btn_.left && mx <= settings_port_minus_btn_.right &&
+                        my >= settings_port_minus_btn_.top && my <= settings_port_minus_btn_.bottom) {
+                        int pidx = 0;
+                        for (int k = 0; k < 3; ++k) if (pvals[k] == config_.api_port) pidx = k;
+                        if (pidx > 0) { config_.api_port = pvals[pidx - 1]; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (mx >= settings_port_plus_btn_.left && mx <= settings_port_plus_btn_.right &&
+                        my >= settings_port_plus_btn_.top && my <= settings_port_plus_btn_.bottom) {
+                        int pidx = 0;
+                        for (int k = 0; k < 3; ++k) if (pvals[k] == config_.api_port) pidx = k;
+                        if (pidx < 2) { config_.api_port = pvals[pidx + 1]; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // Speculative tokens stepper
+                    if (mx >= settings_spec_minus_btn_.left && mx <= settings_spec_minus_btn_.right &&
+                        my >= settings_spec_minus_btn_.top && my <= settings_spec_minus_btn_.bottom) {
+                        if (config_.speculative_draft_tokens > 1) { config_.speculative_draft_tokens--; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+                    if (mx >= settings_spec_plus_btn_.left && mx <= settings_spec_plus_btn_.right &&
+                        my >= settings_spec_plus_btn_.top && my <= settings_spec_plus_btn_.bottom) {
+                        if (config_.speculative_draft_tokens < 5) { config_.speculative_draft_tokens++; config_.is_dirty = true; }
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    // Save & Apply Button
+                    if (mx >= settings_save_btn_.left && mx <= settings_save_btn_.right &&
+                        my >= settings_save_btn_.top && my <= settings_save_btn_.bottom) {
+                        config_.save_to_file("moe_config.json");
+                        std::string resp;
+                        client_.post_config_sync(config_.to_json_string(), resp);
+                        config_.is_dirty = false;
+                        show_settings_ = false;
+
+                        ChatMessageUI note{};
+                        note.role = "assistant";
+                        note.content = L"⚙️ **[System Configuration Applied & Saved]**\r\n\r\n"
+                                       L"Persisted configuration to `moe_config.json` and hot-applied to running engine:\r\n"
+                                       L"• Model Target: `" + utf8_to_wstring(config_.model_path) + L"`\r\n"
+                                       L"• Windows 11 BypassIO: " + (config_.bypass_io ? L"**ACTIVE (Direct DMA)**" : L"DISABLED") + L"\r\n"
+                                       L"• Direct DMA Sector Mode: " + (config_.direct_dma ? L"**ACTIVE**" : L"DISABLED") + L"\r\n"
+                                       L"• PagedAttention Virtual Pool: **" + std::to_wstring(config_.paged_attention_blocks) + L" Blocks** (" + std::to_wstring(config_.max_context) + L" Max Tokens)\r\n"
+                                       L"• Concurrency Slots: **" + std::to_wstring(config_.active_slots) + L" Slots**\r\n"
+                                       L"• API Endpoint Port: **" + std::to_wstring(config_.api_port) + L"**\r\n"
+                                       L"• MTP Speculative Lookahead: **" + std::to_wstring(config_.speculative_draft_tokens) + L" Tokens**";
+                        parse_message_blocks(note.content, note.blocks);
+                        messages_.push_back(note);
+                        scroll_to_bottom();
+                        save_sessions_to_disk();
+
+                        InvalidateRect(hwnd_, nullptr, FALSE);
+                        return 0;
+                    }
+
+                    return 0;
+                }
 
                 if (show_wizard_) {
                     // Check Next / Launch Button
@@ -1210,6 +1433,11 @@ private:
     ) {
         auto* pThis = reinterpret_cast<MoEStudioApp*>(dwRefData);
         if (uMsg == WM_KEYDOWN && wParam == VK_ESCAPE) {
+            if (pThis->show_settings_) {
+                pThis->show_settings_ = false;
+                InvalidateRect(pThis->hwnd_, nullptr, FALSE);
+                return 0;
+            }
             if (pThis->show_wizard_) {
                 pThis->show_wizard_ = false;
                 InvalidateRect(pThis->hwnd_, nullptr, FALSE);
@@ -1811,6 +2039,11 @@ private:
         if (show_wizard_) {
             render_wizard(w, h);
         }
+
+        // 9. System Control & Settings Panel Overlay
+        if (show_settings_) {
+            render_settings_panel(w, h);
+        }
     }
 
     void render_system_inspector(float w, float h) {
@@ -2296,6 +2529,352 @@ private:
         std::wstring nextTxt = (wizard_step_ == 3) ? L"🚀 Launch MoE Studio" : L"Next Step →";
         current_rt_->DrawText(nextTxt.c_str(), static_cast<UINT32>(nextTxt.size()),
             pFormatChipText_, wizard_next_btn_, pBrushTerminalBg_);
+    }
+
+    void render_settings_panel(float w, float h) {
+        if (!pBrushDimOverlay_ || !pBrushCardBg_) return;
+
+        // Dimmed backdrop
+        current_rt_->FillRectangle(D2D1::RectF(0.0f, 0.0f, w, h), pBrushDimOverlay_);
+
+        // Modal Card
+        float cardW = std::min(w - 40.0f, 860.0f);
+        float cardH = std::min(h - 40.0f, 600.0f);
+        float cardX = (w - cardW) * 0.5f;
+        float cardY = (h - cardH) * 0.5f;
+
+        D2D1_RECT_F cardRc = D2D1::RectF(cardX, cardY, cardX + cardW, cardY + cardH);
+        D2D1_ROUNDED_RECT cardRrc = D2D1::RoundedRect(cardRc, 12.0f, 12.0f);
+        current_rt_->FillRoundedRectangle(cardRrc, pBrushCardBg_);
+        current_rt_->DrawRoundedRectangle(cardRrc, pBrushAccentBlue_, 1.5f);
+
+        // Close Button [X]
+        settings_close_btn_ = D2D1::RectF(cardX + cardW - 36.0f, cardY + 12.0f, cardX + cardW - 12.0f, cardY + 36.0f);
+        std::wstring closeTxt = L"✕";
+        current_rt_->DrawText(closeTxt.c_str(), 1, pFormatStatValue_, settings_close_btn_,
+            settings_close_hovered_ ? pBrushAccentPink_ : pBrushTextMuted_);
+
+        // Header Title
+        float titleY = cardY + 14.0f;
+        std::wstring title = L"SYSTEM CONTROL & CONFIGURATION MANAGER";
+        current_rt_->DrawText(title.c_str(), static_cast<UINT32>(title.size()),
+            pFormatStatValue_, D2D1::RectF(cardX + 24.0f, titleY, cardX + cardW - 180.0f, titleY + 22.0f),
+            pBrushAccentBlue_);
+
+        // Subtitle
+        float subY = titleY + 22.0f;
+        std::wstring sub = L"Interactive parameter control • Windows 11 BypassIO • Chunked PagedAttention • moe_config.json";
+        current_rt_->DrawText(sub.c_str(), static_cast<UINT32>(sub.size()),
+            pFormatChipText_, D2D1::RectF(cardX + 24.0f, subY, cardX + cardW - 180.0f, subY + 20.0f),
+            pBrushTextMuted_);
+
+        // Sync Status Badge
+        D2D1_RECT_F syncRc = D2D1::RectF(cardX + cardW - 180.0f, titleY + 2.0f, cardX + cardW - 46.0f, titleY + 26.0f);
+        D2D1_ROUNDED_RECT syncRrc = D2D1::RoundedRect(syncRc, 4.0f, 4.0f);
+        if (config_.is_dirty) {
+            current_rt_->FillRoundedRectangle(syncRrc, pBrushChipBg_);
+            current_rt_->DrawRoundedRectangle(syncRrc, pBrushAccentAmber_, 1.0f);
+            std::wstring st = L"● UNSAVED EDITS";
+            current_rt_->DrawText(st.c_str(), static_cast<UINT32>(st.size()), pFormatAtlasCell_,
+                D2D1::RectF(syncRc.left + 8.0f, syncRc.top + 4.0f, syncRc.right - 8.0f, syncRc.bottom - 4.0f),
+                pBrushAccentAmber_);
+        } else {
+            current_rt_->FillRoundedRectangle(syncRrc, pBrushChipBg_);
+            current_rt_->DrawRoundedRectangle(syncRrc, pBrushAccentGreen_, 1.0f);
+            std::wstring st = L"✓ DISK SYNCED";
+            current_rt_->DrawText(st.c_str(), static_cast<UINT32>(st.size()), pFormatAtlasCell_,
+                D2D1::RectF(syncRc.left + 8.0f, syncRc.top + 4.0f, syncRc.right - 8.0f, syncRc.bottom - 4.0f),
+                pBrushAccentGreen_);
+        }
+
+        // Layout Columns
+        float bodyY = subY + 24.0f;
+        float bodyH = cardH - 110.0f;
+        float col1W = 410.0f;
+        float col2X = cardX + col1W + 24.0f;
+        float col2W = cardW - col1W - 48.0f;
+
+        // ====================================================================
+        // LEFT COLUMN: Controls & Toggles
+        // ====================================================================
+
+        // Row 1: Model Selection
+        float r1Y = bodyY;
+        std::wstring r1Lbl = L"Active Model Weights:";
+        current_rt_->DrawText(r1Lbl.c_str(), static_cast<UINT32>(r1Lbl.size()), pFormatAtlasCell_,
+            D2D1::RectF(cardX + 24.0f, r1Y, cardX + col1W, r1Y + 18.0f), pBrushTextSecondary_);
+
+        float mBtnY = r1Y + 18.0f;
+        float mBtnH = 26.0f;
+
+        // Model 1: Demo 0.5B
+        bool isDemo = (config_.model_path.find("test_qwen") != std::string::npos);
+        settings_mod_demo_btn_ = D2D1::RectF(cardX + 24.0f, mBtnY, cardX + 144.0f, mBtnY + mBtnH);
+        D2D1_ROUNDED_RECT m1Rrc = D2D1::RoundedRect(settings_mod_demo_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(m1Rrc, isDemo ? pBrushChipHover_ : pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(m1Rrc, isDemo ? pBrushAccentBlue_ : pBrushTerminalBorder_, isDemo ? 1.5f : 1.0f);
+        std::wstring m1Txt = isDemo ? L"◉ Demo 0.5B" : L"○ Demo 0.5B";
+        current_rt_->DrawText(m1Txt.c_str(), static_cast<UINT32>(m1Txt.size()), pFormatAtlasCell_,
+            settings_mod_demo_btn_, isDemo ? pBrushAccentBlue_ : pBrushTextPrimary_);
+
+        // Model 2: MoE 7B
+        bool isMoE = (config_.model_path.find("moe-7b") != std::string::npos);
+        settings_mod_moe_btn_ = D2D1::RectF(cardX + 152.0f, mBtnY, cardX + 266.0f, mBtnY + mBtnH);
+        D2D1_ROUNDED_RECT m2Rrc = D2D1::RoundedRect(settings_mod_moe_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(m2Rrc, isMoE ? pBrushChipHover_ : pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(m2Rrc, isMoE ? pBrushAccentBlue_ : pBrushTerminalBorder_, isMoE ? 1.5f : 1.0f);
+        std::wstring m2Txt = isMoE ? L"◉ MoE 7B" : L"○ MoE 7B";
+        current_rt_->DrawText(m2Txt.c_str(), static_cast<UINT32>(m2Txt.size()), pFormatAtlasCell_,
+            settings_mod_moe_btn_, isMoE ? pBrushAccentBlue_ : pBrushTextPrimary_);
+
+        // Model 3: Custom GGUF
+        bool isCustom = (!isDemo && !isMoE);
+        settings_mod_custom_btn_ = D2D1::RectF(cardX + 274.0f, mBtnY, cardX + 410.0f, mBtnY + mBtnH);
+        D2D1_ROUNDED_RECT m3Rrc = D2D1::RoundedRect(settings_mod_custom_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(m3Rrc, isCustom ? pBrushChipHover_ : pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(m3Rrc, isCustom ? pBrushAccentBlue_ : pBrushTerminalBorder_, isCustom ? 1.5f : 1.0f);
+        std::wstring m3Txt = isCustom ? L"◉ Custom GGUF" : L"○ Custom GGUF";
+        current_rt_->DrawText(m3Txt.c_str(), static_cast<UINT32>(m3Txt.size()), pFormatAtlasCell_,
+            settings_mod_custom_btn_, isCustom ? pBrushAccentBlue_ : pBrushTextPrimary_);
+
+        // Row 2: Storage Toggles
+        float r2Y = r1Y + 54.0f;
+        std::wstring r2Lbl1 = L"Windows 11 BypassIO:";
+        current_rt_->DrawText(r2Lbl1.c_str(), static_cast<UINT32>(r2Lbl1.size()), pFormatAtlasCell_,
+            D2D1::RectF(cardX + 24.0f, r2Y, cardX + 200.0f, r2Y + 18.0f), pBrushTextSecondary_);
+
+        std::wstring r2Lbl2 = L"Unbuffered Direct DMA:";
+        current_rt_->DrawText(r2Lbl2.c_str(), static_cast<UINT32>(r2Lbl2.size()), pFormatAtlasCell_,
+            D2D1::RectF(cardX + 214.0f, r2Y, cardX + 410.0f, r2Y + 18.0f), pBrushTextSecondary_);
+
+        float tBtnY = r2Y + 18.0f;
+        float tBtnH = 26.0f;
+
+        // Toggle 1: BypassIO
+        settings_bypass_toggle_btn_ = D2D1::RectF(cardX + 24.0f, tBtnY, cardX + 190.0f, tBtnY + tBtnH);
+        D2D1_ROUNDED_RECT bRrc = D2D1::RoundedRect(settings_bypass_toggle_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(bRrc, config_.bypass_io ? pBrushChipHover_ : pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(bRrc, config_.bypass_io ? pBrushAccentGreen_ : pBrushTerminalBorder_, 1.0f);
+        std::wstring bTxt = config_.bypass_io ? L"✓ BypassIO: ON (Direct DMA)" : L"✕ BypassIO: OFF (Standard)";
+        current_rt_->DrawText(bTxt.c_str(), static_cast<UINT32>(bTxt.size()), pFormatAtlasCell_,
+            settings_bypass_toggle_btn_, config_.bypass_io ? pBrushAccentGreen_ : pBrushTextMuted_);
+
+        // Toggle 2: Direct DMA
+        settings_dma_toggle_btn_ = D2D1::RectF(cardX + 214.0f, tBtnY, cardX + 410.0f, tBtnY + tBtnH);
+        D2D1_ROUNDED_RECT dRrc = D2D1::RoundedRect(settings_dma_toggle_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(dRrc, config_.direct_dma ? pBrushChipHover_ : pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(dRrc, config_.direct_dma ? pBrushAccentGreen_ : pBrushTerminalBorder_, 1.0f);
+        std::wstring dTxt = config_.direct_dma ? L"✓ Sector DMA: ON (No-Buf)" : L"✕ Sector DMA: OFF";
+        current_rt_->DrawText(dTxt.c_str(), static_cast<UINT32>(dTxt.size()), pFormatAtlasCell_,
+            settings_dma_toggle_btn_, config_.direct_dma ? pBrushAccentGreen_ : pBrushTextMuted_);
+
+        // Row 3: PagedAttention Blocks
+        float r3Y = r2Y + 54.0f;
+        std::wstring r3Lbl = L"PagedAttention Virtual Block Pool:";
+        current_rt_->DrawText(r3Lbl.c_str(), static_cast<UINT32>(r3Lbl.size()), pFormatAtlasCell_,
+            D2D1::RectF(cardX + 24.0f, r3Y, cardX + col1W, r3Y + 18.0f), pBrushTextSecondary_);
+
+        float s3Y = r3Y + 18.0f;
+        settings_blocks_minus_btn_ = D2D1::RectF(cardX + 24.0f, s3Y, cardX + 56.0f, s3Y + 26.0f);
+        D2D1_ROUNDED_RECT bMinusRrc = D2D1::RoundedRect(settings_blocks_minus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(bMinusRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(bMinusRrc, pBrushTerminalBorder_, 1.0f);
+        std::wstring minusSym = L"－";
+        current_rt_->DrawText(minusSym.c_str(), 1, pFormatAtlasCell_, settings_blocks_minus_btn_, pBrushAccentBlue_);
+
+        D2D1_RECT_F bValRc = D2D1::RectF(cardX + 62.0f, s3Y, cardX + 372.0f, s3Y + 26.0f);
+        D2D1_ROUNDED_RECT bValRrc = D2D1::RoundedRect(bValRc, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(bValRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(bValRrc, pBrushTerminalBorder_, 1.0f);
+        std::wstring bValTxt = std::to_wstring(config_.paged_attention_blocks) + L" Blocks (" +
+                               std::to_wstring(config_.paged_attention_blocks * 16) + L" Virtual KV Tokens)";
+        current_rt_->DrawText(bValTxt.c_str(), static_cast<UINT32>(bValTxt.size()), pFormatAtlasCell_,
+            bValRc, pBrushTextPrimary_);
+
+        settings_blocks_plus_btn_ = D2D1::RectF(cardX + 378.0f, s3Y, cardX + 410.0f, s3Y + 26.0f);
+        D2D1_ROUNDED_RECT bPlusRrc = D2D1::RoundedRect(settings_blocks_plus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(bPlusRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(bPlusRrc, pBrushTerminalBorder_, 1.0f);
+        std::wstring plusSym = L"＋";
+        current_rt_->DrawText(plusSym.c_str(), 1, pFormatAtlasCell_, settings_blocks_plus_btn_, pBrushAccentBlue_);
+
+        // Row 4: Concurrency Slots & Context Window
+        float r4Y = r3Y + 54.0f;
+        std::wstring r4Lbl1 = L"Multi-Turn Slots:";
+        current_rt_->DrawText(r4Lbl1.c_str(), static_cast<UINT32>(r4Lbl1.size()), pFormatAtlasCell_,
+            D2D1::RectF(cardX + 24.0f, r4Y, cardX + 200.0f, r4Y + 18.0f), pBrushTextSecondary_);
+
+        std::wstring r4Lbl2 = L"Max Context Tokens:";
+        current_rt_->DrawText(r4Lbl2.c_str(), static_cast<UINT32>(r4Lbl2.size()), pFormatAtlasCell_,
+            D2D1::RectF(cardX + 214.0f, r4Y, cardX + 410.0f, r4Y + 18.0f), pBrushTextSecondary_);
+
+        float s4Y = r4Y + 18.0f;
+        // Slots stepper
+        settings_slots_minus_btn_ = D2D1::RectF(cardX + 24.0f, s4Y, cardX + 54.0f, s4Y + 26.0f);
+        D2D1_ROUNDED_RECT smRrc = D2D1::RoundedRect(settings_slots_minus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(smRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(smRrc, pBrushTerminalBorder_, 1.0f);
+        current_rt_->DrawText(minusSym.c_str(), 1, pFormatAtlasCell_, settings_slots_minus_btn_, pBrushAccentBlue_);
+
+        D2D1_RECT_F sValRc = D2D1::RectF(cardX + 58.0f, s4Y, cardX + 160.0f, s4Y + 26.0f);
+        D2D1_ROUNDED_RECT svRrc = D2D1::RoundedRect(sValRc, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(svRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(svRrc, pBrushTerminalBorder_, 1.0f);
+        std::wstring svTxt = std::to_wstring(config_.active_slots) + L" Slots (#0-#" + std::to_wstring(config_.active_slots - 1) + L")";
+        current_rt_->DrawText(svTxt.c_str(), static_cast<UINT32>(svTxt.size()), pFormatAtlasCell_, sValRc, pBrushTextPrimary_);
+
+        settings_slots_plus_btn_ = D2D1::RectF(cardX + 164.0f, s4Y, cardX + 194.0f, s4Y + 26.0f);
+        D2D1_ROUNDED_RECT spRrc = D2D1::RoundedRect(settings_slots_plus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(spRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(spRrc, pBrushTerminalBorder_, 1.0f);
+        current_rt_->DrawText(plusSym.c_str(), 1, pFormatAtlasCell_, settings_slots_plus_btn_, pBrushAccentBlue_);
+
+        // Context stepper
+        settings_ctx_minus_btn_ = D2D1::RectF(cardX + 214.0f, s4Y, cardX + 244.0f, s4Y + 26.0f);
+        D2D1_ROUNDED_RECT cmRrc = D2D1::RoundedRect(settings_ctx_minus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(cmRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(cmRrc, pBrushTerminalBorder_, 1.0f);
+        current_rt_->DrawText(minusSym.c_str(), 1, pFormatAtlasCell_, settings_ctx_minus_btn_, pBrushAccentBlue_);
+
+        D2D1_RECT_F cValRc = D2D1::RectF(cardX + 248.0f, s4Y, cardX + 376.0f, s4Y + 26.0f);
+        D2D1_ROUNDED_RECT cvRrc = D2D1::RoundedRect(cValRc, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(cvRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(cvRrc, pBrushTerminalBorder_, 1.0f);
+        std::wstring cvTxt = std::to_wstring(config_.max_context) + L" Tokens";
+        current_rt_->DrawText(cvTxt.c_str(), static_cast<UINT32>(cvTxt.size()), pFormatAtlasCell_, cValRc, pBrushTextPrimary_);
+
+        settings_ctx_plus_btn_ = D2D1::RectF(cardX + 380.0f, s4Y, cardX + 410.0f, s4Y + 26.0f);
+        D2D1_ROUNDED_RECT cpRrc = D2D1::RoundedRect(settings_ctx_plus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(cpRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(cpRrc, pBrushTerminalBorder_, 1.0f);
+        current_rt_->DrawText(plusSym.c_str(), 1, pFormatAtlasCell_, settings_ctx_plus_btn_, pBrushAccentBlue_);
+
+        // Row 5: Port & Speculative Tokens
+        float r5Y = r4Y + 54.0f;
+        std::wstring r5Lbl1 = L"API Server Port:";
+        current_rt_->DrawText(r5Lbl1.c_str(), static_cast<UINT32>(r5Lbl1.size()), pFormatAtlasCell_,
+            D2D1::RectF(cardX + 24.0f, r5Y, cardX + 200.0f, r5Y + 18.0f), pBrushTextSecondary_);
+
+        std::wstring r5Lbl2 = L"Speculative Lookahead:";
+        current_rt_->DrawText(r5Lbl2.c_str(), static_cast<UINT32>(r5Lbl2.size()), pFormatAtlasCell_,
+            D2D1::RectF(cardX + 214.0f, r5Y, cardX + 410.0f, r5Y + 18.0f), pBrushTextSecondary_);
+
+        float s5Y = r5Y + 18.0f;
+        // Port stepper
+        settings_port_minus_btn_ = D2D1::RectF(cardX + 24.0f, s5Y, cardX + 54.0f, s5Y + 26.0f);
+        D2D1_ROUNDED_RECT pmRrc = D2D1::RoundedRect(settings_port_minus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(pmRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(pmRrc, pBrushTerminalBorder_, 1.0f);
+        current_rt_->DrawText(minusSym.c_str(), 1, pFormatAtlasCell_, settings_port_minus_btn_, pBrushAccentBlue_);
+
+        D2D1_RECT_F pValRc = D2D1::RectF(cardX + 58.0f, s5Y, cardX + 160.0f, s5Y + 26.0f);
+        D2D1_ROUNDED_RECT pvRrc = D2D1::RoundedRect(pValRc, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(pvRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(pvRrc, pBrushTerminalBorder_, 1.0f);
+        std::wstring pvTxt = L"Port " + std::to_wstring(config_.api_port);
+        current_rt_->DrawText(pvTxt.c_str(), static_cast<UINT32>(pvTxt.size()), pFormatAtlasCell_, pValRc, pBrushTextPrimary_);
+
+        settings_port_plus_btn_ = D2D1::RectF(cardX + 164.0f, s5Y, cardX + 194.0f, s5Y + 26.0f);
+        D2D1_ROUNDED_RECT ppRrc = D2D1::RoundedRect(settings_port_plus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(ppRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(ppRrc, pBrushTerminalBorder_, 1.0f);
+        current_rt_->DrawText(plusSym.c_str(), 1, pFormatAtlasCell_, settings_port_plus_btn_, pBrushAccentBlue_);
+
+        // Speculative stepper
+        settings_spec_minus_btn_ = D2D1::RectF(cardX + 214.0f, s5Y, cardX + 244.0f, s5Y + 26.0f);
+        D2D1_ROUNDED_RECT specmRrc = D2D1::RoundedRect(settings_spec_minus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(specmRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(specmRrc, pBrushTerminalBorder_, 1.0f);
+        current_rt_->DrawText(minusSym.c_str(), 1, pFormatAtlasCell_, settings_spec_minus_btn_, pBrushAccentBlue_);
+
+        D2D1_RECT_F specValRc = D2D1::RectF(cardX + 248.0f, s5Y, cardX + 376.0f, s5Y + 26.0f);
+        D2D1_ROUNDED_RECT specvRrc = D2D1::RoundedRect(specValRc, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(specvRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(specvRrc, pBrushTerminalBorder_, 1.0f);
+        std::wstring specvTxt = std::to_wstring(config_.speculative_draft_tokens) + L" Draft Tokens";
+        current_rt_->DrawText(specvTxt.c_str(), static_cast<UINT32>(specvTxt.size()), pFormatAtlasCell_, specValRc, pBrushTextPrimary_);
+
+        settings_spec_plus_btn_ = D2D1::RectF(cardX + 380.0f, s5Y, cardX + 410.0f, s5Y + 26.0f);
+        D2D1_ROUNDED_RECT specpRrc = D2D1::RoundedRect(settings_spec_plus_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(specpRrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(specpRrc, pBrushTerminalBorder_, 1.0f);
+        current_rt_->DrawText(plusSym.c_str(), 1, pFormatAtlasCell_, settings_spec_plus_btn_, pBrushAccentBlue_);
+
+        // Row 6: Hardware Status Box
+        float r6Y = r5Y + 54.0f;
+        float r6H = 120.0f;
+        D2D1_ROUNDED_RECT r6Rrc = D2D1::RoundedRect(D2D1::RectF(cardX + 24.0f, r6Y, cardX + col1W, r6Y + r6H), 6.0f, 6.0f);
+        current_rt_->FillRoundedRectangle(r6Rrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(r6Rrc, pBrushTerminalBorder_, 1.0f);
+
+        std::wstring hwt = L"HARDWARE ACCELERATION SUBSYSTEMS";
+        current_rt_->DrawText(hwt.c_str(), static_cast<UINT32>(hwt.size()), pFormatAtlasCell_,
+            D2D1::RectF(cardX + 34.0f, r6Y + 8.0f, cardX + col1W - 10.0f, r6Y + 24.0f), pBrushAccentBlue_);
+
+        std::wstring hwb = L"• SIMD Vector Backend: AVX-512 + AVX2 FMA (256-bit super-blocks)\r\n"
+                           L"• Storage Engine: Windows 11 BypassIO Unbuffered Direct DMA\r\n"
+                           L"• Concurrency Engine: Chunked PagedAttention (Shared Prefix Pool)\r\n"
+                           L"• API Endpoint: http://127.0.0.1:" + std::to_wstring(config_.api_port) + L"/v1/chat/completions";
+        current_rt_->DrawText(hwb.c_str(), static_cast<UINT32>(hwb.size()), pFormatTerminalText_,
+            D2D1::RectF(cardX + 34.0f, r6Y + 28.0f, cardX + col1W - 10.0f, r6Y + r6H - 6.0f), pBrushTextPrimary_);
+
+        // ====================================================================
+        // RIGHT COLUMN: Live JSON Code Drawer
+        // ====================================================================
+        float col2H = bodyH - 10.0f;
+        D2D1_ROUNDED_RECT col2Rrc = D2D1::RoundedRect(D2D1::RectF(col2X, bodyY, col2X + col2W, bodyY + col2H), 8.0f, 8.0f);
+        current_rt_->FillRoundedRectangle(col2Rrc, pBrushTerminalBg_);
+        current_rt_->DrawRoundedRectangle(col2Rrc, pBrushTerminalBorder_, 1.0f);
+
+        std::wstring jsonHdr = L"LIVE PROFILE (moe_config.json)";
+        current_rt_->DrawText(jsonHdr.c_str(), static_cast<UINT32>(jsonHdr.size()), pFormatAtlasCell_,
+            D2D1::RectF(col2X + 14.0f, bodyY + 10.0f, col2X + col2W - 14.0f, bodyY + 26.0f), pBrushAccentBlue_);
+
+        std::string curJson = config_.to_json_string();
+        std::wstring wideJson = utf8_to_wstring(curJson);
+        current_rt_->DrawText(wideJson.c_str(), static_cast<UINT32>(wideJson.size()), pFormatTerminalText_,
+            D2D1::RectF(col2X + 14.0f, bodyY + 34.0f, col2X + col2W - 14.0f, bodyY + col2H - 10.0f), pBrushTextPrimary_);
+
+        // ====================================================================
+        // FOOTER ACTIONS
+        // ====================================================================
+        float fY = cardY + cardH - 46.0f;
+        float fH = 32.0f;
+
+        // Reload Button
+        settings_reload_btn_ = D2D1::RectF(cardX + 24.0f, fY, cardX + 144.0f, fY + fH);
+        D2D1_ROUNDED_RECT relRrc = D2D1::RoundedRect(settings_reload_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(relRrc, settings_reload_hovered_ ? pBrushChipHover_ : pBrushChipBg_);
+        current_rt_->DrawRoundedRectangle(relRrc, pBrushCardBorder_, 1.0f);
+        std::wstring relTxt = L"🔄 Reload File";
+        current_rt_->DrawText(relTxt.c_str(), static_cast<UINT32>(relTxt.size()), pFormatAtlasCell_,
+            settings_reload_btn_, pBrushTextPrimary_);
+
+        // Defaults Button
+        settings_defaults_btn_ = D2D1::RectF(cardX + 152.0f, fY, cardX + 252.0f, fY + fH);
+        D2D1_ROUNDED_RECT defRrc = D2D1::RoundedRect(settings_defaults_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(defRrc, settings_defaults_hovered_ ? pBrushChipHover_ : pBrushChipBg_);
+        current_rt_->DrawRoundedRectangle(defRrc, pBrushCardBorder_, 1.0f);
+        std::wstring defTxt = L"⚡ Defaults";
+        current_rt_->DrawText(defTxt.c_str(), static_cast<UINT32>(defTxt.size()), pFormatAtlasCell_,
+            settings_defaults_btn_, pBrushTextPrimary_);
+
+        // Cancel Button
+        settings_cancel_btn_ = D2D1::RectF(cardX + cardW - 320.0f, fY, cardX + cardW - 230.0f, fY + fH);
+        D2D1_ROUNDED_RECT canRrc = D2D1::RoundedRect(settings_cancel_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(canRrc, settings_cancel_hovered_ ? pBrushChipHover_ : pBrushChipBg_);
+        current_rt_->DrawRoundedRectangle(canRrc, pBrushCardBorder_, 1.0f);
+        std::wstring canTxt = L"Cancel";
+        current_rt_->DrawText(canTxt.c_str(), static_cast<UINT32>(canTxt.size()), pFormatAtlasCell_,
+            settings_cancel_btn_, pBrushTextSecondary_);
+
+        // Save & Apply Button
+        settings_save_btn_ = D2D1::RectF(cardX + cardW - 222.0f, fY, cardX + cardW - 24.0f, fY + fH);
+        D2D1_ROUNDED_RECT saveRrc = D2D1::RoundedRect(settings_save_btn_, 4.0f, 4.0f);
+        current_rt_->FillRoundedRectangle(saveRrc, settings_save_hovered_ ? pBrushAccentBlue_ : pBrushAccentGreen_);
+        std::wstring saveTxt = L"💾 Save & Apply Config";
+        current_rt_->DrawText(saveTxt.c_str(), static_cast<UINT32>(saveTxt.size()), pFormatChipText_,
+            settings_save_btn_, pBrushTerminalBg_);
     }
 
     void render() {
@@ -3055,6 +3634,8 @@ private:
     bool show_cortex_atlas_ = true;
     bool show_system_inspector_ = false;
     bool show_wizard_ = false;
+    bool show_settings_ = false;
+    SystemConfigUI config_;
     int wizard_step_ = 0;
     int wizard_model_choice_ = 0;
 
@@ -3071,6 +3652,35 @@ private:
     bool wizard_opt0_hovered_ = false;
     bool wizard_opt1_hovered_ = false;
     bool wizard_opt2_hovered_ = false;
+
+    // System Control & Settings Panel UI Members
+    D2D1_RECT_F settings_close_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_mod_demo_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_mod_moe_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_mod_custom_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_bypass_toggle_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_dma_toggle_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_blocks_minus_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_blocks_plus_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_slots_minus_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_slots_plus_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_ctx_minus_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_ctx_plus_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_port_minus_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_port_plus_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_spec_minus_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_spec_plus_btn_ = D2D1::RectF();
+
+    D2D1_RECT_F settings_save_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_reload_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_defaults_btn_ = D2D1::RectF();
+    D2D1_RECT_F settings_cancel_btn_ = D2D1::RectF();
+
+    bool settings_close_hovered_ = false;
+    bool settings_save_hovered_ = false;
+    bool settings_reload_hovered_ = false;
+    bool settings_defaults_hovered_ = false;
+    bool settings_cancel_hovered_ = false;
 
     int scroll_offset_ = 0;
     uint32_t active_slot_ = 0;
@@ -3096,6 +3706,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     uint32_t test_max_tokens = 140;
     bool show_inspector = false;
     bool show_wizard = false;
+    bool show_settings = false;
     int wizard_step_arg = -1;
     bool export_md = false;
     if (argv) {
@@ -3104,6 +3715,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
                 screenshot_path = argv[++i];
             } else if (std::wstring(argv[i]) == L"--show-inspector") {
                 show_inspector = true;
+            } else if (std::wstring(argv[i]) == L"--settings" || std::wstring(argv[i]) == L"--config") {
+                show_settings = true;
             } else if (std::wstring(argv[i]) == L"--wizard") {
                 show_wizard = true;
                 if (i + 1 < argc && argv[i + 1][0] >= L'0' && argv[i + 1][0] <= L'9') {
@@ -3135,6 +3748,10 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
         if (wizard_step_arg >= 0) {
             app.set_wizard_step(wizard_step_arg);
         }
+    }
+
+    if (show_settings) {
+        app.set_show_settings(true);
     }
 
     if (show_inspector) {

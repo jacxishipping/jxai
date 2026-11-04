@@ -287,6 +287,7 @@ void HttpServer::stop() {
 }
 
 bool HttpServer::start(uint16_t port, std::string& err_msg) {
+    port_ = port;
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {

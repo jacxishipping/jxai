@@ -21,6 +21,7 @@ private:
 
     MoETransformerEngine& engine_;
     std::string web_root_;
+    uint16_t port_ = 8000;
     std::atomic<bool> running_{false};
     std::atomic<uint32_t> active_requests_{0};
     uintptr_t listen_sock_ = ~static_cast<uintptr_t>(0);
