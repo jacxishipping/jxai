@@ -483,7 +483,7 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
             previewTab === 'preview' ? (
               <iframe
                 title="Interactive Sandbox"
-                srcDoc={`<!DOCTYPE html><html><head><meta charset="utf-8"><style>body{margin:0;padding:12px;background:#0f172a;color:#f8fafc;font-family:system-ui;}</style></head><body>${sandboxHtml}</body></html>`}
+                srcDoc={'<!DOCTYPE html><html><' + 'head><meta charset="utf-8"><' + 'style>body{margin:0;padding:12px;background:#0f172a;color:#f8fafc;font-family:system-ui;}<' + '/style><' + '/head><body>' + sandboxHtml + '<' + '/body><' + '/html>'}
                 sandbox="allow-scripts"
                 className="w-full h-full rounded-xl border border-slate-800 bg-slate-900 shadow-inner"
               />

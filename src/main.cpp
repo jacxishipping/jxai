@@ -30,6 +30,7 @@ void print_usage() {
               << "  moe_engine test                                  [run 10-point rigorous verification suite]\n"
               << "  moe_engine chat   --model <file> [--prompt \"...\"] [--max-tokens 64] [--speculative]\n"
               << "  moe_engine serve  --model <file> [--port 8000] [--web-dir web/dist]\n"
+              << "  moe_engine studio [--model <file>] [--port 8000] [launch native C++ Windows desktop app]\n"
               << "  moe_engine forge  --out <file.gguf> [--format gguf|safetensors]\n";
 }
 
@@ -380,6 +381,30 @@ int main(int argc, char* argv[]) {
         }
         std::cout << "\033[1;32m[SUCCESS] GGUF v3 MoE Model forged successfully (" << fs::file_size(out_path) << " bytes).\033[0m\n";
         return 0;
+    }
+
+    if (mode == "studio") {
+#ifdef _WIN32
+        std::cout << "\033[1;36m[STUDIO] Launching native Windows C++ Direct2D App (moe_studio.exe)...\033[0m\n";
+        std::string exe_path = "build/moe_studio.exe";
+        if (!fs::exists(exe_path)) exe_path = "build\\moe_studio.exe";
+        if (!fs::exists(exe_path)) exe_path = "moe_studio.exe";
+        STARTUPINFOA si{};
+        si.cb = sizeof(si);
+        PROCESS_INFORMATION pi{};
+        if (CreateProcessA(exe_path.c_str(), nullptr, nullptr, nullptr, FALSE, 0, nullptr, nullptr, &si, &pi)) {
+            CloseHandle(pi.hThread);
+            CloseHandle(pi.hProcess);
+            std::cout << "\033[1;32m[STUDIO] MoE Studio native desktop window launched successfully.\033[0m\n";
+            return 0;
+        } else {
+            std::cerr << "Failed to launch " << exe_path << " (Error: " << GetLastError() << ")\n";
+            return 1;
+        }
+#else
+        std::cerr << "MoE Studio C++ Direct2D native desktop app is supported on Windows.\n";
+        return 1;
+#endif
     }
 
     // Auto-forge model if specified file does not exist
