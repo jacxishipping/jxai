@@ -70,3 +70,4 @@ echo   3. Background API:   .\build\moe_engine.exe serve --model models/test_qwe
 echo.
 echo Launching MoE Studio First-Run Setup Wizard...
 start "" "%STUDIO_EXE%" --wizard 0
+
