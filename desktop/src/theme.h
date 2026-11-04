@@ -28,6 +28,18 @@ namespace colors {
     inline const D2D1_COLOR_F TextMuted      = D2D1::ColorF(0x64 / 255.0f, 0x74 / 255.0f, 0x8B / 255.0f, 1.0f); // #64748b
     inline const D2D1_COLOR_F ChipBg         = D2D1::ColorF(0x1E / 255.0f, 0x29 / 255.0f, 0x3B / 255.0f, 0.7f);
     inline const D2D1_COLOR_F ChipHover      = D2D1::ColorF(0x33 / 255.0f, 0x41 / 255.0f, 0x55 / 255.0f, 0.9f);
+
+    inline const D2D1_COLOR_F CodeHeaderBg   = D2D1::ColorF(0x13 / 255.0f, 0x1B / 255.0f, 0x2E / 255.0f, 1.0f);
+    inline const D2D1_COLOR_F CodeBorder     = D2D1::ColorF(0x22 / 255.0f, 0x32 / 255.0f, 0x4D / 255.0f, 1.0f);
+    inline const D2D1_COLOR_F SyntaxKeyword  = D2D1::ColorF(0x38 / 255.0f, 0xBD / 255.0f, 0xF8 / 255.0f, 1.0f);
+    inline const D2D1_COLOR_F SyntaxString   = D2D1::ColorF(0x34 / 255.0f, 0xD3 / 255.0f, 0x99 / 255.0f, 1.0f);
+    inline const D2D1_COLOR_F SyntaxComment  = D2D1::ColorF(0x64 / 255.0f, 0x74 / 255.0f, 0x8B / 255.0f, 1.0f);
+    inline const D2D1_COLOR_F SyntaxNumber   = D2D1::ColorF(0xFB / 255.0f, 0xBF / 255.0f, 0x24 / 255.0f, 1.0f);
+
+    inline const D2D1_COLOR_F AtlasActive    = D2D1::ColorF(0xFB / 255.0f, 0xBF / 255.0f, 0x24 / 255.0f, 1.0f);
+    inline const D2D1_COLOR_F AtlasVram      = D2D1::ColorF(0x10 / 255.0f, 0xB9 / 255.0f, 0x81 / 255.0f, 0.95f);
+    inline const D2D1_COLOR_F AtlasRam       = D2D1::ColorF(0x06 / 255.0f, 0xB6 / 255.0f, 0xD4 / 255.0f, 0.90f);
+    inline const D2D1_COLOR_F AtlasDisk      = D2D1::ColorF(0x1E / 255.0f, 0x29 / 255.0f, 0x3B / 255.0f, 0.85f);
 }
 
 } // namespace moe::ui

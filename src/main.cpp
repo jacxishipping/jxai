@@ -2,6 +2,7 @@
 #include "transformer.h"
 #include "gguf.h"
 #include "model_forge.h"
+#include "model_pull.h"
 #include "server.h"
 #include "vulkan_backend.h"
 #include <iostream>
@@ -31,6 +32,7 @@ void print_usage() {
               << "  moe_engine chat   --model <file> [--prompt \"...\"] [--max-tokens 64] [--speculative]\n"
               << "  moe_engine serve  --model <file> [--port 8000] [--web-dir web/dist]\n"
               << "  moe_engine studio [--model <file>] [--port 8000] [launch native C++ Windows desktop app]\n"
+              << "  moe_engine pull   <repo|url> [--out <dir>]       [stream & verify models from Hugging Face hub]\n"
               << "  moe_engine forge  --out <file.gguf> [--format gguf|safetensors]\n";
 }
 
@@ -380,6 +382,27 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         std::cout << "\033[1;32m[SUCCESS] GGUF v3 MoE Model forged successfully (" << fs::file_size(out_path) << " bytes).\033[0m\n";
+        return 0;
+    }
+
+    if (mode == "pull") {
+        if (argc < 3 || std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h") {
+            std::cerr << "Usage: moe_engine pull <repo_or_url> [--out <dir>]\n"
+                      << "Examples:\n"
+                      << "  moe_engine pull Qwen/Qwen2.5-0.5B-Instruct-GGUF\n"
+                      << "  moe_engine pull https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf\n";
+            return 0;
+        }
+        std::string target = argv[2];
+        std::string out_dir = "models";
+        for (int i = 3; i < argc; ++i) {
+            if (std::string(argv[i]) == "--out" && i + 1 < argc) out_dir = argv[++i];
+        }
+        std::string out_file, err;
+        if (!pull_model_from_hub(target, out_dir, out_file, err)) {
+            std::cerr << "\033[1;31m[ERROR] Failed to pull model: " << err << "\033[0m\n";
+            return 1;
+        }
         return 0;
     }
 

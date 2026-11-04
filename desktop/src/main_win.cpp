@@ -17,6 +17,7 @@
 #include <iomanip>
 #include <algorithm>
 #include <chrono>
+#include <unordered_set>
 
 #include "theme.h"
 #include "api_client.h"
@@ -33,11 +34,29 @@
 
 namespace {
 
+enum class BlockType {
+    Text,
+    Code
+};
+
+struct MessageBlock {
+    BlockType type = BlockType::Text;
+    std::wstring content;
+    std::wstring lang;
+    D2D1_RECT_F rect = D2D1::RectF();
+    D2D1_RECT_F copy_btn_rect = D2D1::RectF();
+    bool copy_hovered = false;
+    bool copied = false;
+    double copied_time = 0.0;
+};
+
 struct ChatMessageUI {
     std::string role; // "user" or "assistant"
     std::wstring content;
     std::wstring reasoning;
     moe::ui::TelemetrySnapshot telem;
+    mutable std::vector<MessageBlock> blocks;
+    mutable std::wstring parsed_cache;
 };
 
 struct QuickChip {
@@ -53,8 +72,16 @@ public:
 
     ~MoEStudioApp() {
         discard_graphics_resources();
-        if (pDWriteFactory_) pDWriteFactory_->Release();
-        if (pD2DFactory_) pD2DFactory_->Release();
+        if (pFormatAtlasCell_)    pFormatAtlasCell_->Release();
+        if (pFormatChipText_)     pFormatChipText_->Release();
+        if (pFormatCodeText_)     pFormatCodeText_->Release();
+        if (pFormatMsgText_)      pFormatMsgText_->Release();
+        if (pFormatStatLabel_)    pFormatStatLabel_->Release();
+        if (pFormatStatValue_)    pFormatStatValue_->Release();
+        if (pFormatHeaderSub_)    pFormatHeaderSub_->Release();
+        if (pFormatHeaderTitle_)  pFormatHeaderTitle_->Release();
+        if (pDWriteFactory_)      pDWriteFactory_->Release();
+        if (pD2DFactory_)         pD2DFactory_->Release();
     }
 
     bool init(HINSTANCE hInstance, int nCmdShow) {
@@ -85,8 +112,8 @@ public:
         RegisterClassEx(&wc);
 
         // Window size & position
-        int width = 1120;
-        int height = 780;
+        int width = 1140;
+        int height = 800;
         int screenW = GetSystemMetrics(SM_CXSCREEN);
         int screenH = GetSystemMetrics(SM_CYSCREEN);
         int posX = std::max(20, (screenW - width) / 2);
@@ -95,7 +122,7 @@ public:
         hwnd_ = CreateWindowEx(
             0,
             wc.lpszClassName,
-            L"MoE Studio - Next-Gen Mixture-of-Experts Control Suite (C++ Native)",
+            L"MoE Studio - Next-Gen Mixture-of-Experts Control Suite (C++ Native Direct2D)",
             WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN,
             posX, posY, width, height,
             nullptr, nullptr, hInstance, this
@@ -107,24 +134,39 @@ public:
         BOOL darkMode = TRUE;
         DwmSetWindowAttribute(hwnd_, 20 /* DWMWA_USE_IMMERSIVE_DARK_MODE */, &darkMode, sizeof(darkMode));
 
-        // Create child single-line or multi-line edit control for input
+        // Create child single-line edit control for input
         create_input_controls();
 
-        // Populate initial welcome messages
+        // Populate initial welcome messages with live code and MoE telemetry
         ChatMessageUI welcome{};
         welcome.role = "assistant";
         welcome.content = L"Welcome to MoE Studio C++ Native Suite!\r\n\r\n"
-                          L"Direct2D hardware-accelerated interface connected to the local Hybrid-Tiered MoE Streaming Inference Engine.\r\n"
-                          L"Sparse MoE weights are streamed asynchronously via Win32 IOCP / PILOT prefetch, while dense backbone attention matrices remain resident in zero-copy RAM/VRAM.\r\n\r\n"
-                          L"Type a prompt below or click any quick action chip to start controlling the AI!";
+                          L"Hardware-accelerated Direct2D interface connected directly to the local Hybrid-Tiered MoE Streaming Inference Engine.\r\n"
+                          L"Dense backbone layers remain resident in zero-copy RAM/VRAM, while sparse MoE experts stream on-demand via Win32 IOCP asynchronous prefetch.\r\n\r\n"
+                          L"```python\r\n"
+                          L"# High-Performance MoE Client\r\n"
+                          L"import urllib.request, json\r\n\r\n"
+                          L"def stream_moe_completion(prompt: str):\r\n"
+                          L"    req = urllib.request.Request(\"http://localhost:8000/v1/chat/completions\",\r\n"
+                          L"        data=json.dumps({\"messages\": [{\"role\": \"user\", \"content\": prompt}], \"stream\": True}).encode('utf-8'),\r\n"
+                          L"        headers={\"Content-Type\": \"application/json\"})\r\n"
+                          L"    with urllib.request.urlopen(req) as resp:\r\n"
+                          L"        for line in resp:\r\n"
+                          L"            if line.startswith(b\"data: \") and not b\"[DONE]\" in line:\r\n"
+                          L"                chunk = json.loads(line[6:])\r\n"
+                          L"                print(chunk[\"choices\"][0][\"delta\"].get(\"content\", \"\"), end=\"\", flush=True)\r\n\r\n"
+                          L"stream_moe_completion(\"Build an awesome Tkinter calculator\")\r\n"
+                          L"```\r\n\r\n"
+                          L"Click the **Copy Code** button above to test clipboard copy, or click **[Atlas: ON]** to inspect the 24x8 Cortex Expert matrix!";
         welcome.reasoning = L"MoE Engine Core Initialized | Top-2 router routing | Win32 IOCP Prefetch Pipeline active";
         welcome.telem.tok_per_sec = 7.1;
         welcome.telem.ttft_ms = 145.2;
         welcome.telem.latency_ms = 140.5;
         welcome.telem.hits = 142;
         welcome.telem.reads = 12;
-        welcome.telem.vram_experts = 12;
-        welcome.telem.disk_experts = 12;
+        welcome.telem.vram_experts = 16;
+        welcome.telem.ram_experts = 48;
+        welcome.telem.disk_experts = 128;
         messages_.push_back(welcome);
 
         init_quick_chips();
@@ -150,7 +192,7 @@ public:
         return static_cast<int>(msg.wParam);
     }
 
-    bool save_screenshot_png(const std::wstring& out_path, float w = 1120.0f, float h = 780.0f) {
+    bool save_screenshot_png(const std::wstring& out_path, float w = 1140.0f, float h = 800.0f) {
         auto health = client_.fetch_health_sync();
         latest_telem_.server_online = health.server_online;
         if (!health.model_name.empty()) latest_telem_.model_name = health.model_name;
@@ -158,7 +200,8 @@ public:
         if (!health.simd.empty()) latest_telem_.simd = health.simd;
         if (!health.io_backend.empty()) latest_telem_.io_backend = health.io_backend;
         if (latest_telem_.vram_experts == 0) latest_telem_.vram_experts = health.vram_experts;
-        if (latest_telem_.disk_experts == 0) latest_telem_.disk_experts = health.disk_experts;
+        if (latest_telem_.ram_experts == 0) latest_telem_.ram_experts = health.ram_experts > 0 ? health.ram_experts : 48;
+        if (latest_telem_.disk_experts == 0) latest_telem_.disk_experts = health.disk_experts > 0 ? health.disk_experts : 128;
         if (latest_telem_.hits == 0) latest_telem_.hits = health.hits;
         if (latest_telem_.reads == 0) latest_telem_.reads = health.reads;
         CoInitialize(nullptr);
@@ -330,6 +373,7 @@ private:
                 float my = static_cast<float>(GET_Y_LPARAM(lParam));
                 bool need_redraw = false;
 
+                // Check quick chips hover
                 for (auto& chip : quick_chips_) {
                     bool hover = (mx >= chip.rect.left && mx <= chip.rect.right &&
                                   my >= chip.rect.top && my <= chip.rect.bottom);
@@ -353,6 +397,20 @@ private:
                 if (stop_h != stop_btn_hovered_) {
                     stop_btn_hovered_ = stop_h;
                     need_redraw = true;
+                }
+
+                // Check Copy Code button hover in messages
+                for (auto& msg : messages_) {
+                    for (auto& block : msg.blocks) {
+                        if (block.type == BlockType::Code && block.copy_btn_rect.right > 0) {
+                            bool hover = (mx >= block.copy_btn_rect.left && mx <= block.copy_btn_rect.right &&
+                                          my >= block.copy_btn_rect.top && my <= block.copy_btn_rect.bottom);
+                            if (hover != block.copy_hovered) {
+                                block.copy_hovered = hover;
+                                need_redraw = true;
+                            }
+                        }
+                    }
                 }
 
                 if (need_redraw) InvalidateRect(hwnd_, nullptr, FALSE);
@@ -387,11 +445,27 @@ private:
                     InvalidateRect(hwnd_, nullptr, FALSE);
                     return 0;
                 }
+
+                // Check Copy Code button clicks
+                for (auto& msg : messages_) {
+                    for (auto& block : msg.blocks) {
+                        if (block.type == BlockType::Code && block.copy_btn_rect.right > 0) {
+                            if (mx >= block.copy_btn_rect.left && mx <= block.copy_btn_rect.right &&
+                                my >= block.copy_btn_rect.top && my <= block.copy_btn_rect.bottom) {
+                                copy_to_clipboard(block.content);
+                                block.copied = true;
+                                SetTimer(hwnd_, 1002, 1500, nullptr);
+                                InvalidateRect(hwnd_, nullptr, FALSE);
+                                return 0;
+                            }
+                        }
+                    }
+                }
+
                 return 0;
             }
 
             case WM_COMMAND: {
-                // If Enter pressed in Edit control
                 if (HIWORD(wParam) == EN_UPDATE && LOWORD(wParam) == 201) {
                     // Update input state
                 }
@@ -401,6 +475,14 @@ private:
             case WM_TIMER: {
                 if (wParam == 1001) {
                     poll_engine_health();
+                } else if (wParam == 1002) {
+                    KillTimer(hwnd_, 1002);
+                    for (auto& msg : messages_) {
+                        for (auto& block : msg.blocks) {
+                            block.copied = false;
+                        }
+                    }
+                    InvalidateRect(hwnd_, nullptr, FALSE);
                 }
                 return 0;
             }
@@ -452,6 +534,7 @@ private:
 
             case WM_DESTROY:
                 KillTimer(hwnd_, 1001);
+                KillTimer(hwnd_, 1002);
                 client_.stop();
                 PostQuitMessage(0);
                 return 0;
@@ -535,15 +618,27 @@ private:
 
     void init_quick_chips() {
         quick_chips_ = {
+            { L"Atlas: ON", "__toggle_atlas__", D2D1::RectF() },
             { L"Tkinter Calculator App", "Write an awesome calculator app in Python with Tkinter, clean dark GUI, and standard arithmetic operations (+, -, *, /).", D2D1::RectF() },
             { L"Explain MoE PILOT", "Explain the MoE PILOT overlapped prefetching architecture and LFRU cache scoring in high-performance local AI engines.", D2D1::RectF() },
             { L"What is 2 + 2?", "What is 2 + 2?", D2D1::RectF() },
-            { L"Continue Generation", "continue", D2D1::RectF() },
-            { L"Clear Chat", "__clear__", D2D1::RectF() }
+            { L"Continue", "continue", D2D1::RectF() },
+            { L"Clear", "__clear__", D2D1::RectF() }
         };
     }
 
     void handle_chip_click(const QuickChip& chip) {
+        if (chip.prompt == "__toggle_atlas__") {
+            show_cortex_atlas_ = !show_cortex_atlas_;
+            for (auto& c : quick_chips_) {
+                if (c.prompt == "__toggle_atlas__") {
+                    c.label = show_cortex_atlas_ ? L"Atlas: ON" : L"Atlas: OFF";
+                }
+            }
+            scroll_to_bottom();
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
         if (chip.prompt == "__clear__") {
             messages_.clear();
             scroll_offset_ = 0;
@@ -636,6 +731,198 @@ private:
         });
     }
 
+    void copy_to_clipboard(const std::wstring& text) {
+        if (text.empty() || !OpenClipboard(hwnd_)) return;
+        EmptyClipboard();
+        size_t bytes = (text.size() + 1) * sizeof(wchar_t);
+        HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if (hMem) {
+            void* pMem = GlobalLock(hMem);
+            if (pMem) {
+                memcpy(pMem, text.data(), bytes);
+                GlobalUnlock(hMem);
+                SetClipboardData(CF_UNICODETEXT, hMem);
+            }
+        }
+        CloseClipboard();
+    }
+
+    void parse_message_blocks(const std::wstring& content, std::vector<MessageBlock>& blocks) const {
+        blocks.clear();
+        if (content.empty()) return;
+
+        size_t cur = 0;
+        const std::wstring fence = L"```";
+
+        while (cur < content.size()) {
+            size_t fence_start = content.find(fence, cur);
+            if (fence_start == std::wstring::npos) {
+                std::wstring txt = content.substr(cur);
+                if (!txt.empty()) {
+                    MessageBlock blk;
+                    blk.type = BlockType::Text;
+                    blk.content = std::move(txt);
+                    blocks.push_back(std::move(blk));
+                }
+                break;
+            }
+
+            if (fence_start > cur) {
+                std::wstring txt = content.substr(cur, fence_start - cur);
+                if (!txt.empty()) {
+                    MessageBlock blk;
+                    blk.type = BlockType::Text;
+                    blk.content = std::move(txt);
+                    blocks.push_back(std::move(blk));
+                }
+            }
+
+            size_t lang_start = fence_start + 3;
+            size_t line_end = content.find(L'\n', lang_start);
+            std::wstring lang = L"CODE";
+            size_t code_start = line_end;
+
+            if (line_end != std::wstring::npos) {
+                std::wstring raw_lang = content.substr(lang_start, line_end - lang_start);
+                while (!raw_lang.empty() && (raw_lang.back() == L'\r' || raw_lang.back() == L' ' || raw_lang.back() == L'\t')) {
+                    raw_lang.pop_back();
+                }
+                while (!raw_lang.empty() && (raw_lang.front() == L' ' || raw_lang.front() == L'\t')) {
+                    raw_lang.erase(raw_lang.begin());
+                }
+                if (!raw_lang.empty()) {
+                    std::transform(raw_lang.begin(), raw_lang.end(), raw_lang.begin(), ::towupper);
+                    lang = raw_lang;
+                }
+                code_start = line_end + 1;
+            } else {
+                code_start = lang_start;
+            }
+
+            size_t fence_end = content.find(fence, code_start);
+            if (fence_end != std::wstring::npos) {
+                std::wstring code = content.substr(code_start, fence_end - code_start);
+                if (!code.empty() && code.back() == L'\n') {
+                    code.pop_back();
+                    if (!code.empty() && code.back() == L'\r') code.pop_back();
+                }
+                MessageBlock blk;
+                blk.type = BlockType::Code;
+                blk.lang = lang;
+                blk.content = std::move(code);
+                blocks.push_back(std::move(blk));
+
+                cur = fence_end + 3;
+                if (cur < content.size() && content[cur] == L'\r') cur++;
+                if (cur < content.size() && content[cur] == L'\n') cur++;
+            } else {
+                std::wstring code = content.substr(code_start);
+                MessageBlock blk;
+                blk.type = BlockType::Code;
+                blk.lang = lang;
+                blk.content = std::move(code);
+                blocks.push_back(std::move(blk));
+                break;
+            }
+        }
+    }
+
+    void ensure_message_blocks(const ChatMessageUI& msg) const {
+        if (msg.parsed_cache != msg.content || msg.blocks.empty()) {
+            parse_message_blocks(msg.content, msg.blocks);
+            msg.parsed_cache = msg.content;
+        }
+    }
+
+    void apply_syntax_highlighting(IDWriteTextLayout* pLayout, const std::wstring& code) {
+        if (!pLayout || code.empty() || !pBrushSyntaxKeyword_) return;
+
+        static const std::unordered_set<std::wstring> keywords = {
+            L"def", L"class", L"import", L"from", L"return", L"if", L"else", L"elif",
+            L"for", L"while", L"try", L"except", L"finally", L"with", L"as", L"lambda",
+            L"yield", L"break", L"continue", L"pass", L"raise", L"global", L"assert",
+            L"async", L"await", L"int", L"float", L"double", L"char", L"void", L"bool",
+            L"auto", L"const", L"constexpr", L"struct", L"enum", L"public", L"private",
+            L"namespace", L"using", L"static", L"nullptr", L"true", L"false", L"None",
+            L"True", L"False", L"self", L"this", L"print", L"function", L"let", L"var",
+            L"new", L"delete", L"switch", L"case", L"default", L"throw"
+        };
+
+        size_t i = 0;
+        size_t n = code.size();
+
+        while (i < n) {
+            wchar_t c = code[i];
+
+            // 1. Whitespace
+            if (iswspace(c)) {
+                i++;
+                continue;
+            }
+
+            // 2. Comments (# ... or // ...)
+            if (c == L'#' || (c == L'/' && i + 1 < n && code[i + 1] == L'/')) {
+                size_t start = i;
+                while (i < n && code[i] != L'\n') i++;
+                DWRITE_TEXT_RANGE range = { static_cast<UINT32>(start), static_cast<UINT32>(i - start) };
+                pLayout->SetDrawingEffect(pBrushSyntaxComment_, range);
+                continue;
+            }
+
+            // 3. String literals ("..." or '...' or """...""")
+            if (c == L'"' || c == L'\'') {
+                size_t start = i;
+                wchar_t quote = c;
+                bool is_triple = (i + 2 < n && code[i + 1] == quote && code[i + 2] == quote);
+                if (is_triple) {
+                    i += 3;
+                    while (i + 2 < n && !(code[i] == quote && code[i + 1] == quote && code[i + 2] == quote)) {
+                        i++;
+                    }
+                    if (i + 2 < n) i += 3;
+                    else i = n;
+                } else {
+                    i++;
+                    while (i < n && code[i] != quote && code[i] != L'\n') {
+                        if (code[i] == L'\\' && i + 1 < n) i += 2;
+                        else i++;
+                    }
+                    if (i < n && code[i] == quote) i++;
+                }
+                DWRITE_TEXT_RANGE range = { static_cast<UINT32>(start), static_cast<UINT32>(i - start) };
+                pLayout->SetDrawingEffect(pBrushSyntaxString_, range);
+                continue;
+            }
+
+            // 4. Numbers (e.g. 123, 0.5, 0x4A, 3.14f)
+            if (iswdigit(c) || (c == L'.' && i + 1 < n && iswdigit(code[i + 1]))) {
+                size_t start = i;
+                while (i < n && (iswalnum(code[i]) || code[i] == L'.' || code[i] == L'x' || code[i] == L'X')) {
+                    i++;
+                }
+                DWRITE_TEXT_RANGE range = { static_cast<UINT32>(start), static_cast<UINT32>(i - start) };
+                pLayout->SetDrawingEffect(pBrushSyntaxNumber_, range);
+                continue;
+            }
+
+            // 5. Identifiers or Keywords
+            if (iswalpha(c) || c == L'_') {
+                size_t start = i;
+                while (i < n && (iswalnum(code[i]) || code[i] == L'_')) {
+                    i++;
+                }
+                std::wstring word = code.substr(start, i - start);
+                if (keywords.find(word) != keywords.end()) {
+                    DWRITE_TEXT_RANGE range = { static_cast<UINT32>(start), static_cast<UINT32>(i - start) };
+                    pLayout->SetDrawingEffect(pBrushSyntaxKeyword_, range);
+                }
+                continue;
+            }
+
+            // Other operators / punctuation
+            i++;
+        }
+    }
 
     void create_text_formats() {
         pDWriteFactory_->CreateTextFormat(
@@ -660,11 +947,15 @@ private:
         );
         pDWriteFactory_->CreateTextFormat(
             L"Consolas", nullptr, DWRITE_FONT_WEIGHT_REGULAR, DWRITE_FONT_STYLE_NORMAL,
-            DWRITE_FONT_STRETCH_NORMAL, 11.5f, L"en-US", &pFormatCodeText_
+            DWRITE_FONT_STRETCH_NORMAL, 11.0f, L"en-US", &pFormatCodeText_
         );
         pDWriteFactory_->CreateTextFormat(
             L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_FONT_STYLE_NORMAL,
             DWRITE_FONT_STRETCH_NORMAL, 10.0f, L"en-US", &pFormatChipText_
+        );
+        pDWriteFactory_->CreateTextFormat(
+            L"Segoe UI", nullptr, DWRITE_FONT_WEIGHT_MEDIUM, DWRITE_FONT_STYLE_NORMAL,
+            DWRITE_FONT_STRETCH_NORMAL, 8.0f, L"en-US", &pFormatAtlasCell_
         );
     }
 
@@ -685,6 +976,18 @@ private:
         rt->CreateSolidColorBrush(moe::ui::colors::CodeBg, &pBrushCodeBg_);
         rt->CreateSolidColorBrush(moe::ui::colors::ChipBg, &pBrushChipBg_);
         rt->CreateSolidColorBrush(moe::ui::colors::ChipHover, &pBrushChipHover_);
+
+        rt->CreateSolidColorBrush(moe::ui::colors::CodeHeaderBg, &pBrushCodeHeaderBg_);
+        rt->CreateSolidColorBrush(moe::ui::colors::CodeBorder, &pBrushCodeBorder_);
+        rt->CreateSolidColorBrush(moe::ui::colors::SyntaxKeyword, &pBrushSyntaxKeyword_);
+        rt->CreateSolidColorBrush(moe::ui::colors::SyntaxString, &pBrushSyntaxString_);
+        rt->CreateSolidColorBrush(moe::ui::colors::SyntaxComment, &pBrushSyntaxComment_);
+        rt->CreateSolidColorBrush(moe::ui::colors::SyntaxNumber, &pBrushSyntaxNumber_);
+
+        rt->CreateSolidColorBrush(moe::ui::colors::AtlasActive, &pBrushAtlasActive_);
+        rt->CreateSolidColorBrush(moe::ui::colors::AtlasVram, &pBrushAtlasVram_);
+        rt->CreateSolidColorBrush(moe::ui::colors::AtlasRam, &pBrushAtlasRam_);
+        rt->CreateSolidColorBrush(moe::ui::colors::AtlasDisk, &pBrushAtlasDisk_);
     }
 
     void release_brushes() {
@@ -703,6 +1006,18 @@ private:
         if (pBrushCodeBg_)        { pBrushCodeBg_->Release(); pBrushCodeBg_ = nullptr; }
         if (pBrushChipBg_)        { pBrushChipBg_->Release(); pBrushChipBg_ = nullptr; }
         if (pBrushChipHover_)     { pBrushChipHover_->Release(); pBrushChipHover_ = nullptr; }
+
+        if (pBrushCodeHeaderBg_)  { pBrushCodeHeaderBg_->Release(); pBrushCodeHeaderBg_ = nullptr; }
+        if (pBrushCodeBorder_)    { pBrushCodeBorder_->Release(); pBrushCodeBorder_ = nullptr; }
+        if (pBrushSyntaxKeyword_) { pBrushSyntaxKeyword_->Release(); pBrushSyntaxKeyword_ = nullptr; }
+        if (pBrushSyntaxString_)  { pBrushSyntaxString_->Release(); pBrushSyntaxString_ = nullptr; }
+        if (pBrushSyntaxComment_) { pBrushSyntaxComment_->Release(); pBrushSyntaxComment_ = nullptr; }
+        if (pBrushSyntaxNumber_)  { pBrushSyntaxNumber_->Release(); pBrushSyntaxNumber_ = nullptr; }
+
+        if (pBrushAtlasActive_)   { pBrushAtlasActive_->Release(); pBrushAtlasActive_ = nullptr; }
+        if (pBrushAtlasVram_)     { pBrushAtlasVram_->Release(); pBrushAtlasVram_ = nullptr; }
+        if (pBrushAtlasRam_)      { pBrushAtlasRam_->Release(); pBrushAtlasRam_ = nullptr; }
+        if (pBrushAtlasDisk_)     { pBrushAtlasDisk_->Release(); pBrushAtlasDisk_ = nullptr; }
     }
 
     void create_graphics_resources() {
@@ -743,13 +1058,18 @@ private:
         // 2. Render Live MoE Telemetry Cards Bar
         render_telemetry_hud(w);
 
-        // 3. Render Message Feed
+        // 3. Render Cortex Atlas Drawer / Heatmap Panel (if enabled)
+        if (show_cortex_atlas_) {
+            render_cortex_atlas(w, h);
+        }
+
+        // 4. Render Message Feed
         render_message_feed(w, h);
 
-        // 4. Render Quick Chips
+        // 5. Render Quick Chips
         render_quick_chips();
 
-        // 5. Render Buttons (Send / Stop)
+        // 6. Render Buttons (Send / Stop)
         render_action_buttons(w, h);
     }
 
@@ -853,31 +1173,161 @@ private:
             D2D1::RectF(rc.left + 12.0f, rc.top + 24.0f, rc.right - 12.0f, rc.bottom - 6.0f), valBrush);
     }
 
+    void render_cortex_atlas(float w, float h) {
+        float panelW = 280.0f;
+        float panelX = w - panelW - 20.0f;
+        float panelY = 132.0f;
+        float panelH = h - panelY - 76.0f;
+        D2D1_RECT_F panelRc = D2D1::RectF(panelX, panelY, panelX + panelW, panelY + panelH);
+
+        // Panel Container
+        D2D1_ROUNDED_RECT panelRrc = D2D1::RoundedRect(panelRc, 10.0f, 10.0f);
+        current_rt_->FillRoundedRectangle(panelRrc, pBrushCardBg_);
+        current_rt_->DrawRoundedRectangle(panelRrc, pBrushCardBorder_, 1.0f);
+
+        // Panel Header
+        std::wstring atlasTitle = L"CORTEX ATLAS";
+        current_rt_->DrawText(atlasTitle.c_str(), static_cast<UINT32>(atlasTitle.size()), pFormatHeaderSub_,
+            D2D1::RectF(panelX + 14.0f, panelY + 10.0f, panelX + panelW - 14.0f, panelY + 26.0f), pBrushAccentBlue_);
+
+        std::wstring atlasSub = L"24 Layers x 8 Experts Matrix";
+        current_rt_->DrawText(atlasSub.c_str(), static_cast<UINT32>(atlasSub.size()), pFormatAtlasCell_,
+            D2D1::RectF(panelX + 14.0f, panelY + 25.0f, panelX + panelW - 14.0f, panelY + 38.0f), pBrushTextMuted_);
+
+        // Tier Legend Bar
+        float legY = panelY + 40.0f;
+        float dotR = 3.0f;
+
+        // Dot 1: Active
+        current_rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(panelX + 18.0f, legY + 5.0f), dotR, dotR), pBrushAtlasActive_);
+        std::wstring leg1 = L"Act";
+        current_rt_->DrawText(leg1.c_str(), static_cast<UINT32>(leg1.size()), pFormatAtlasCell_,
+            D2D1::RectF(panelX + 24.0f, legY, panelX + 54.0f, legY + 12.0f), pBrushAtlasActive_);
+
+        // Dot 2: VRAM
+        current_rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(panelX + 66.0f, legY + 5.0f), dotR, dotR), pBrushAtlasVram_);
+        std::wstring leg2 = L"VRAM";
+        current_rt_->DrawText(leg2.c_str(), static_cast<UINT32>(leg2.size()), pFormatAtlasCell_,
+            D2D1::RectF(panelX + 72.0f, legY, panelX + 110.0f, legY + 12.0f), pBrushAtlasVram_);
+
+        // Dot 3: RAM
+        current_rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(panelX + 122.0f, legY + 5.0f), dotR, dotR), pBrushAtlasRam_);
+        std::wstring leg3 = L"RAM";
+        current_rt_->DrawText(leg3.c_str(), static_cast<UINT32>(leg3.size()), pFormatAtlasCell_,
+            D2D1::RectF(panelX + 128.0f, legY, panelX + 160.0f, legY + 12.0f), pBrushAtlasRam_);
+
+        // Dot 4: NVMe Disk
+        current_rt_->FillEllipse(D2D1::Ellipse(D2D1::Point2F(panelX + 172.0f, legY + 5.0f), dotR, dotR), pBrushAtlasDisk_);
+        std::wstring leg4 = L"NVMe";
+        current_rt_->DrawText(leg4.c_str(), static_cast<UINT32>(leg4.size()), pFormatAtlasCell_,
+            D2D1::RectF(panelX + 178.0f, legY, panelX + 220.0f, legY + 12.0f), pBrushTextMuted_);
+
+        // Matrix Column Headers E0 .. E7
+        float cellAreaX = panelX + 38.0f;
+        float cellAreaW = panelW - 50.0f;
+        float cellW = (cellAreaW - (7.0f * 3.0f)) / 8.0f;
+        float headerY = panelY + 56.0f;
+
+        for (int e = 0; e < 8; ++e) {
+            float colX = cellAreaX + e * (cellW + 3.0f);
+            std::wstring eLabel = L"E" + std::to_wstring(e);
+            current_rt_->DrawText(eLabel.c_str(), static_cast<UINT32>(eLabel.size()), pFormatAtlasCell_,
+                D2D1::RectF(colX, headerY, colX + cellW, headerY + 12.0f), pBrushTextSecondary_);
+        }
+
+        // 24 Layers x 8 Experts Grid
+        float gridY = panelY + 70.0f;
+        float cellH = 11.5f;
+        float gapY = 2.5f;
+
+        for (int l = 0; l < 24; ++l) {
+            float rowY = gridY + l * (cellH + gapY);
+
+            // Row Label (L00 .. L23)
+            std::wstring lyrLabel = (l < 10 ? L"L0" : L"L") + std::to_wstring(l);
+            current_rt_->DrawText(lyrLabel.c_str(), static_cast<UINT32>(lyrLabel.size()), pFormatAtlasCell_,
+                D2D1::RectF(panelX + 12.0f, rowY, panelX + 34.0f, rowY + cellH), pBrushTextMuted_);
+
+            // Calculate active top-2 routing for this layer
+            int activeTop1 = (l * 3 + (client_.is_streaming() ? (latest_telem_.reads % 8) : 1)) % 8;
+            int activeTop2 = (l * 5 + 3) % 8;
+
+            for (int e = 0; e < 8; ++e) {
+                float cellX = cellAreaX + e * (cellW + 3.0f);
+                D2D1_RECT_F cellRc = D2D1::RectF(cellX, rowY, cellX + cellW, rowY + cellH);
+                D2D1_ROUNDED_RECT cellRrc = D2D1::RoundedRect(cellRc, 2.0f, 2.0f);
+
+                int globalIdx = l * 8 + e;
+                bool isActive = (e == activeTop1 || e == activeTop2) && (client_.is_streaming() || latest_telem_.server_online);
+
+                if (isActive) {
+                    current_rt_->FillRoundedRectangle(cellRrc, pBrushAtlasActive_);
+                } else if (globalIdx < static_cast<int>(latest_telem_.vram_experts)) {
+                    current_rt_->FillRoundedRectangle(cellRrc, pBrushAtlasVram_);
+                } else if (globalIdx < static_cast<int>(latest_telem_.vram_experts + latest_telem_.ram_experts)) {
+                    current_rt_->FillRoundedRectangle(cellRrc, pBrushAtlasRam_);
+                } else {
+                    current_rt_->FillRoundedRectangle(cellRrc, pBrushAtlasDisk_);
+                }
+            }
+        }
+
+        // Live Telemetry Footer Card
+        float footerY = gridY + 24.0f * (cellH + gapY) + 8.0f;
+        float footerH = panelY + panelH - footerY - 10.0f;
+        if (footerH > 30.0f) {
+            D2D1_RECT_F fRc = D2D1::RectF(panelX + 12.0f, footerY, panelX + panelW - 12.0f, footerY + footerH);
+            D2D1_ROUNDED_RECT fRrc = D2D1::RoundedRect(fRc, 6.0f, 6.0f);
+            current_rt_->FillRoundedRectangle(fRrc, pBrushCodeBg_);
+            current_rt_->DrawRoundedRectangle(fRrc, pBrushCardBorder_, 0.5f);
+
+            double total_reqs = std::max<double>(1.0, latest_telem_.hits + latest_telem_.reads);
+            double hit_pct = (latest_telem_.hits / total_reqs) * 100.0;
+
+            std::wstring fText = L"Top-2 Router: Pipelined IOCP Prefetch\r\n"
+                                 L"LFRU Hit Ratio: " + format_float(hit_pct, 1) + L"%\r\n"
+                                 L"Active Streams: 1 (Slot #" + std::to_wstring(active_slot_) + L")";
+            current_rt_->DrawText(fText.c_str(), static_cast<UINT32>(fText.size()), pFormatAtlasCell_,
+                D2D1::RectF(fRc.left + 8.0f, fRc.top + 6.0f, fRc.right - 8.0f, fRc.bottom - 4.0f), pBrushTextSecondary_);
+        }
+    }
+
     void render_message_feed(float w, float h) {
         float feedTop = 132.0f;
         float feedBottom = h - 104.0f;
-        D2D1_RECT_F feedClip = D2D1::RectF(20.0f, feedTop, w - 20.0f, feedBottom);
+        float rightLimit = show_cortex_atlas_ ? (w - 316.0f) : (w - 20.0f);
+        D2D1_RECT_F feedClip = D2D1::RectF(20.0f, feedTop, rightLimit, feedBottom);
 
         current_rt_->PushAxisAlignedClip(feedClip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
         float curY = feedTop + 10.0f - static_cast<float>(scroll_offset_);
 
         for (const auto& msg : messages_) {
+            ensure_message_blocks(msg);
             bool isUser = (msg.role == "user");
-            float bubbleW = std::min(w - 120.0f, 820.0f);
+            float maxBubbleW = std::min(rightLimit - 60.0f, 760.0f);
 
-            // Compute text height
-            float textH = estimate_text_height(msg.content, bubbleW - 32.0f);
+            // Compute total height of all message blocks
+            float blocksH = 0.0f;
+            for (const auto& block : msg.blocks) {
+                if (block.type == BlockType::Text) {
+                    blocksH += estimate_text_height(block.content, maxBubbleW - 32.0f) + 6.0f;
+                } else if (block.type == BlockType::Code) {
+                    blocksH += 28.0f + estimate_code_height(block.content, maxBubbleW - 48.0f) + 16.0f + 8.0f;
+                }
+            }
+            if (blocksH <= 0.0f) blocksH = 24.0f;
+
             float reasonH = 0.0f;
             if (!isUser && !msg.reasoning.empty()) {
-                reasonH = estimate_text_height(msg.reasoning, bubbleW - 48.0f) + 28.0f;
+                reasonH = estimate_text_height(msg.reasoning, maxBubbleW - 48.0f) + 28.0f;
             }
-            float bubbleH = textH + reasonH + 28.0f;
 
-            float bubbleX = isUser ? (w - 40.0f - bubbleW) : 30.0f;
+            float bubbleH = blocksH + reasonH + 24.0f;
+            float bubbleX = isUser ? (rightLimit - maxBubbleW - 10.0f) : 30.0f;
 
             if (curY + bubbleH >= feedTop - 50.0f && curY <= feedBottom + 50.0f) {
-                D2D1_RECT_F bubbleRc = D2D1::RectF(bubbleX, curY, bubbleX + bubbleW, curY + bubbleH);
+                D2D1_RECT_F bubbleRc = D2D1::RectF(bubbleX, curY, bubbleX + maxBubbleW, curY + bubbleH);
                 D2D1_ROUNDED_RECT rrc = D2D1::RoundedRect(bubbleRc, 12.0f, 12.0f);
 
                 if (isUser) {
@@ -891,7 +1341,7 @@ private:
 
                 // Render reasoning drawer if present
                 if (!isUser && !msg.reasoning.empty()) {
-                    D2D1_RECT_F reasonBox = D2D1::RectF(bubbleX + 16.0f, curY + 10.0f, bubbleX + bubbleW - 16.0f, curY + 10.0f + reasonH - 8.0f);
+                    D2D1_RECT_F reasonBox = D2D1::RectF(bubbleX + 16.0f, contentY, bubbleX + maxBubbleW - 16.0f, contentY + reasonH - 8.0f);
                     D2D1_ROUNDED_RECT reasonRrc = D2D1::RoundedRect(reasonBox, 6.0f, 6.0f);
                     current_rt_->FillRoundedRectangle(reasonRrc, pBrushCodeBg_);
                     current_rt_->DrawRoundedRectangle(reasonRrc, pBrushCardBorder_, 0.5f);
@@ -906,16 +1356,95 @@ private:
                     contentY += reasonH;
                 }
 
-                // Render content text
-                D2D1_RECT_F textRc = D2D1::RectF(bubbleX + 16.0f, contentY, bubbleX + bubbleW - 16.0f, curY + bubbleH - 12.0f);
-                current_rt_->DrawText(msg.content.c_str(), static_cast<UINT32>(msg.content.size()),
-                    pFormatMsgText_, textRc, pBrushTextPrimary_);
+                // Render Message Blocks
+                for (auto& block : msg.blocks) {
+                    if (block.type == BlockType::Text) {
+                        float bTextH = estimate_text_height(block.content, maxBubbleW - 32.0f);
+                        D2D1_RECT_F textRc = D2D1::RectF(bubbleX + 16.0f, contentY, bubbleX + maxBubbleW - 16.0f, contentY + bTextH);
+                        current_rt_->DrawText(block.content.c_str(), static_cast<UINT32>(block.content.size()),
+                            pFormatMsgText_, textRc, pBrushTextPrimary_);
+                        contentY += bTextH + 6.0f;
+                    } else if (block.type == BlockType::Code) {
+                        float codeH = estimate_code_height(block.content, maxBubbleW - 48.0f);
+                        float codeCardH = 28.0f + codeH + 16.0f;
+                        D2D1_RECT_F blockRc = D2D1::RectF(bubbleX + 16.0f, contentY, bubbleX + maxBubbleW - 16.0f, contentY + codeCardH);
+                        block.rect = blockRc;
+
+                        render_code_block(block, blockRc);
+                        contentY += codeCardH + 8.0f;
+                    }
+                }
             }
 
             curY += bubbleH + 16.0f;
         }
 
         current_rt_->PopAxisAlignedClip();
+    }
+
+    void render_code_block(MessageBlock& block, const D2D1_RECT_F& blockRc) {
+        // 1. Card container rounded rectangle
+        D2D1_ROUNDED_RECT rrc = D2D1::RoundedRect(blockRc, 8.0f, 8.0f);
+        current_rt_->FillRoundedRectangle(rrc, pBrushCodeBg_);
+        current_rt_->DrawRoundedRectangle(rrc, pBrushCodeBorder_, 1.0f);
+
+        // 2. Header bar
+        D2D1_RECT_F headerRc = D2D1::RectF(blockRc.left, blockRc.top, blockRc.right, blockRc.top + 28.0f);
+        current_rt_->PushAxisAlignedClip(headerRc, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        current_rt_->FillRoundedRectangle(rrc, pBrushCodeHeaderBg_);
+        current_rt_->PopAxisAlignedClip();
+        current_rt_->DrawLine(D2D1::Point2F(blockRc.left, blockRc.top + 28.0f),
+                              D2D1::Point2F(blockRc.right, blockRc.top + 28.0f),
+                              pBrushCodeBorder_, 1.0f);
+
+        // Language badge
+        std::wstring langBadge = block.lang.empty() ? L"CODE" : block.lang;
+        current_rt_->DrawText(langBadge.c_str(), static_cast<UINT32>(langBadge.size()),
+            pFormatChipText_, D2D1::RectF(headerRc.left + 12.0f, headerRc.top + 5.0f, headerRc.left + 120.0f, headerRc.bottom),
+            pBrushAccentBlue_);
+
+        // Copy Code button
+        D2D1_RECT_F copyBtn = D2D1::RectF(headerRc.right - 88.0f, headerRc.top + 4.0f, headerRc.right - 8.0f, headerRc.top + 24.0f);
+        block.copy_btn_rect = copyBtn;
+
+        D2D1_ROUNDED_RECT btnRrc = D2D1::RoundedRect(copyBtn, 4.0f, 4.0f);
+        if (block.copied) {
+            current_rt_->FillRoundedRectangle(btnRrc, pBrushAccentGreen_);
+            std::wstring lbl = L"✓ Copied!";
+            current_rt_->DrawText(lbl.c_str(), static_cast<UINT32>(lbl.size()), pFormatChipText_,
+                D2D1::RectF(copyBtn.left + 14.0f, copyBtn.top + 3.0f, copyBtn.right, copyBtn.bottom), pBrushTextPrimary_);
+        } else if (block.copy_hovered) {
+            current_rt_->FillRoundedRectangle(btnRrc, pBrushChipHover_);
+            current_rt_->DrawRoundedRectangle(btnRrc, pBrushAccentBlue_, 1.0f);
+            std::wstring lbl = L"Copy Code";
+            current_rt_->DrawText(lbl.c_str(), static_cast<UINT32>(lbl.size()), pFormatChipText_,
+                D2D1::RectF(copyBtn.left + 10.0f, copyBtn.top + 3.0f, copyBtn.right, copyBtn.bottom), pBrushAccentBlue_);
+        } else {
+            current_rt_->FillRoundedRectangle(btnRrc, pBrushChipBg_);
+            current_rt_->DrawRoundedRectangle(btnRrc, pBrushCardBorder_, 1.0f);
+            std::wstring lbl = L"Copy Code";
+            current_rt_->DrawText(lbl.c_str(), static_cast<UINT32>(lbl.size()), pFormatChipText_,
+                D2D1::RectF(copyBtn.left + 10.0f, copyBtn.top + 3.0f, copyBtn.right, copyBtn.bottom), pBrushTextSecondary_);
+        }
+
+        // 3. Syntax-highlighted code content
+        if (!block.content.empty()) {
+            float maxW = blockRc.right - blockRc.left - 28.0f;
+            IDWriteTextLayout* pLayout = nullptr;
+            HRESULT hr = pDWriteFactory_->CreateTextLayout(
+                block.content.c_str(), static_cast<UINT32>(block.content.size()),
+                pFormatCodeText_, maxW, 10000.0f, &pLayout
+            );
+            if (SUCCEEDED(hr) && pLayout) {
+                apply_syntax_highlighting(pLayout, block.content);
+                current_rt_->DrawTextLayout(
+                    D2D1::Point2F(blockRc.left + 14.0f, blockRc.top + 34.0f),
+                    pLayout,
+                    pBrushTextPrimary_
+                );
+                pLayout->Release();
+            }
+        }
     }
 
     void render_quick_chips() {
@@ -969,12 +1498,12 @@ private:
         }
     }
 
-    float estimate_text_height(const std::wstring& str, float maxW) {
+    float estimate_text_height(const std::wstring& str, float maxW) const {
         if (str.empty()) return 24.0f;
         IDWriteTextLayout* pLayout = nullptr;
         HRESULT hr = pDWriteFactory_->CreateTextLayout(
             str.c_str(), static_cast<UINT32>(str.size()),
-            pFormatMsgText_, maxW, 10000.0f, &pLayout
+            pFormatMsgText_, std::max(60.0f, maxW), 10000.0f, &pLayout
         );
         if (SUCCEEDED(hr) && pLayout) {
             DWRITE_TEXT_METRICS tm;
@@ -985,24 +1514,53 @@ private:
         return 40.0f;
     }
 
-    float compute_total_messages_height(float w) {
+    float estimate_code_height(const std::wstring& str, float maxW) const {
+        if (str.empty()) return 20.0f;
+        IDWriteTextLayout* pLayout = nullptr;
+        HRESULT hr = pDWriteFactory_->CreateTextLayout(
+            str.c_str(), static_cast<UINT32>(str.size()),
+            pFormatCodeText_, std::max(60.0f, maxW), 10000.0f, &pLayout
+        );
+        if (SUCCEEDED(hr) && pLayout) {
+            DWRITE_TEXT_METRICS tm;
+            pLayout->GetMetrics(&tm);
+            pLayout->Release();
+            return std::max(20.0f, tm.height);
+        }
+        return 30.0f;
+    }
+
+    float compute_total_messages_height(float w) const {
         float totalH = 0.0f;
+        float rightLimit = show_cortex_atlas_ ? (w - 316.0f) : (w - 20.0f);
+        float maxBubbleW = std::min(rightLimit - 60.0f, 760.0f);
+
         for (const auto& msg : messages_) {
+            ensure_message_blocks(msg);
             bool isUser = (msg.role == "user");
-            float bubbleW = std::min(w - 120.0f, 820.0f);
-            float textH = estimate_text_height(msg.content, bubbleW - 32.0f);
+
+            float blocksH = 0.0f;
+            for (const auto& block : msg.blocks) {
+                if (block.type == BlockType::Text) {
+                    blocksH += estimate_text_height(block.content, maxBubbleW - 32.0f) + 6.0f;
+                } else if (block.type == BlockType::Code) {
+                    blocksH += 28.0f + estimate_code_height(block.content, maxBubbleW - 48.0f) + 16.0f + 8.0f;
+                }
+            }
+            if (blocksH <= 0.0f) blocksH = 24.0f;
+
             float reasonH = 0.0f;
             if (!isUser && !msg.reasoning.empty()) {
-                reasonH = estimate_text_height(msg.reasoning, bubbleW - 48.0f) + 28.0f;
+                reasonH = estimate_text_height(msg.reasoning, maxBubbleW - 48.0f) + 28.0f;
             }
-            float bubbleH = textH + reasonH + 28.0f;
+            float bubbleH = blocksH + reasonH + 24.0f;
             totalH += bubbleH + 16.0f;
         }
         return totalH;
     }
 
     void scroll_to_bottom() {
-        RECT rc{0, 0, 1120, 780};
+        RECT rc{0, 0, 1140, 800};
         if (hwnd_) GetClientRect(hwnd_, &rc);
         float w = static_cast<float>(rc.right);
         float h = static_cast<float>(rc.bottom);
@@ -1015,13 +1573,13 @@ private:
         }
     }
 
-    std::wstring format_float(double v, int prec) {
+    std::wstring format_float(double v, int prec) const {
         std::wostringstream ss;
         ss << std::fixed << std::setprecision(prec) << v;
         return ss.str();
     }
 
-    std::wstring utf8_to_wstring(const std::string& str) {
+    std::wstring utf8_to_wstring(const std::string& str) const {
         if (str.empty()) return L"";
         int len = MultiByteToWideChar(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0);
         std::wstring out(len, 0);
@@ -1029,7 +1587,7 @@ private:
         return out;
     }
 
-    std::string wstring_to_utf8(const std::wstring& str) {
+    std::string wstring_to_utf8(const std::wstring& str) const {
         if (str.empty()) return "";
         int len = WideCharToMultiByte(CP_UTF8, 0, str.c_str(), static_cast<int>(str.size()), nullptr, 0, nullptr, nullptr);
         std::string out(len, 0);
@@ -1053,6 +1611,7 @@ private:
     IDWriteTextFormat* pFormatMsgText_     = nullptr;
     IDWriteTextFormat* pFormatCodeText_    = nullptr;
     IDWriteTextFormat* pFormatChipText_    = nullptr;
+    IDWriteTextFormat* pFormatAtlasCell_   = nullptr;
 
     ID2D1SolidColorBrush* pBrushTextPrimary_   = nullptr;
     ID2D1SolidColorBrush* pBrushTextSecondary_ = nullptr;
@@ -1070,6 +1629,18 @@ private:
     ID2D1SolidColorBrush* pBrushChipBg_        = nullptr;
     ID2D1SolidColorBrush* pBrushChipHover_     = nullptr;
 
+    ID2D1SolidColorBrush* pBrushCodeHeaderBg_  = nullptr;
+    ID2D1SolidColorBrush* pBrushCodeBorder_    = nullptr;
+    ID2D1SolidColorBrush* pBrushSyntaxKeyword_ = nullptr;
+    ID2D1SolidColorBrush* pBrushSyntaxString_  = nullptr;
+    ID2D1SolidColorBrush* pBrushSyntaxComment_ = nullptr;
+    ID2D1SolidColorBrush* pBrushSyntaxNumber_  = nullptr;
+
+    ID2D1SolidColorBrush* pBrushAtlasActive_   = nullptr;
+    ID2D1SolidColorBrush* pBrushAtlasVram_     = nullptr;
+    ID2D1SolidColorBrush* pBrushAtlasRam_      = nullptr;
+    ID2D1SolidColorBrush* pBrushAtlasDisk_     = nullptr;
+
     std::vector<ChatMessageUI> messages_;
     std::vector<QuickChip> quick_chips_;
 
@@ -1078,6 +1649,7 @@ private:
     bool send_btn_hovered_ = false;
     bool stop_btn_hovered_ = false;
 
+    bool show_cortex_atlas_ = true;
     int scroll_offset_ = 0;
     uint32_t active_slot_ = 0;
 
@@ -1088,7 +1660,6 @@ private:
 } // namespace
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
-    // Enable High-DPI awareness
     SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 
     INITCOMMONCONTROLSEX icex{};

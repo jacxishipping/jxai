@@ -15,6 +15,7 @@ set(SOURCES
     src/transformer.cpp
     src/diffusion.cpp
     src/model_forge.cpp
+    src/model_pull.cpp
     src/vulkan_backend.cpp
     src/server.cpp
     src/main.cpp
@@ -24,11 +25,11 @@ add_executable(moe_engine ${SOURCES})
 
 if (MSVC)
     target_compile_options(moe_engine PRIVATE /O2 /arch:AVX2 /W3)
-    target_link_libraries(moe_engine PRIVATE ws2_32)
+    target_link_libraries(moe_engine PRIVATE ws2_32 wininet)
 else()
     target_compile_options(moe_engine PRIVATE -O3 -mavx2 -mfma -fopenmp -Wall -Wextra)
     if (WIN32)
-        target_link_libraries(moe_engine PRIVATE ws2_32 -fopenmp)
+        target_link_libraries(moe_engine PRIVATE ws2_32 wininet -fopenmp)
     else()
         target_link_libraries(moe_engine PRIVATE pthread -fopenmp)
     endif()
