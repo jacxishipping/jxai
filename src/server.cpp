@@ -121,6 +121,54 @@ std::string extract_last_message_content(const std::string& body) {
     return out;
 }
 
+// Extract multi-turn ChatML prompt from "messages" array, or fallback to single prompt
+std::string extract_chat_prompt(const std::string& body) {
+    size_t m_pos = body.find("\"messages\"");
+    if (m_pos == std::string::npos) {
+        return extract_last_message_content(body);
+    }
+    size_t arr_start = body.find('[', m_pos);
+    if (arr_start == std::string::npos) return extract_last_message_content(body);
+    size_t arr_end = body.rfind(']');
+    if (arr_end == std::string::npos || arr_end <= arr_start) return extract_last_message_content(body);
+
+    std::string arr_str = body.substr(arr_start, arr_end - arr_start + 1);
+
+    std::ostringstream formatted_prompt;
+    size_t cur = 0;
+    int msg_count = 0;
+
+    while ((cur = arr_str.find('{', cur)) != std::string::npos) {
+        size_t obj_end = arr_str.find('}', cur);
+        if (obj_end == std::string::npos) break;
+
+        std::string obj_str = arr_str.substr(cur, obj_end - cur + 1);
+        cur = obj_end + 1;
+
+        std::string role = extract_json_string(obj_str, "role", "user");
+        std::string content = extract_json_string(obj_str, "content", "");
+
+        if (content.empty()) {
+            size_t text_pos = obj_str.find("\"text\"");
+            if (text_pos != std::string::npos) {
+                content = extract_json_string(obj_str.substr(text_pos - 1), "text", "");
+            }
+        }
+
+        if (!content.empty()) {
+            formatted_prompt << "<|im_start|>" << role << "\n" << content << "<|im_end|>\n";
+            msg_count++;
+        }
+    }
+
+    if (msg_count > 0) {
+        formatted_prompt << "<|im_start|>assistant\n";
+        return formatted_prompt.str();
+    }
+
+    return extract_last_message_content(body);
+}
+
 double extract_json_number(const std::string& body, const std::string& key, double def) {
     std::string pat = "\"" + key + "\"";
     size_t pos = body.find(pat);
@@ -212,8 +260,8 @@ void send_http_json(uintptr_t sock, int status_code, const std::string& status_t
     hdr << "HTTP/1.1 " << status_code << " " << status_text << "\r\n"
         << "Content-Type: application/json; charset=utf-8\r\n"
         << "Access-Control-Allow-Origin: *\r\n"
-        << "Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n"
-        << "Access-Control-Allow-Headers: Content-Type, Authorization\r\n"
+        << "Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\n"
+        << "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, User-Agent\r\n"
         << "Content-Length: " << json_body.size() << "\r\n"
         << "Connection: close\r\n\r\n";
     std::string h = hdr.str();
@@ -371,6 +419,84 @@ void HttpServer::handle_client(uintptr_t client_sock) {
 
     if (method == "OPTIONS") {
         send_http_json(client_sock, 200, "OK", "{}");
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // 0a. GET /v1/models & GET /models (OpenAI Standard Model Discovery)
+    // ------------------------------------------------------------------------
+    if (method == "GET" && (path == "/v1/models" || path == "/models" || path.starts_with("/v1/models/") || path.starts_with("/models/"))) {
+        const auto& hp = engine_.hparams();
+        const std::string mname = hp.model_name.empty() ? "qwen2.5-0.5b-instruct" : hp.model_name;
+
+        if ((path.starts_with("/v1/models/") && path.size() > 11) || (path.starts_with("/models/") && path.size() > 8)) {
+            std::ostringstream js;
+            js << "{"
+               << "\"id\":\"" << json_escape(mname) << "\","
+               << "\"object\":\"model\","
+               << "\"created\":1730000000,"
+               << "\"owned_by\":\"moe-engine\","
+               << "\"permission\":[],"
+               << "\"root\":\"" << json_escape(mname) << "\","
+               << "\"parent\":null"
+               << "}";
+            send_http_json(client_sock, 200, "OK", js.str());
+            return;
+        }
+
+        std::ostringstream js;
+        js << "{"
+           << "\"object\":\"list\","
+           << "\"data\":["
+           << "{"
+           << "\"id\":\"" << json_escape(mname) << "\","
+           << "\"object\":\"model\","
+           << "\"created\":1730000000,"
+           << "\"owned_by\":\"moe-engine\","
+           << "\"permission\":[],"
+           << "\"root\":\"" << json_escape(mname) << "\","
+           << "\"parent\":null"
+           << "},"
+           << "{"
+           << "\"id\":\"default\","
+           << "\"object\":\"model\","
+           << "\"created\":1730000000,"
+           << "\"owned_by\":\"moe-engine\""
+           << "},"
+           << "{"
+           << "\"id\":\"gpt-3.5-turbo\","
+           << "\"object\":\"model\","
+           << "\"created\":1730000000,"
+           << "\"owned_by\":\"moe-engine\""
+           << "},"
+           << "{"
+           << "\"id\":\"gpt-4\","
+           << "\"object\":\"model\","
+           << "\"created\":1730000000,"
+           << "\"owned_by\":\"moe-engine\""
+           << "}"
+           << "]"
+           << "}";
+        send_http_json(client_sock, 200, "OK", js.str());
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // 0b. GET /api/tags (Ollama Standard Model Discovery)
+    // ------------------------------------------------------------------------
+    if (method == "GET" && path == "/api/tags") {
+        const auto& hp = engine_.hparams();
+        const std::string mname = hp.model_name.empty() ? "qwen2.5:latest" : hp.model_name;
+        std::ostringstream js;
+        js << "{\"models\":[{"
+           << "\"name\":\"" << json_escape(mname) << "\","
+           << "\"model\":\"" << json_escape(mname) << "\","
+           << "\"modified_at\":\"2026-11-04T00:00:00Z\","
+           << "\"size\":1328288,"
+           << "\"digest\":\"sha256:moe-engine-local\","
+           << "\"details\":{\"format\":\"gguf\",\"family\":\"qwen2\",\"parameter_size\":\"0.5B\",\"quantization_level\":\"Q4_0\"}"
+           << "}]}";
+        send_http_json(client_sock, 200, "OK", js.str());
         return;
     }
 
@@ -546,10 +672,10 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     }
 
     // ------------------------------------------------------------------------
-    // 4. POST /v1/chat/completions
+    // 4. POST /v1/chat/completions, /v1/completions, /api/chat, /api/generate
     // ------------------------------------------------------------------------
-    if (method == "POST" && path == "/v1/chat/completions") {
-        std::string user_prompt = extract_last_message_content(body);
+    if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions" || path == "/api/chat" || path == "/api/generate")) {
+        std::string user_prompt = extract_chat_prompt(body);
         bool stream = extract_json_bool(body, "stream", true);
         uint32_t max_tokens = static_cast<uint32_t>(std::clamp(extract_json_number(body, "max_tokens", 1024.0), 1.0, 4096.0));
         uint32_t slot_id = static_cast<uint32_t>(std::max(0.0, extract_json_number(body, "cache_slot", 0.0)));
@@ -590,6 +716,11 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                << "\"reasoning_content\":\"" << json_escape(reasoning_acc) << "\","
                << "\"content\":\"" << json_escape(content_acc) << "\""
                << "},\"finish_reason\":\"stop\"}],"
+               << "\"usage\":{"
+               << "\"prompt_tokens\":" << (user_prompt.size() / 4 + 1) << ","
+               << "\"completion_tokens\":" << (content_acc.size() / 4 + 1) << ","
+               << "\"total_tokens\":" << ((user_prompt.size() + content_acc.size()) / 4 + 2)
+               << "},"
                << "\"moe_telemetry\":{"
                << "\"tok_per_sec\":" << final_prof.tok_per_sec << ","
                << "\"wall_ms\":" << final_prof.wall_ms << ","
@@ -656,6 +787,16 @@ void HttpServer::handle_client(uintptr_t client_sock) {
             std::string chunk = ev.str();
             send_all(client_sock, chunk.data(), chunk.size());
         }
+
+        std::ostringstream final_chunk;
+        final_chunk << "data: {"
+                    << "\"id\":\"" << cmpl_id << "\","
+                    << "\"object\":\"chat.completion.chunk\","
+                    << "\"model\":\"" << mname << "\","
+                    << "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]"
+                    << "}\n\n";
+        std::string fc_str = final_chunk.str();
+        send_all(client_sock, fc_str.data(), fc_str.size());
 
         const char* done_msg = "data: [DONE]\n\n";
         send_all(client_sock, done_msg, std::strlen(done_msg));
