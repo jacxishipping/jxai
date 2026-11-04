@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, Cpu, Database, Disc, ChevronDown, ChevronRight, Eye, Code, Zap, Clock, Layers } from 'lucide-react';
+import { Send, Cpu, Database, Disc, ChevronDown, ChevronRight, Eye, Code, Zap, Clock, Layers, Play } from 'lucide-react';
 import { ChatMessage, EngineHealth } from '../types';
 import { MarkdownRenderer } from '../utils/markdownParser';
 import { Translations } from '../utils/i18n';
@@ -11,7 +11,7 @@ interface ChatWorkspaceProps {
   currentSlot: number;
 }
 
-export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({ health, t, currentSlot }) => {
+export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({ health, t, currentSlot, onRefreshHealth }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([
     {
       id: 'welcome',
@@ -54,6 +54,7 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
 
   const handleSend = async () => {
     if (!input.trim() || isStreaming) return;
+    const isContinue = input.trim().toLowerCase() === 'continue';
     const userMsg: ChatMessage = {
       id: 'msg-' + Date.now(),
       role: 'user',
@@ -85,9 +86,10 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
         body: JSON.stringify({
           messages: [{ role: 'user', content: userMsg.content }],
           stream: true,
-          max_tokens: 128,
+          max_tokens: 2048,
           temperature: 0.7,
           cache_slot: currentSlot,
+          continue_assistant: isContinue,
           context_compaction: true
         })
       });
@@ -167,8 +169,96 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
       );
     } finally {
       setIsStreaming(false);
-      // Ensure collapsed upon completion
       setCollapsedReasoning(prev => ({ ...prev, [assistantMsgId]: true }));
+      if (onRefreshHealth) onRefreshHealth();
+    }
+  };
+
+  const handleContinue = async (msgId: string) => {
+    if (isStreaming) return;
+    setIsStreaming(true);
+    const requestStartTime = performance.now();
+    let ttftRecorded = false;
+    let ttftMs = 0;
+
+    try {
+      const response = await fetch('/v1/chat/completions', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          messages: [{ role: 'user', content: 'continue' }],
+          stream: true,
+          max_tokens: 2048,
+          temperature: 0.7,
+          cache_slot: currentSlot,
+          continue_assistant: true,
+          context_compaction: true
+        })
+      });
+
+      if (!response.body) throw new Error('No readable stream');
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buffer += decoder.decode(value, { stream: true });
+
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
+
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data: ')) continue;
+          const dataStr = trimmed.slice(6);
+          if (dataStr === '[DONE]') break;
+
+          try {
+            const parsed = JSON.parse(dataStr);
+            const delta = parsed.choices?.[0]?.delta;
+            const telem = parsed.moe_telemetry;
+
+            if (!ttftRecorded && (delta?.reasoning_content || delta?.content)) {
+              ttftMs = performance.now() - requestStartTime;
+              ttftRecorded = true;
+            }
+
+            setMessages(prev =>
+              prev.map(m => {
+                if (m.id !== msgId) return m;
+                return {
+                  ...m,
+                  content: delta?.content ? m.content + delta.content : m.content,
+                  reasoning_content: delta?.reasoning_content
+                    ? (m.reasoning_content || '') + delta.reasoning_content
+                    : m.reasoning_content,
+                  telemetry: telem
+                    ? {
+                        tok_per_sec: telem.tok_per_sec,
+                        wall_ms: telem.wall_ms,
+                        io_wait_ms: telem.io_wait_ms,
+                        cache_hits: telem.cache_hits,
+                        disk_reads: telem.disk_reads,
+                        ttft_ms: ttftMs,
+                        queue_latency_ms: Math.max(0.2, (telem.wall_ms || 1) * 0.1),
+                        cache_slot: currentSlot
+                      }
+                    : m.telemetry
+                };
+              })
+            );
+          } catch {
+            // ignore partial JSON chunk
+          }
+        }
+      }
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setIsStreaming(false);
+      if (onRefreshHealth) onRefreshHealth();
     }
   };
 
@@ -309,6 +399,20 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
                       <span className="text-slate-500">|</span>
                       <span className="text-amber-400">{t.reads}: {msg.telemetry.disk_reads}</span>
                     </div>
+                  </div>
+                )}
+
+                {/* Continue Generation Action Button */}
+                {!isStreaming && msg.role === 'assistant' && msg.id !== 'welcome' && (
+                  <div className="mt-2.5 pt-2 border-t border-slate-800/40 flex items-center justify-end">
+                    <button
+                      onClick={() => handleContinue(msg.id)}
+                      className="text-[11px] font-mono text-indigo-400 hover:text-indigo-300 flex items-center space-x-1.5 px-2.5 py-1 rounded-lg bg-indigo-950/40 border border-indigo-500/20 hover:bg-indigo-900/40 transition-colors"
+                      title="Continue generating next tokens"
+                    >
+                      <Play className="w-3 h-3 fill-current" />
+                      <span>Continue generation</span>
+                    </button>
                   </div>
                 )}
               </div>

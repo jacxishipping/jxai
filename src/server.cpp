@@ -496,7 +496,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     if (method == "POST" && path == "/v1/chat/completions") {
         std::string user_prompt = extract_last_message_content(body);
         bool stream = extract_json_bool(body, "stream", true);
-        uint32_t max_tokens = static_cast<uint32_t>(std::clamp(extract_json_number(body, "max_tokens", 56.0), 1.0, 512.0));
+        uint32_t max_tokens = static_cast<uint32_t>(std::clamp(extract_json_number(body, "max_tokens", 1024.0), 1.0, 4096.0));
         uint32_t slot_id = static_cast<uint32_t>(std::max(0.0, extract_json_number(body, "cache_slot", 0.0)));
         bool compaction = extract_json_bool(body, "context_compaction", true);
         bool continue_asst = extract_json_bool(body, "continue_assistant", false);

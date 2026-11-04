@@ -749,7 +749,7 @@ void MoETransformerEngine::generate_stream(
             if (hp_.arch == "olmoe" || tokenizer_.token_to_id("<|user|>") >= 0) {
                 prompt_to_encode = "<|user|>\n" + prompt_to_encode + "\n<|assistant|>\n";
             } else if (hp_.arch == "qwen2" || tokenizer_.token_to_id("<|im_start|>") >= 0) {
-                prompt_to_encode = "<|im_start|>system\nYou are a helpful assistant. Please answer concisely in English.<|im_end|>\n<|im_start|>user\n" + prompt_to_encode + "<|im_end|>\n<|im_start|>assistant\n";
+                prompt_to_encode = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + prompt_to_encode + "<|im_end|>\n<|im_start|>assistant\n";
             }
         }
 
