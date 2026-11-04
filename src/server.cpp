@@ -672,6 +672,93 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     }
 
     // ------------------------------------------------------------------------
+    // 3c. GET /api/config & GET /v1/config (Retrieve Live moe_config.json)
+    // ------------------------------------------------------------------------
+    if (method == "GET" && (path == "/api/config" || path == "/v1/config")) {
+        std::ifstream ifs("moe_config.json");
+        std::string json_content;
+        if (ifs.is_open()) {
+            json_content = std::string((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        }
+        if (json_content.empty()) {
+            const auto& hp = engine_.hparams();
+            std::ostringstream js;
+            js << "{\n"
+               << "  \"engine\": \"MoE-Stream-Engine-v2\",\n"
+               << "  \"first_run_completed\": true,\n"
+               << "  \"model_path\": \"" << (hp.model_name.empty() ? "models/test_qwen.gguf" : hp.model_name) << "\",\n"
+               << "  \"bypass_io\": true,\n"
+               << "  \"direct_dma\": true,\n"
+               << "  \"paged_attention_blocks\": 2048,\n"
+               << "  \"active_slots\": 4,\n"
+               << "  \"max_context\": 32768,\n"
+               << "  \"api_port\": " << port_ << ",\n"
+               << "  \"speculative_draft_tokens\": 3,\n"
+               << "  \"temperature\": 0.7,\n"
+               << "  \"top_p\": 0.9\n"
+               << "}";
+            json_content = js.str();
+        }
+        send_http_json(client_sock, 200, "OK", json_content);
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // 3d. POST /api/config & POST /v1/config (Update & Persist moe_config.json)
+    // ------------------------------------------------------------------------
+    if (method == "POST" && (path == "/api/config" || path == "/v1/config")) {
+        std::string model_path = extract_json_string(body, "model_path", "models/test_qwen.gguf");
+        bool bypass_io = extract_json_bool(body, "bypass_io", true);
+        bool direct_dma = extract_json_bool(body, "direct_dma", true);
+        int paged_blocks = static_cast<int>(extract_json_number(body, "paged_attention_blocks", 2048.0));
+        int active_slots = static_cast<int>(extract_json_number(body, "active_slots", 4.0));
+        int max_ctx = static_cast<int>(extract_json_number(body, "max_context", 32768.0));
+        int api_port = static_cast<int>(extract_json_number(body, "api_port", static_cast<double>(port_)));
+        int spec_tokens = static_cast<int>(extract_json_number(body, "speculative_draft_tokens", 3.0));
+        double temp = extract_json_number(body, "temperature", 0.7);
+        double top_p = extract_json_number(body, "top_p", 0.9);
+
+        std::ofstream ofs("moe_config.json", std::ios::trunc | std::ios::binary);
+        if (ofs.is_open()) {
+            ofs << "{\n"
+                << "  \"engine\": \"MoE-Stream-Engine-v2\",\n"
+                << "  \"first_run_completed\": true,\n"
+                << "  \"model_path\": \"" << model_path << "\",\n"
+                << "  \"bypass_io\": " << (bypass_io ? "true" : "false") << ",\n"
+                << "  \"direct_dma\": " << (direct_dma ? "true" : "false") << ",\n"
+                << "  \"paged_attention_blocks\": " << paged_blocks << ",\n"
+                << "  \"active_slots\": " << active_slots << ",\n"
+                << "  \"max_context\": " << max_ctx << ",\n"
+                << "  \"api_port\": " << api_port << ",\n"
+                << "  \"speculative_draft_tokens\": " << spec_tokens << ",\n"
+                << "  \"temperature\": " << temp << ",\n"
+                << "  \"top_p\": " << top_p << "\n"
+                << "}\n";
+            ofs.close();
+        }
+
+        std::ostringstream js;
+        js << "{\n"
+           << "  \"status\": \"ok\",\n"
+           << "  \"message\": \"System configuration updated and written to moe_config.json\",\n"
+           << "  \"config\": {\n"
+           << "    \"model_path\": \"" << model_path << "\",\n"
+           << "    \"bypass_io\": " << (bypass_io ? "true" : "false") << ",\n"
+           << "    \"direct_dma\": " << (direct_dma ? "true" : "false") << ",\n"
+           << "    \"paged_attention_blocks\": " << paged_blocks << ",\n"
+           << "    \"active_slots\": " << active_slots << ",\n"
+           << "    \"max_context\": " << max_ctx << ",\n"
+           << "    \"api_port\": " << api_port << ",\n"
+           << "    \"speculative_draft_tokens\": " << spec_tokens << ",\n"
+           << "    \"temperature\": " << temp << ",\n"
+           << "    \"top_p\": " << top_p << "\n"
+           << "  }\n"
+           << "}";
+        send_http_json(client_sock, 200, "OK", js.str());
+        return;
+    }
+
+    // ------------------------------------------------------------------------
     // 4. POST /v1/chat/completions, /v1/completions, /api/chat, /api/generate
     // ------------------------------------------------------------------------
     if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions" || path == "/api/chat" || path == "/api/generate")) {

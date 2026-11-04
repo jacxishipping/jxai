@@ -130,6 +130,56 @@ private:
     }
 
 public:
+    bool post_config_sync(const std::string& json_payload, std::string& out_resp) {
+        SOCKET s = connect_socket();
+        if (s == INVALID_SOCKET) return false;
+
+        std::ostringstream req;
+        req << "POST /api/config HTTP/1.1\r\n"
+            << "Host: " << host_ << "\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << json_payload.size() << "\r\n"
+            << "Connection: close\r\n\r\n"
+            << json_payload;
+
+        std::string req_str = req.str();
+        send(s, req_str.data(), static_cast<int>(req_str.size()), 0);
+
+        out_resp.clear();
+        char buf[2048];
+        while (true) {
+            int n = recv(s, buf, sizeof(buf) - 1, 0);
+            if (n <= 0) break;
+            out_resp.append(buf, n);
+        }
+        closesocket(s);
+        return (out_resp.find("200 OK") != std::string::npos);
+    }
+
+    bool fetch_config_sync(std::string& out_json) {
+        SOCKET s = connect_socket();
+        if (s == INVALID_SOCKET) return false;
+
+        std::string req = "GET /api/config HTTP/1.1\r\nHost: " + host_ + "\r\nConnection: close\r\n\r\n";
+        send(s, req.data(), static_cast<int>(req.size()), 0);
+
+        std::string resp;
+        char buf[2048];
+        while (true) {
+            int n = recv(s, buf, sizeof(buf) - 1, 0);
+            if (n <= 0) break;
+            resp.append(buf, n);
+        }
+        closesocket(s);
+
+        size_t body_pos = resp.find("\r\n\r\n");
+        if (body_pos != std::string::npos) {
+            out_json = resp.substr(body_pos + 4);
+            return true;
+        }
+        return false;
+    }
+
     TelemetrySnapshot fetch_health_sync() {
         TelemetrySnapshot ts{};
         SOCKET s = connect_socket();

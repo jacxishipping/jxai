@@ -285,6 +285,118 @@ bool export_markdown(uint32_t slot_id, const std::vector<ChatMessageUI>& msgs, s
     return true;
 }
 
+struct SystemConfigUI {
+    std::string engine = "MoE-Stream-Engine-v2";
+    bool first_run_completed = true;
+    std::string model_path = "models/test_qwen.gguf";
+    std::string model_name = "qwen2.5-0.5b-instruct";
+    bool bypass_io = true;
+    bool direct_dma = true;
+    int paged_attention_blocks = 2048;
+    int active_slots = 4;
+    int max_context = 32768;
+    int api_port = 8000;
+    int speculative_draft_tokens = 3;
+    double temperature = 0.7;
+    double top_p = 0.9;
+
+    bool is_dirty = false;
+
+    void reset_to_defaults() {
+        engine = "MoE-Stream-Engine-v2";
+        first_run_completed = true;
+        model_path = "models/test_qwen.gguf";
+        model_name = "qwen2.5-0.5b-instruct";
+        bypass_io = true;
+        direct_dma = true;
+        paged_attention_blocks = 2048;
+        active_slots = 4;
+        max_context = 32768;
+        api_port = 8000;
+        speculative_draft_tokens = 3;
+        temperature = 0.7;
+        top_p = 0.9;
+        is_dirty = true;
+    }
+
+    std::string to_json_string() const {
+        std::ostringstream ss;
+        ss << "{\n"
+           << "  \"engine\": \"" << engine << "\",\n"
+           << "  \"first_run_completed\": " << (first_run_completed ? "true" : "false") << ",\n"
+           << "  \"model_path\": \"" << model_path << "\",\n"
+           << "  \"model_name\": \"" << model_name << "\",\n"
+           << "  \"bypass_io\": " << (bypass_io ? "true" : "false") << ",\n"
+           << "  \"direct_dma\": " << (direct_dma ? "true" : "false") << ",\n"
+           << "  \"paged_attention_blocks\": " << paged_attention_blocks << ",\n"
+           << "  \"active_slots\": " << active_slots << ",\n"
+           << "  \"max_context\": " << max_context << ",\n"
+           << "  \"api_port\": " << api_port << ",\n"
+           << "  \"speculative_draft_tokens\": " << speculative_draft_tokens << ",\n"
+           << "  \"temperature\": " << temperature << ",\n"
+           << "  \"top_p\": " << top_p << "\n"
+           << "}\n";
+        return ss.str();
+    }
+
+    void load_from_file(const std::string& path = "moe_config.json") {
+        std::ifstream ifs(path, std::ios::binary);
+        if (!ifs.is_open()) return;
+        std::string json((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        if (json.empty()) return;
+
+        auto extract_str = [&](const std::string& key, const std::string& def) -> std::string {
+            size_t p = json.find("\"" + key + "\":");
+            if (p == std::string::npos) return def;
+            p = json.find("\"", p + key.size() + 2);
+            if (p == std::string::npos) return def;
+            size_t q = json.find("\"", p + 1);
+            if (q == std::string::npos) return def;
+            return json.substr(p + 1, q - p - 1);
+        };
+
+        auto extract_bool = [&](const std::string& key, bool def) -> bool {
+            size_t p = json.find("\"" + key + "\":");
+            if (p == std::string::npos) return def;
+            p += key.size() + 3;
+            while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) p++;
+            if (json.compare(p, 4, "true") == 0) return true;
+            if (json.compare(p, 5, "false") == 0) return false;
+            return def;
+        };
+
+        auto extract_num = [&](const std::string& key, double def) -> double {
+            size_t p = json.find("\"" + key + "\":");
+            if (p == std::string::npos) return def;
+            p += key.size() + 3;
+            while (p < json.size() && (json[p] == ' ' || json[p] == '\t')) p++;
+            try { return std::stod(json.substr(p)); } catch (...) { return def; }
+        };
+
+        model_path = extract_str("model_path", model_path);
+        model_name = extract_str("model_name", model_name);
+        bypass_io = extract_bool("bypass_io", bypass_io);
+        direct_dma = extract_bool("direct_dma", direct_dma);
+        paged_attention_blocks = static_cast<int>(extract_num("paged_attention_blocks", paged_attention_blocks));
+        active_slots = static_cast<int>(extract_num("active_slots", active_slots));
+        max_context = static_cast<int>(extract_num("max_context", max_context));
+        api_port = static_cast<int>(extract_num("api_port", api_port));
+        speculative_draft_tokens = static_cast<int>(extract_num("speculative_draft_tokens", speculative_draft_tokens));
+        temperature = extract_num("temperature", temperature);
+        top_p = extract_num("top_p", top_p);
+        is_dirty = false;
+    }
+
+    bool save_to_file(const std::string& path = "moe_config.json") {
+        std::ofstream ofs(path, std::ios::trunc | std::ios::binary);
+        if (!ofs.is_open()) return false;
+        std::string s = to_json_string();
+        ofs.write(s.data(), s.size());
+        is_dirty = false;
+        return true;
+    }
+};
+
 class MoEStudioApp {
 public:
     MoEStudioApp() : client_("127.0.0.1", 8000) {}
@@ -294,6 +406,9 @@ public:
     void set_show_wizard(bool v) { show_wizard_ = v; }
     void set_wizard_step(int step) { wizard_step_ = std::max(0, std::min(step, 3)); }
     bool is_showing_wizard() const { return show_wizard_; }
+    void set_show_settings(bool v) { show_settings_ = v; }
+    bool is_showing_settings() const { return show_settings_; }
+    SystemConfigUI& config() { return config_; }
 
     bool has_config() const {
         DWORD dwAttrib = GetFileAttributesW(L"moe_config.json");
@@ -448,6 +563,7 @@ public:
         slot_sessions_[0] = messages_;
 
         load_sessions_from_disk();
+        config_.load_from_file("moe_config.json");
 
         if (!has_config()) {
             show_wizard_ = true;
@@ -1151,6 +1267,7 @@ private:
 
     void init_quick_chips() {
         quick_chips_ = {
+            { L"⚙️ System Config", "__open_settings__", D2D1::RectF() },
             { L"Setup Wizard", "__open_wizard__", D2D1::RectF() },
             { L"Atlas: ON", "__toggle_atlas__", D2D1::RectF() },
             { L"Slot: #0", "__cycle_slot__", D2D1::RectF() },
@@ -1164,6 +1281,12 @@ private:
     }
 
     void handle_chip_click(const QuickChip& chip) {
+        if (chip.prompt == "__open_settings__") {
+            config_.load_from_file("moe_config.json");
+            show_settings_ = true;
+            InvalidateRect(hwnd_, nullptr, FALSE);
+            return;
+        }
         if (chip.prompt == "__open_wizard__") {
             show_wizard_ = true;
             wizard_step_ = 0;
