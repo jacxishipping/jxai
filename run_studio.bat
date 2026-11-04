@@ -25,3 +25,4 @@ if %ERRORLEVEL% neq 0 (
 echo [LAUNCH] Launching MoE Studio C++ Direct2D Native Desktop App...
 start "" "build\moe_studio.exe"
 echo [OK] MoE Studio is running.
+

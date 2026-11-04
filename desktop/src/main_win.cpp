@@ -8,6 +8,8 @@
 #include <dwrite.h>
 #include <dwmapi.h>
 #include <commctrl.h>
+#include <wincodec.h>
+#include <shellapi.h>
 #include <string>
 #include <vector>
 #include <memory>
@@ -146,6 +148,124 @@ public:
             DispatchMessage(&msg);
         }
         return static_cast<int>(msg.wParam);
+    }
+
+    bool save_screenshot_png(const std::wstring& out_path, float w = 1120.0f, float h = 780.0f) {
+        latest_telem_ = client_.fetch_health_sync();
+        CoInitialize(nullptr);
+
+        IWICImagingFactory* pWICFactory = nullptr;
+        HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pWICFactory));
+        if (FAILED(hr) || !pWICFactory) return false;
+
+        UINT32 uW = static_cast<UINT32>(w);
+        UINT32 uH = static_cast<UINT32>(h);
+
+        IWICBitmap* pWicBitmap = nullptr;
+        hr = pWICFactory->CreateBitmap(uW, uH, GUID_WICPixelFormat32bppPBGRA, WICBitmapCacheOnDemand, &pWicBitmap);
+        if (FAILED(hr) || !pWicBitmap) {
+            pWICFactory->Release();
+            return false;
+        }
+
+        D2D1_RENDER_TARGET_PROPERTIES rtProps = D2D1::RenderTargetProperties(
+            D2D1_RENDER_TARGET_TYPE_DEFAULT,
+            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED),
+            0.0f, 0.0f,
+            D2D1_RENDER_TARGET_USAGE_NONE,
+            D2D1_FEATURE_LEVEL_DEFAULT
+        );
+
+        ID2D1RenderTarget* pOffscreenRT = nullptr;
+        hr = pD2DFactory_->CreateWicBitmapRenderTarget(pWicBitmap, rtProps, &pOffscreenRT);
+        if (FAILED(hr) || !pOffscreenRT) {
+            pWicBitmap->Release();
+            pWICFactory->Release();
+            return false;
+        }
+
+        layout_input_controls(static_cast<int>(w), static_cast<int>(h));
+
+        release_brushes();
+        create_brushes(pOffscreenRT);
+
+        pOffscreenRT->BeginDraw();
+        current_rt_ = pOffscreenRT;
+        render_scene(w, h);
+        hr = pOffscreenRT->EndDraw();
+
+        IWICStream* pStream = nullptr;
+        hr = pWICFactory->CreateStream(&pStream);
+        if (SUCCEEDED(hr)) {
+            hr = pStream->InitializeFromFilename(out_path.c_str(), GENERIC_WRITE);
+            if (SUCCEEDED(hr)) {
+                IWICBitmapEncoder* pEncoder = nullptr;
+                pWICFactory->CreateEncoder(GUID_ContainerFormatPng, nullptr, &pEncoder);
+                pEncoder->Initialize(pStream, WICBitmapEncoderNoCache);
+
+                IWICBitmapFrameEncode* pFrame = nullptr;
+                pEncoder->CreateNewFrame(&pFrame, nullptr);
+                pFrame->Initialize(nullptr);
+                pFrame->SetSize(uW, uH);
+
+                WICPixelFormatGUID format = GUID_WICPixelFormat32bppPBGRA;
+                pFrame->SetPixelFormat(&format);
+                pFrame->WriteSource(pWicBitmap, nullptr);
+                pFrame->Commit();
+                pEncoder->Commit();
+
+                pFrame->Release();
+                pEncoder->Release();
+            }
+            pStream->Release();
+        }
+
+        release_brushes();
+        pOffscreenRT->Release();
+        pWicBitmap->Release();
+        pWICFactory->Release();
+
+        if (pRenderTarget_) {
+            create_brushes(pRenderTarget_);
+        }
+
+        return SUCCEEDED(hr);
+    }
+
+    bool send_prompt_sync(const std::string& prompt_utf8, uint32_t max_tokens = 1024) {
+        latest_telem_ = client_.fetch_health_sync();
+
+        ChatMessageUI userMsg{};
+        userMsg.role = "user";
+        userMsg.content = utf8_to_wstring(prompt_utf8);
+        messages_.push_back(userMsg);
+
+        ChatMessageUI asstMsg{};
+        asstMsg.role = "assistant";
+        asstMsg.content = L"";
+        asstMsg.reasoning = L"";
+        messages_.push_back(asstMsg);
+
+        std::string err;
+        bool ok = client_.execute_stream_sync(
+            prompt_utf8,
+            max_tokens,
+            0.7f,
+            active_slot_,
+            false,
+            [this](const std::string& piece, bool is_reasoning, const moe::ui::TelemetrySnapshot& telem) {
+                if (is_reasoning) {
+                    messages_.back().reasoning += utf8_to_wstring(piece);
+                } else {
+                    messages_.back().content += utf8_to_wstring(piece);
+                }
+                latest_telem_ = telem;
+            },
+            err
+        );
+        messages_.back().telem = latest_telem_;
+        scroll_to_bottom();
+        return ok;
     }
 
 private:
@@ -543,40 +663,26 @@ private:
         );
     }
 
-    void create_graphics_resources() {
-        if (!pRenderTarget_) {
-            RECT rc;
-            GetClientRect(hwnd_, &rc);
-            UINT32 w = std::max(100u, static_cast<UINT32>(rc.right - rc.left));
-            UINT32 h = std::max(100u, static_cast<UINT32>(rc.bottom - rc.top));
-            D2D1_SIZE_U size = D2D1::SizeU(w, h);
-
-            HRESULT hr = pD2DFactory_->CreateHwndRenderTarget(
-                D2D1::RenderTargetProperties(),
-                D2D1::HwndRenderTargetProperties(hwnd_, size),
-                &pRenderTarget_
-            );
-            if (FAILED(hr) || !pRenderTarget_) return;
-
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::TextPrimary, &pBrushTextPrimary_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::TextSecondary, &pBrushTextSecondary_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::TextMuted, &pBrushTextMuted_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::AccentBlue, &pBrushAccentBlue_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::AccentGreen, &pBrushAccentGreen_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::AccentPink, &pBrushAccentPink_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::AccentAmber, &pBrushAccentAmber_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::AccentIndigo, &pBrushAccentIndigo_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::CardBg, &pBrushCardBg_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::CardBorder, &pBrushCardBorder_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::UserBubble, &pBrushUserBubble_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::AsstBubble, &pBrushAsstBubble_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::CodeBg, &pBrushCodeBg_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::ChipBg, &pBrushChipBg_);
-            pRenderTarget_->CreateSolidColorBrush(moe::ui::colors::ChipHover, &pBrushChipHover_);
-        }
+    void create_brushes(ID2D1RenderTarget* rt) {
+        if (!rt) return;
+        rt->CreateSolidColorBrush(moe::ui::colors::TextPrimary, &pBrushTextPrimary_);
+        rt->CreateSolidColorBrush(moe::ui::colors::TextSecondary, &pBrushTextSecondary_);
+        rt->CreateSolidColorBrush(moe::ui::colors::TextMuted, &pBrushTextMuted_);
+        rt->CreateSolidColorBrush(moe::ui::colors::AccentBlue, &pBrushAccentBlue_);
+        rt->CreateSolidColorBrush(moe::ui::colors::AccentGreen, &pBrushAccentGreen_);
+        rt->CreateSolidColorBrush(moe::ui::colors::AccentPink, &pBrushAccentPink_);
+        rt->CreateSolidColorBrush(moe::ui::colors::AccentAmber, &pBrushAccentAmber_);
+        rt->CreateSolidColorBrush(moe::ui::colors::AccentIndigo, &pBrushAccentIndigo_);
+        rt->CreateSolidColorBrush(moe::ui::colors::CardBg, &pBrushCardBg_);
+        rt->CreateSolidColorBrush(moe::ui::colors::CardBorder, &pBrushCardBorder_);
+        rt->CreateSolidColorBrush(moe::ui::colors::UserBubble, &pBrushUserBubble_);
+        rt->CreateSolidColorBrush(moe::ui::colors::AsstBubble, &pBrushAsstBubble_);
+        rt->CreateSolidColorBrush(moe::ui::colors::CodeBg, &pBrushCodeBg_);
+        rt->CreateSolidColorBrush(moe::ui::colors::ChipBg, &pBrushChipBg_);
+        rt->CreateSolidColorBrush(moe::ui::colors::ChipHover, &pBrushChipHover_);
     }
 
-    void discard_graphics_resources() {
+    void release_brushes() {
         if (pBrushTextPrimary_)   { pBrushTextPrimary_->Release(); pBrushTextPrimary_ = nullptr; }
         if (pBrushTextSecondary_) { pBrushTextSecondary_->Release(); pBrushTextSecondary_ = nullptr; }
         if (pBrushTextMuted_)     { pBrushTextMuted_->Release(); pBrushTextMuted_ = nullptr; }
@@ -592,6 +698,28 @@ private:
         if (pBrushCodeBg_)        { pBrushCodeBg_->Release(); pBrushCodeBg_ = nullptr; }
         if (pBrushChipBg_)        { pBrushChipBg_->Release(); pBrushChipBg_ = nullptr; }
         if (pBrushChipHover_)     { pBrushChipHover_->Release(); pBrushChipHover_ = nullptr; }
+    }
+
+    void create_graphics_resources() {
+        if (!pRenderTarget_) {
+            RECT rc;
+            GetClientRect(hwnd_, &rc);
+            UINT32 w = std::max(100u, static_cast<UINT32>(rc.right - rc.left));
+            UINT32 h = std::max(100u, static_cast<UINT32>(rc.bottom - rc.top));
+            D2D1_SIZE_U size = D2D1::SizeU(w, h);
+
+            HRESULT hr = pD2DFactory_->CreateHwndRenderTarget(
+                D2D1::RenderTargetProperties(),
+                D2D1::HwndRenderTargetProperties(hwnd_, size),
+                &pRenderTarget_
+            );
+            if (FAILED(hr) || !pRenderTarget_) return;
+            create_brushes(pRenderTarget_);
+        }
+    }
+
+    void discard_graphics_resources() {
+        release_brushes();
         if (pRenderTarget_)       { pRenderTarget_->Release(); pRenderTarget_ = nullptr; }
     }
 
@@ -601,17 +729,8 @@ private:
         }
     }
 
-    void render() {
-        create_graphics_resources();
-        if (!pRenderTarget_ || !pBrushTextPrimary_) return;
-
-        pRenderTarget_->BeginDraw();
-        pRenderTarget_->Clear(moe::ui::colors::BgDark);
-
-        RECT clientRc;
-        GetClientRect(hwnd_, &clientRc);
-        float w = static_cast<float>(clientRc.right);
-        float h = static_cast<float>(clientRc.bottom);
+    void render_scene(float w, float h) {
+        current_rt_->Clear(moe::ui::colors::BgDark);
 
         // 1. Render Top App Header & Model Status
         render_header(w);
@@ -626,8 +745,21 @@ private:
         render_quick_chips();
 
         // 5. Render Buttons (Send / Stop)
-        render_action_buttons();
+        render_action_buttons(w, h);
+    }
 
+    void render() {
+        create_graphics_resources();
+        if (!pRenderTarget_ || !pBrushTextPrimary_) return;
+
+        RECT clientRc;
+        GetClientRect(hwnd_, &clientRc);
+        float w = static_cast<float>(clientRc.right);
+        float h = static_cast<float>(clientRc.bottom);
+
+        pRenderTarget_->BeginDraw();
+        current_rt_ = pRenderTarget_;
+        render_scene(w, h);
         HRESULT hr = pRenderTarget_->EndDraw();
         if (hr == D2DERR_RECREATE_TARGET) {
             discard_graphics_resources();
@@ -636,28 +768,28 @@ private:
 
     void render_header(float w) {
         D2D1_RECT_F headerRc = D2D1::RectF(0, 0, w, 52.0f);
-        pRenderTarget_->FillRectangle(headerRc, pBrushCardBg_);
-        pRenderTarget_->DrawLine(D2D1::Point2F(0, 52.0f), D2D1::Point2F(w, 52.0f), pBrushCardBorder_, 1.0f);
+        current_rt_->FillRectangle(headerRc, pBrushCardBg_);
+        current_rt_->DrawLine(D2D1::Point2F(0, 52.0f), D2D1::Point2F(w, 52.0f), pBrushCardBorder_, 1.0f);
 
         // App Logo Icon & Title
         std::wstring title = L"MoE Studio";
-        pRenderTarget_->DrawText(title.c_str(), static_cast<UINT32>(title.size()), pFormatHeaderTitle_,
+        current_rt_->DrawText(title.c_str(), static_cast<UINT32>(title.size()), pFormatHeaderTitle_,
             D2D1::RectF(20.0f, 12.0f, 180.0f, 44.0f), pBrushAccentBlue_);
 
         // Status indicator dot
         D2D1_ELLIPSE statusDot = D2D1::Ellipse(
             D2D1::Point2F(145.0f, 26.0f), 4.5f, 4.5f
         );
-        pRenderTarget_->FillEllipse(statusDot, latest_telem_.server_online ? pBrushAccentGreen_ : pBrushAccentPink_);
+        current_rt_->FillEllipse(statusDot, latest_telem_.server_online ? pBrushAccentGreen_ : pBrushAccentPink_);
 
         // Model & Architecture Badge
         std::wstring modelDesc = utf8_to_wstring(latest_telem_.model_name) + L" (" + utf8_to_wstring(latest_telem_.arch) + L")";
-        pRenderTarget_->DrawText(modelDesc.c_str(), static_cast<UINT32>(modelDesc.size()), pFormatHeaderSub_,
+        current_rt_->DrawText(modelDesc.c_str(), static_cast<UINT32>(modelDesc.size()), pFormatHeaderSub_,
             D2D1::RectF(160.0f, 17.0f, 460.0f, 40.0f), pBrushTextPrimary_);
 
         // Hardware Tags on Right
         std::wstring hwTags = utf8_to_wstring(latest_telem_.simd) + L"  |  " + utf8_to_wstring(latest_telem_.io_backend) + L"  |  Slot #" + std::to_wstring(active_slot_);
-        pRenderTarget_->DrawText(hwTags.c_str(), static_cast<UINT32>(hwTags.size()), pFormatHeaderSub_,
+        current_rt_->DrawText(hwTags.c_str(), static_cast<UINT32>(hwTags.size()), pFormatHeaderSub_,
             D2D1::RectF(w - 420.0f, 17.0f, w - 20.0f, 40.0f), pBrushTextSecondary_);
     }
 
@@ -704,24 +836,24 @@ private:
 
     void render_stat_card(const D2D1_RECT_F& rc, const std::wstring& label, const std::wstring& val, ID2D1SolidColorBrush* valBrush) {
         D2D1_ROUNDED_RECT rrc = D2D1::RoundedRect(rc, 8.0f, 8.0f);
-        pRenderTarget_->FillRoundedRectangle(rrc, pBrushCardBg_);
-        pRenderTarget_->DrawRoundedRectangle(rrc, pBrushCardBorder_, 1.0f);
+        current_rt_->FillRoundedRectangle(rrc, pBrushCardBg_);
+        current_rt_->DrawRoundedRectangle(rrc, pBrushCardBorder_, 1.0f);
 
         // Label
-        pRenderTarget_->DrawText(label.c_str(), static_cast<UINT32>(label.size()), pFormatStatLabel_,
+        current_rt_->DrawText(label.c_str(), static_cast<UINT32>(label.size()), pFormatStatLabel_,
             D2D1::RectF(rc.left + 12.0f, rc.top + 8.0f, rc.right - 12.0f, rc.top + 22.0f), pBrushTextMuted_);
 
         // Value
-        pRenderTarget_->DrawText(val.c_str(), static_cast<UINT32>(val.size()), pFormatStatValue_,
+        current_rt_->DrawText(val.c_str(), static_cast<UINT32>(val.size()), pFormatStatValue_,
             D2D1::RectF(rc.left + 12.0f, rc.top + 24.0f, rc.right - 12.0f, rc.bottom - 6.0f), valBrush);
     }
 
     void render_message_feed(float w, float h) {
         float feedTop = 132.0f;
-        float feedBottom = h - 90.0f;
+        float feedBottom = h - 104.0f;
         D2D1_RECT_F feedClip = D2D1::RectF(20.0f, feedTop, w - 20.0f, feedBottom);
 
-        pRenderTarget_->PushAxisAlignedClip(feedClip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+        current_rt_->PushAxisAlignedClip(feedClip, D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
 
         float curY = feedTop + 10.0f - static_cast<float>(scroll_offset_);
 
@@ -731,7 +863,11 @@ private:
 
             // Compute text height
             float textH = estimate_text_height(msg.content, bubbleW - 32.0f);
-            float bubbleH = textH + 28.0f;
+            float reasonH = 0.0f;
+            if (!isUser && !msg.reasoning.empty()) {
+                reasonH = estimate_text_height(msg.reasoning, bubbleW - 48.0f) + 28.0f;
+            }
+            float bubbleH = textH + reasonH + 28.0f;
 
             float bubbleX = isUser ? (w - 40.0f - bubbleW) : 30.0f;
 
@@ -740,54 +876,89 @@ private:
                 D2D1_ROUNDED_RECT rrc = D2D1::RoundedRect(bubbleRc, 12.0f, 12.0f);
 
                 if (isUser) {
-                    pRenderTarget_->FillRoundedRectangle(rrc, pBrushUserBubble_);
+                    current_rt_->FillRoundedRectangle(rrc, pBrushUserBubble_);
                 } else {
-                    pRenderTarget_->FillRoundedRectangle(rrc, pBrushAsstBubble_);
-                    pRenderTarget_->DrawRoundedRectangle(rrc, pBrushCardBorder_, 1.0f);
+                    current_rt_->FillRoundedRectangle(rrc, pBrushAsstBubble_);
+                    current_rt_->DrawRoundedRectangle(rrc, pBrushCardBorder_, 1.0f);
+                }
+
+                float contentY = curY + 12.0f;
+
+                // Render reasoning drawer if present
+                if (!isUser && !msg.reasoning.empty()) {
+                    D2D1_RECT_F reasonBox = D2D1::RectF(bubbleX + 16.0f, curY + 10.0f, bubbleX + bubbleW - 16.0f, curY + 10.0f + reasonH - 8.0f);
+                    D2D1_ROUNDED_RECT reasonRrc = D2D1::RoundedRect(reasonBox, 6.0f, 6.0f);
+                    current_rt_->FillRoundedRectangle(reasonRrc, pBrushCodeBg_);
+                    current_rt_->DrawRoundedRectangle(reasonRrc, pBrushCardBorder_, 0.5f);
+
+                    std::wstring thinkLabel = L"[Thinking & MoE Routing Plan]";
+                    current_rt_->DrawText(thinkLabel.c_str(), static_cast<UINT32>(thinkLabel.size()), pFormatChipText_,
+                        D2D1::RectF(reasonBox.left + 8.0f, reasonBox.top + 4.0f, reasonBox.right - 8.0f, reasonBox.top + 18.0f), pBrushAccentAmber_);
+
+                    current_rt_->DrawText(msg.reasoning.c_str(), static_cast<UINT32>(msg.reasoning.size()), pFormatChipText_,
+                        D2D1::RectF(reasonBox.left + 8.0f, reasonBox.top + 20.0f, reasonBox.right - 8.0f, reasonBox.bottom - 4.0f), pBrushTextMuted_);
+
+                    contentY += reasonH;
                 }
 
                 // Render content text
-                D2D1_RECT_F textRc = D2D1::RectF(bubbleX + 16.0f, curY + 12.0f, bubbleX + bubbleW - 16.0f, curY + bubbleH - 12.0f);
-                pRenderTarget_->DrawText(msg.content.c_str(), static_cast<UINT32>(msg.content.size()),
+                D2D1_RECT_F textRc = D2D1::RectF(bubbleX + 16.0f, contentY, bubbleX + bubbleW - 16.0f, curY + bubbleH - 12.0f);
+                current_rt_->DrawText(msg.content.c_str(), static_cast<UINT32>(msg.content.size()),
                     pFormatMsgText_, textRc, pBrushTextPrimary_);
             }
 
             curY += bubbleH + 16.0f;
         }
 
-        pRenderTarget_->PopAxisAlignedClip();
+        current_rt_->PopAxisAlignedClip();
     }
 
     void render_quick_chips() {
         for (const auto& chip : quick_chips_) {
             D2D1_ROUNDED_RECT rrc = D2D1::RoundedRect(chip.rect, 6.0f, 6.0f);
-            pRenderTarget_->FillRoundedRectangle(rrc, chip.is_hovered ? pBrushChipHover_ : pBrushChipBg_);
-            pRenderTarget_->DrawRoundedRectangle(rrc, pBrushCardBorder_, 1.0f);
+            current_rt_->FillRoundedRectangle(rrc, chip.is_hovered ? pBrushChipHover_ : pBrushChipBg_);
+            current_rt_->DrawRoundedRectangle(rrc, pBrushCardBorder_, 1.0f);
 
-            pRenderTarget_->DrawText(chip.label.c_str(), static_cast<UINT32>(chip.label.size()),
+            current_rt_->DrawText(chip.label.c_str(), static_cast<UINT32>(chip.label.size()),
                 pFormatChipText_, D2D1::RectF(chip.rect.left + 8.0f, chip.rect.top + 3.0f, chip.rect.right - 8.0f, chip.rect.bottom),
                 pBrushAccentBlue_);
         }
     }
 
-    void render_action_buttons() {
+    void render_action_buttons(float, float h) {
+        // Render composer input box background & placeholder
+        float composerY = h - 60.0f;
+        float inputW = send_btn_rect_.left - 32.0f;
+        if (inputW > 100.0f) {
+            D2D1_RECT_F inputBg = D2D1::RectF(20.0f, composerY, 20.0f + inputW, composerY + 36.0f);
+            D2D1_ROUNDED_RECT inputRrc = D2D1::RoundedRect(inputBg, 8.0f, 8.0f);
+            current_rt_->FillRoundedRectangle(inputRrc, pBrushCardBg_);
+            current_rt_->DrawRoundedRectangle(inputRrc, pBrushCardBorder_, 1.0f);
+
+            // Placeholder text if empty
+            std::wstring placeholder = L"Ask the MoE Engine anything... (e.g. 'Build a Tkinter Calculator') [Enter to Send]";
+            current_rt_->DrawText(placeholder.c_str(), static_cast<UINT32>(placeholder.size()),
+                pFormatChipText_, D2D1::RectF(inputBg.left + 12.0f, inputBg.top + 9.0f, inputBg.right - 12.0f, inputBg.bottom),
+                pBrushTextMuted_);
+        }
+
         // Send Button
         D2D1_ROUNDED_RECT sendRrc = D2D1::RoundedRect(send_btn_rect_, 8.0f, 8.0f);
-        pRenderTarget_->FillRoundedRectangle(sendRrc, send_btn_hovered_ ? pBrushAccentBlue_ : pBrushUserBubble_);
+        current_rt_->FillRoundedRectangle(sendRrc, send_btn_hovered_ ? pBrushAccentBlue_ : pBrushUserBubble_);
 
         std::wstring sendLabel = client_.is_streaming() ? L"..." : L"Send";
-        pRenderTarget_->DrawText(sendLabel.c_str(), static_cast<UINT32>(sendLabel.size()),
+        current_rt_->DrawText(sendLabel.c_str(), static_cast<UINT32>(sendLabel.size()),
             pFormatChipText_, D2D1::RectF(send_btn_rect_.left + 26.0f, send_btn_rect_.top + 9.0f, send_btn_rect_.right, send_btn_rect_.bottom),
             pBrushTextPrimary_);
 
         // Stop Button (if streaming)
         if (client_.is_streaming() && stop_btn_rect_.right > 0) {
             D2D1_ROUNDED_RECT stopRrc = D2D1::RoundedRect(stop_btn_rect_, 8.0f, 8.0f);
-            pRenderTarget_->FillRoundedRectangle(stopRrc, stop_btn_hovered_ ? pBrushAccentPink_ : pBrushChipBg_);
-            pRenderTarget_->DrawRoundedRectangle(stopRrc, pBrushAccentPink_, 1.0f);
+            current_rt_->FillRoundedRectangle(stopRrc, stop_btn_hovered_ ? pBrushAccentPink_ : pBrushChipBg_);
+            current_rt_->DrawRoundedRectangle(stopRrc, pBrushAccentPink_, 1.0f);
 
             std::wstring stopLabel = L"Stop";
-            pRenderTarget_->DrawText(stopLabel.c_str(), static_cast<UINT32>(stopLabel.size()),
+            current_rt_->DrawText(stopLabel.c_str(), static_cast<UINT32>(stopLabel.size()),
                 pFormatChipText_, D2D1::RectF(stop_btn_rect_.left + 22.0f, stop_btn_rect_.top + 9.0f, stop_btn_rect_.right, stop_btn_rect_.bottom),
                 pBrushTextPrimary_);
         }
@@ -807,6 +978,36 @@ private:
             return std::max(24.0f, tm.height);
         }
         return 40.0f;
+    }
+
+    float compute_total_messages_height(float w) {
+        float totalH = 0.0f;
+        for (const auto& msg : messages_) {
+            bool isUser = (msg.role == "user");
+            float bubbleW = std::min(w - 120.0f, 820.0f);
+            float textH = estimate_text_height(msg.content, bubbleW - 32.0f);
+            float reasonH = 0.0f;
+            if (!isUser && !msg.reasoning.empty()) {
+                reasonH = estimate_text_height(msg.reasoning, bubbleW - 48.0f) + 28.0f;
+            }
+            float bubbleH = textH + reasonH + 28.0f;
+            totalH += bubbleH + 16.0f;
+        }
+        return totalH;
+    }
+
+    void scroll_to_bottom() {
+        RECT rc{0, 0, 1120, 780};
+        if (hwnd_) GetClientRect(hwnd_, &rc);
+        float w = static_cast<float>(rc.right);
+        float h = static_cast<float>(rc.bottom);
+        float viewH = (h - 104.0f) - 132.0f;
+        float totalH = compute_total_messages_height(w);
+        if (totalH > viewH) {
+            scroll_offset_ = static_cast<int>(totalH - viewH + 20.0f);
+        } else {
+            scroll_offset_ = 0;
+        }
     }
 
     std::wstring format_float(double v, int prec) {
@@ -837,6 +1038,7 @@ private:
 
     ID2D1Factory*          pD2DFactory_ = nullptr;
     ID2D1HwndRenderTarget* pRenderTarget_ = nullptr;
+    ID2D1RenderTarget*     current_rt_ = nullptr;
     IDWriteFactory*        pDWriteFactory_ = nullptr;
 
     IDWriteTextFormat* pFormatHeaderTitle_ = nullptr;
@@ -889,10 +1091,42 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     icex.dwICC = ICC_STANDARD_CLASSES;
     InitCommonControlsEx(&icex);
 
+    int argc = 0;
+    LPWSTR* argv = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::wstring screenshot_path = L"";
+    std::string test_prompt = "";
+    uint32_t test_max_tokens = 140;
+    if (argv) {
+        for (int i = 1; i < argc; ++i) {
+            if (std::wstring(argv[i]) == L"--screenshot" && i + 1 < argc) {
+                screenshot_path = argv[++i];
+            } else if (std::wstring(argv[i]) == L"--test-prompt" && i + 1 < argc) {
+                int len = WideCharToMultiByte(CP_UTF8, 0, argv[++i], -1, nullptr, 0, nullptr, nullptr);
+                std::string s(len, 0);
+                WideCharToMultiByte(CP_UTF8, 0, argv[i], -1, &s[0], len, nullptr, nullptr);
+                if (!s.empty() && s.back() == '\0') s.pop_back();
+                test_prompt = s;
+            } else if (std::wstring(argv[i]) == L"--max-tokens" && i + 1 < argc) {
+                test_max_tokens = static_cast<uint32_t>(std::stoul(std::wstring(argv[++i])));
+            }
+        }
+        LocalFree(argv);
+    }
+
     MoEStudioApp app;
     if (!app.init(hInstance, nCmdShow)) {
         MessageBox(nullptr, L"Failed to initialize MoE Studio Direct2D interface.", L"MoE Studio Error", MB_ICONERROR | MB_OK);
         return 1;
     }
+
+    if (!test_prompt.empty()) {
+        app.send_prompt_sync(test_prompt, test_max_tokens);
+    }
+
+    if (!screenshot_path.empty()) {
+        bool ok = app.save_screenshot_png(screenshot_path);
+        return ok ? 0 : 2;
+    }
+
     return app.run();
 }

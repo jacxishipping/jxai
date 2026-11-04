@@ -129,6 +129,7 @@ private:
         return s;
     }
 
+public:
     TelemetrySnapshot fetch_health_sync() {
         TelemetrySnapshot ts{};
         SOCKET s = connect_socket();
