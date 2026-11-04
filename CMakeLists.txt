@@ -34,3 +34,11 @@ else()
     endif()
 endif()
 
+if (WIN32)
+    add_executable(moe_studio WIN32 desktop/src/main_win.cpp)
+    target_include_directories(moe_studio PRIVATE desktop/src include)
+    target_compile_options(moe_studio PRIVATE -O3 -Wall -Wextra)
+    target_link_libraries(moe_studio PRIVATE d2d1 dwrite dwmapi comctl32 ws2_32 ole32)
+endif()
+
+
