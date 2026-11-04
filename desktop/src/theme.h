@@ -40,6 +40,9 @@ namespace colors {
     inline const D2D1_COLOR_F AtlasVram      = D2D1::ColorF(0x10 / 255.0f, 0xB9 / 255.0f, 0x81 / 255.0f, 0.95f);
     inline const D2D1_COLOR_F AtlasRam       = D2D1::ColorF(0x06 / 255.0f, 0xB6 / 255.0f, 0xD4 / 255.0f, 0.90f);
     inline const D2D1_COLOR_F AtlasDisk      = D2D1::ColorF(0x1E / 255.0f, 0x29 / 255.0f, 0x3B / 255.0f, 0.85f);
+
+    inline const D2D1_COLOR_F TerminalBg     = D2D1::ColorF(0x05 / 255.0f, 0x08 / 255.0f, 0x14 / 255.0f, 1.0f);
+    inline const D2D1_COLOR_F TerminalBorder = D2D1::ColorF(0x1E / 255.0f, 0x29 / 255.0f, 0x3B / 255.0f, 0.8f);
 }
 
 } // namespace moe::ui
