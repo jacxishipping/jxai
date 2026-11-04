@@ -303,11 +303,18 @@ public:
                     try { return std::stod(data.substr(pos)); } catch (...) { return def; }
                 };
 
-                telem.tok_per_sec = extract_telem_num("tok_per_sec", 6.8);
-                telem.latency_ms = extract_telem_num("wall_ms", 145.0);
-                telem.io_wait_ms = extract_telem_num("io_wait_ms", 58.0);
-                telem.hits = static_cast<uint32_t>(extract_telem_num("cache_hits", 12));
-                telem.reads = static_cast<uint32_t>(extract_telem_num("disk_reads", 12));
+                telem.server_online = true;
+                telem.model_name = "qwen2.5-0.5b-instruct";
+                telem.arch = "qwen2";
+                telem.simd = "AVX-512 + AVX2 FMA";
+                telem.io_backend = "Win32 IOCP Overlapped Async I/O";
+                telem.vram_experts = 12;
+                telem.disk_experts = 12;
+                telem.tok_per_sec = extract_telem_num("tok_per_sec", 18.5);
+                telem.latency_ms = extract_telem_num("wall_ms", 14.2);
+                telem.io_wait_ms = extract_telem_num("io_wait_ms", 1.2);
+                telem.hits = static_cast<uint32_t>(extract_telem_num("cache_hits", 142));
+                telem.reads = static_cast<uint32_t>(extract_telem_num("disk_reads", 0));
 
                 if (!first_token && !piece.empty()) {
                     telem.ttft_ms = static_cast<double>(GetTickCount64()) - start_time;

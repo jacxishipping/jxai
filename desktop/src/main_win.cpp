@@ -151,7 +151,16 @@ public:
     }
 
     bool save_screenshot_png(const std::wstring& out_path, float w = 1120.0f, float h = 780.0f) {
-        latest_telem_ = client_.fetch_health_sync();
+        auto health = client_.fetch_health_sync();
+        latest_telem_.server_online = health.server_online;
+        if (!health.model_name.empty()) latest_telem_.model_name = health.model_name;
+        if (!health.arch.empty()) latest_telem_.arch = health.arch;
+        if (!health.simd.empty()) latest_telem_.simd = health.simd;
+        if (!health.io_backend.empty()) latest_telem_.io_backend = health.io_backend;
+        if (latest_telem_.vram_experts == 0) latest_telem_.vram_experts = health.vram_experts;
+        if (latest_telem_.disk_experts == 0) latest_telem_.disk_experts = health.disk_experts;
+        if (latest_telem_.hits == 0) latest_telem_.hits = health.hits;
+        if (latest_telem_.reads == 0) latest_telem_.reads = health.reads;
         CoInitialize(nullptr);
 
         IWICImagingFactory* pWICFactory = nullptr;
@@ -627,10 +636,6 @@ private:
         });
     }
 
-    void scroll_to_bottom() {
-        // Compute estimated content height and adjust scroll
-        scroll_offset_ = std::max(0, static_cast<int>(messages_.size()) * 180);
-    }
 
     void create_text_formats() {
         pDWriteFactory_->CreateTextFormat(
