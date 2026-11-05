@@ -195,8 +195,37 @@ bool pull_model_from_hub(
 
     return true;
 #else
-    err_msg = "Model pulling is currently supported on Windows with native WinINet.";
-    return false;
+    // Linux / macOS: download using curl with HTTP redirect support and progress display
+    std::string cmd = "curl -L --fail --progress-bar -o \"" + dest_path.string() + "\" \"" + url + "\"";
+    std::cout << "[PULL] Running system download: " << cmd << "\n";
+    int ret = std::system(cmd.c_str());
+    if (ret != 0) {
+        err_msg = "Download command failed with status code " + std::to_string(ret);
+        return false;
+    }
+
+    if (!fs::exists(dest_path) || fs::file_size(dest_path) == 0) {
+        err_msg = "Downloaded file does not exist or is empty.";
+        return false;
+    }
+
+    size_t downloaded = fs::file_size(dest_path);
+
+    // Validate GGUF Magic header
+    std::ifstream check(dest_path, std::ios::binary);
+    uint32_t magic = 0;
+    check.read(reinterpret_cast<char*>(&magic), sizeof(magic));
+    check.close();
+
+    if (magic != 0x46554747) { // "GGUF" in little-endian
+        err_msg = "File downloaded but failed GGUF binary magic validation (found: 0x" + std::to_string(magic) + ")";
+        return false;
+    }
+
+    std::cout << "\n\033[1;32m[SUCCESS] MoE Model downloaded & verified successfully!\033[0m\n"
+              << "  File Path:      " << dest_path.string() << "\n"
+              << "  File Size:      " << std::fixed << std::setprecision(2) << (downloaded / (1024.0 * 1024.0)) << " MB\n\n";
+    return true;
 #endif
 }
 
