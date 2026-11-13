@@ -33,40 +33,45 @@ fi
 
 # 3. Start Open WebUI
 echo "[3/4] Starting Open WebUI..."
-if ! curl -s http://127.0.0.1:3000/ >/dev/null 2>&1; then
+if ! curl -s http://127.0.0.1:8080/api/v1/auths/signin >/dev/null 2>&1; then
+    docker rm -f open-webui 2>/dev/null || true
     docker run -d \
         --name open-webui \
         --restart always \
-        -p 3000:8080 \
-        -v open-webui-data:/app/backend/data \
-        -e OLLAMA_BASE_URL=http://host.docker.internal:11434 \
-        -e OPENAI_API_BASE_URL=http://host.docker.internal:8000 \
+        --network host \
+        -v open-webui:/app/backend/data \
         -e WEBUI_NAME="JXAI" \
-        -e WEBUI_SECRET_KEY=jxai-local-dev-key-$(date +%s) \
+        -e WEBUI_AUTH=False \
+        -e OPENAI_API_BASE_URL="http://localhost:8000/v1" \
+        -e OPENAI_API_KEY="" \
         ghcr.io/open-webui/open-webui:main >/dev/null 2>&1
-    sleep 10
-    echo "  ✓ Open WebUI started on http://127.0.0.1:3000"
+    echo "  ✓ Open WebUI starting on http://127.0.0.1:8080"
+    echo "  ✓ Admin login: admin@localhost / admin"
 else
-    echo "  ✓ Open WebUI already running on http://127.0.0.1:3000"
+    echo "  ✓ Open WebUI already running on http://127.0.0.1:8080"
 fi
 
 # 4. Start Cloudflare Tunnel
 echo "[4/4] Starting Cloudflare Tunnel..."
 echo "  Starting tunnel (check output for the public URL)..."
-cloudflared tunnel --url http://127.0.0.1:3000 2>&1 &
+cloudflared tunnel --url http://127.0.0.1:8080 2>&1 &
 sleep 5
 
 echo ""
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  JXAI Platform is running!                                  ║"
 echo "║                                                              ║"
-echo "║  Open WebUI:    http://127.0.0.1:3000                        ║"
+echo "║  Open WebUI:    http://127.0.0.1:8080                        ║"
 echo "║  JXAI API:      http://127.0.0.1:8000                        ║"
 echo "║  Ollama API:    http://127.0.0.1:11434                        ║"
+echo "║                                                              ║"
+echo "║  Admin Login:  admin@localhost / admin                       ║"
 echo "║                                                              ║"
 echo "║  Models:                                                     ║"
 echo "║  - qwen3.6:35b-a3b                                           ║"
 echo "║  - qwen3-coder:30b                                            ║"
+echo "║  - qwen2.5:1.5b                                              ║"
+echo "║  - qwen2.5-coder:1.5b                                        ║"
 echo "║                                                              ║"
 echo "║  Public URL: Check cloudflared output above                  ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
