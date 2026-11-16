@@ -120,4 +120,56 @@ export interface ImageResult {
   previews: ImagePreview[];
 }
 
+export interface SamplerSettings {
+  temperature: number;
+  top_p: number;
+  top_k: number;
+  repetition_penalty: number;
+  max_tokens: number;
+  speculative: boolean;
+  draft_tokens: number;
+}
+
+export interface KVSlotInfo {
+  slot_id: number;
+  seq_pos: number;
+  pages_allocated: number;
+  compactions: number;
+  token_count: number;
+  memory_bytes: number;
+}
+
+export interface PagedBlockStats {
+  total_blocks: number;
+  used_blocks: number;
+  free_blocks: number;
+  block_size_tokens: number;
+  memory_bytes: number;
+}
+
+export interface SlotsResponse {
+  slots: KVSlotInfo[];
+  paged_block_manager: PagedBlockStats;
+}
+
+export interface LocalModelInfo {
+  id: string;
+  path?: string;
+  size?: number;
+  active?: boolean;
+  owned_by?: string;
+}
+
+export interface AttachedFile {
+  name: string;
+  content: string;
+  size: number;
+}
+
+export interface ChatSessionMeta {
+  slotId: number;
+  title: string;
+  updatedAt: number;
+}
+
 export type SupportedLanguage = 'en' | 'it' | 'de' | 'zh-CN' | 'zh-TW' | 'id' | 'pt-BR';

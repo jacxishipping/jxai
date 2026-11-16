@@ -1,13 +1,101 @@
 import React, { useState } from 'react';
-import { Copy, Check, Code } from 'lucide-react';
+import { Copy, Check, Code, Eye } from 'lucide-react';
 
 interface CodeBlockProps {
   language: string;
   code: string;
+  onPreviewInSandbox?: (code: string) => void;
 }
 
-const CodeBlock: React.FC<CodeBlockProps> = ({ language, code }) => {
+// Lightweight syntax highlighter for C/C++, TS/JS, Python, HTML/SVG, JSON, and Shell
+function highlightSyntax(code: string, language: string): React.ReactNode[] {
+  const lang = language.toLowerCase();
+  const tokenRegex =
+    /(\/\/[^\n]*|#[^\n]*|\/\*[\s\S]*?\*\/|"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|`(?:\\.|[^`\\])*`|\b(?:const|let|var|function|return|if|else|for|while|switch|case|break|continue|struct|class|namespace|template|typename|public|private|protected|virtual|override|static|inline|constexpr|void|int|float|double|bool|char|size_t|uint8_t|uint16_t|uint32_t|uint64_t|int8_t|int16_t|int32_t|int64_t|auto|def|import|from|as|async|await|try|catch|finally|true|false|null|nullptr|export|interface|type)\b|\b\d+(?:\.\d+)?(?:f|u|ull|L)?\b|<\/?[a-zA-Z0-9_-]+|\/>|>)/g;
+
+  const nodes: React.ReactNode[] = [];
+  let lastIdx = 0;
+  let match: RegExpExecArray | null;
+  let k = 0;
+
+  while ((match = tokenRegex.exec(code)) !== null) {
+    if (match.index > lastIdx) {
+      nodes.push(code.slice(lastIdx, match.index));
+    }
+    const tok = match[0];
+    let cls = 'text-slate-200';
+    if (tok.startsWith('//') || tok.startsWith('/*') || (tok.startsWith('#') && lang !== 'c' && lang !== 'cpp')) {
+      cls = 'text-slate-500 italic';
+    } else if (tok.startsWith('"') || tok.startsWith("'") || tok.startsWith('`')) {
+      cls = 'text-emerald-300';
+    } else if (/^\d/.test(tok)) {
+      cls = 'text-amber-300';
+    } else if (tok.startsWith('<') || tok === '/>' || tok === '>') {
+      cls = 'text-pink-400';
+    } else {
+      cls = 'text-indigo-300 font-semibold';
+    }
+    nodes.push(
+      <span key={`tok-${k++}`} className={cls}>
+        {tok}
+      </span>
+    );
+    lastIdx = match.index + tok.length;
+  }
+
+  if (lastIdx < code.length) {
+    nodes.push(code.slice(lastIdx));
+  }
+  return nodes;
+}
+
+// Format LaTeX math expressions into clean mathematical Unicode & styled elements
+function formatLatexMath(tex: string): string {
+  return tex
+    .replace(/\\text\{([^}]*)\}/g, '$1')
+    .replace(/\\mathrm\{([^}]*)\}/g, '$1')
+    .replace(/\\frac\{([^}]*)\}\{([^}]*)\}/g, '($1) / ($2)')
+    .replace(/\\sqrt\{([^}]*)\}/g, '√($1)')
+    .replace(/\\alpha/g, 'α')
+    .replace(/\\beta/g, 'β')
+    .replace(/\\gamma/g, 'γ')
+    .replace(/\\delta/g, 'δ')
+    .replace(/\\Delta/g, 'Δ')
+    .replace(/\\epsilon/g, 'ε')
+    .replace(/\\varepsilon/g, 'ε')
+    .replace(/\\theta/g, 'θ')
+    .replace(/\\lambda/g, 'λ')
+    .replace(/\\mu/g, 'μ')
+    .replace(/\\pi/g, 'π')
+    .replace(/\\sigma/g, 'σ')
+    .replace(/\\Sigma/g, 'Σ')
+    .replace(/\\omega/g, 'ω')
+    .replace(/\\Omega/g, 'Ω')
+    .replace(/\\sum/g, '∑')
+    .replace(/\\prod/g, '∏')
+    .replace(/\\int/g, '∫')
+    .replace(/\\infty/g, '∞')
+    .replace(/\\le\b|\\leq\b/g, '≤')
+    .replace(/\\ge\b|\\geq\b/g, '≥')
+    .replace(/\\neq\b|\\ne\b/g, '≠')
+    .replace(/\\approx\b/g, '≈')
+    .replace(/\\times\b/g, '×')
+    .replace(/\\cdot\b|\\odot\b/g, '·')
+    .replace(/\\pm\b/g, '±')
+    .replace(/\\rightarrow\b|\\to\b/g, '→')
+    .replace(/\\Rightarrow\b/g, '⇒')
+    .replace(/\\left\b|\\right\b/g, '');
+}
+
+const CodeBlock: React.FC<CodeBlockProps> = ({ language, code, onPreviewInSandbox }) => {
   const [copied, setCopied] = useState(false);
+  const langLower = (language || '').toLowerCase();
+  const isSandboxable =
+    langLower === 'html' ||
+    langLower === 'svg' ||
+    langLower === 'xml' ||
+    code.includes('<svg') ||
+    code.includes('<div');
 
   const handleCopy = () => {
     navigator.clipboard.writeText(code);
@@ -22,26 +110,38 @@ const CodeBlock: React.FC<CodeBlockProps> = ({ language, code }) => {
           <Code className="w-3.5 h-3.5 text-blue-400" />
           <span className="uppercase tracking-wider">{language || 'text'}</span>
         </span>
-        <button
-          onClick={handleCopy}
-          className="flex items-center space-x-1 text-slate-400 hover:text-slate-200 transition-colors"
-          title="Copy code"
-        >
-          {copied ? (
-            <>
-              <Check className="w-3.5 h-3.5 text-emerald-400" />
-              <span className="text-emerald-400">Copied</span>
-            </>
-          ) : (
-            <>
-              <Copy className="w-3.5 h-3.5" />
-              <span>Copy</span>
-            </>
+        <div className="flex items-center space-x-3">
+          {isSandboxable && onPreviewInSandbox && (
+            <button
+              onClick={() => onPreviewInSandbox(code)}
+              className="flex items-center space-x-1 text-cyan-400 hover:text-cyan-300 transition-colors"
+              title="Render in Interactive Sandbox"
+            >
+              <Eye className="w-3.5 h-3.5" />
+              <span>Open in Sandbox</span>
+            </button>
           )}
-        </button>
+          <button
+            onClick={handleCopy}
+            className="flex items-center space-x-1 text-slate-400 hover:text-slate-200 transition-colors"
+            title="Copy code"
+          >
+            {copied ? (
+              <>
+                <Check className="w-3.5 h-3.5 text-emerald-400" />
+                <span className="text-emerald-400">Copied</span>
+              </>
+            ) : (
+              <>
+                <Copy className="w-3.5 h-3.5" />
+                <span>Copy</span>
+              </>
+            )}
+          </button>
+        </div>
       </div>
       <pre className="p-3.5 overflow-x-auto text-xs font-mono text-slate-200 leading-relaxed whitespace-pre">
-        <code>{code}</code>
+        <code>{highlightSyntax(code, language)}</code>
       </pre>
     </div>
   );
@@ -113,6 +213,23 @@ function parseInlineSpans(text: string): React.ReactNode[] {
       }
     }
 
+    // Inline LaTeX Math $...$
+    if (remaining.startsWith('$') && !remaining.startsWith('$$')) {
+      const end = remaining.indexOf('$', 1);
+      if (end > 1) {
+        nodes.push(
+          <span
+            key={`math-${keyIndex++}`}
+            className="px-1.5 py-0.5 rounded bg-indigo-950/40 text-indigo-300 font-serif italic text-[13px] border border-indigo-500/20"
+          >
+            {formatLatexMath(remaining.slice(1, end))}
+          </span>
+        );
+        remaining = remaining.slice(end + 1);
+        continue;
+      }
+    }
+
     // Link [text](url)
     const linkMatch = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
     if (linkMatch) {
@@ -132,7 +249,7 @@ function parseInlineSpans(text: string): React.ReactNode[] {
     }
 
     // Find next special delimiter
-    const nextSpecial = remaining.search(/[`*~\[]/);
+    const nextSpecial = remaining.search(/[`*~\[$]/);
     if (nextSpecial === -1) {
       nodes.push(remaining);
       break;
@@ -151,9 +268,10 @@ function parseInlineSpans(text: string): React.ReactNode[] {
 
 export interface MarkdownASTProps {
   content: string;
+  onPreviewInSandbox?: (code: string) => void;
 }
 
-export const MarkdownRenderer: React.FC<MarkdownASTProps> = ({ content }) => {
+export const MarkdownRenderer: React.FC<MarkdownASTProps> = ({ content, onPreviewInSandbox }) => {
   if (!content) return null;
 
   const lines = content.split('\n');
@@ -163,6 +281,45 @@ export const MarkdownRenderer: React.FC<MarkdownASTProps> = ({ content }) => {
 
   while (i < lines.length) {
     const line = lines[i];
+
+    // Display Math Block: $$ ... $$
+    if (line.trim().startsWith('$$')) {
+      const singleLineMatch = line.trim().match(/^\$\$(.+)\$\$$/);
+      if (singleLineMatch) {
+        elements.push(
+          <div
+            key={`math-block-${elemKey++}`}
+            className="my-2.5 px-4 py-2.5 rounded-xl bg-indigo-950/30 border border-indigo-500/20 text-center font-serif italic text-sm text-indigo-200 overflow-x-auto"
+          >
+            {formatLatexMath(singleLineMatch[1].trim())}
+          </div>
+        );
+        i++;
+        continue;
+      }
+      const mathLines: string[] = [];
+      const firstRem = line.trim().slice(2).trim();
+      if (firstRem) mathLines.push(firstRem);
+      i++;
+      while (i < lines.length && !lines[i].trim().endsWith('$$')) {
+        mathLines.push(lines[i]);
+        i++;
+      }
+      if (i < lines.length) {
+        const lastRem = lines[i].trim().slice(0, -2).trim();
+        if (lastRem) mathLines.push(lastRem);
+        i++;
+      }
+      elements.push(
+        <div
+          key={`math-block-${elemKey++}`}
+          className="my-2.5 px-4 py-2.5 rounded-xl bg-indigo-950/30 border border-indigo-500/20 text-center font-serif italic text-sm text-indigo-200 overflow-x-auto"
+        >
+          {formatLatexMath(mathLines.join(' '))}
+        </div>
+      );
+      continue;
+    }
 
     // Fenced Code Block: ```lang
     if (line.trim().startsWith('```')) {
@@ -177,7 +334,12 @@ export const MarkdownRenderer: React.FC<MarkdownASTProps> = ({ content }) => {
         i++; // consume closing ```
       }
       elements.push(
-        <CodeBlock key={`block-${elemKey++}`} language={lang} code={codeLines.join('\n')} />
+        <CodeBlock
+          key={`block-${elemKey++}`}
+          language={lang}
+          code={codeLines.join('\n')}
+          onPreviewInSandbox={onPreviewInSandbox}
+        />
       );
       continue;
     }

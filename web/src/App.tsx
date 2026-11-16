@@ -17,8 +17,24 @@ import { ProfilerDashboard } from './components/ProfilerDashboard';
 import { SystemOneWorkspace } from './components/SystemOneWorkspace';
 import { ImageWorkspace } from './components/ImageWorkspace';
 import { SettingsModal } from './components/SettingsModal';
-import { EngineHealth, SupportedLanguage } from './types';
+import {
+  EngineHealth,
+  SupportedLanguage,
+  SamplerSettings,
+  ChatMessage,
+  ChatSessionMeta
+} from './types';
 import { translations } from './utils/i18n';
+
+const DEFAULT_SAMPLER: SamplerSettings = {
+  temperature: 0.7,
+  top_p: 0.9,
+  top_k: 40,
+  repetition_penalty: 1.1,
+  max_tokens: 2048,
+  speculative: false,
+  draft_tokens: 2
+};
 
 export const App: React.FC = () => {
   const [activeTab, setActiveTab] = useState<'chat' | 'atlas' | 'profiler' | 'systemone' | 'images'>('chat');
@@ -30,8 +46,48 @@ export const App: React.FC = () => {
   const [systemPrompt, setSystemPrompt] = useState(
     'You are an expert AI assistant specializing in high-performance computing and local MoE streaming architectures.'
   );
+  const [samplerSettings, setSamplerSettings] = useState<SamplerSettings>(DEFAULT_SAMPLER);
+
+  const [sessions, setSessions] = useState<ChatSessionMeta[]>(() => {
+    try {
+      const saved = localStorage.getItem('jxai_sessions_v1');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (Array.isArray(parsed) && parsed.length > 0) return parsed;
+      }
+    } catch {}
+    return [{ slotId: 0, title: 'Session #0', updatedAt: Date.now() }];
+  });
+
+  const [messagesBySlot, setMessagesBySlot] = useState<Record<number, ChatMessage[]>>(() => {
+    try {
+      const saved = localStorage.getItem('jxai_messages_v1');
+      if (saved) return JSON.parse(saved);
+    } catch {}
+    return {};
+  });
+
   const [currentSlot, setCurrentSlot] = useState(0);
   const [health, setHealth] = useState<EngineHealth | null>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('jxai_sessions_v1', JSON.stringify(sessions));
+    } catch {}
+  }, [sessions]);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('jxai_messages_v1', JSON.stringify(messagesBySlot));
+    } catch {}
+  }, [messagesBySlot]);
+
+  const handleNewChat = () => {
+    const nextSlot = sessions.reduce((mx, s) => Math.max(mx, s.slotId), currentSlot) + 1;
+    setSessions(prev => [{ slotId: nextSlot, title: `Session #${nextSlot}`, updatedAt: Date.now() }, ...prev]);
+    setCurrentSlot(nextSlot);
+    setActiveTab('chat');
+  };
 
   const t = translations[language] || translations.en;
 
@@ -92,6 +148,19 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     fetchHealth();
+    fetch('/v1/config')
+      .then(r => (r.ok ? r.json() : null))
+      .then(cfg => {
+        if (cfg) {
+          setSamplerSettings(prev => ({
+            ...prev,
+            temperature: typeof cfg.temperature === 'number' ? cfg.temperature : prev.temperature,
+            top_p: typeof cfg.top_p === 'number' ? cfg.top_p : prev.top_p,
+            draft_tokens: typeof cfg.speculative_draft_tokens === 'number' ? cfg.speculative_draft_tokens : prev.draft_tokens
+          }));
+        }
+      })
+      .catch(() => {});
     const timer = setInterval(fetchHealth, 3000);
     return () => clearInterval(timer);
   }, []);
@@ -107,8 +176,7 @@ export const App: React.FC = () => {
       // Ctrl/Cmd + N: Create new chat (advances slot)
       if ((e.ctrlKey || e.metaKey) && e.key.toLowerCase() === 'n') {
         e.preventDefault();
-        setCurrentSlot(prev => prev + 1);
-        setActiveTab('chat');
+        handleNewChat();
       }
       // Ctrl/Cmd + Shift + L: Toggle Light / Dark theme
       if ((e.ctrlKey || e.metaKey) && e.shiftKey && e.key.toLowerCase() === 'l') {
@@ -125,18 +193,43 @@ export const App: React.FC = () => {
     return () => window.removeEventListener('keydown', handleKeyDown);
   }, []);
 
-  const searchResults = [
-    { id: '1', title: 'Explain MoE streaming architecture', tab: 'chat' as const },
-    { id: '2', title: 'Interactive 3D Cortex Atlas', tab: 'atlas' as const },
-    { id: '3', title: 'Latency Profiler & Overlapped I/O', tab: 'profiler' as const },
-    { id: '4', title: 'System One Decision Engine', tab: 'systemone' as const },
-    { id: '5', title: 'Neural Latent Image Synthesis', tab: 'images' as const }
-  ].filter(item => item.title.toLowerCase().includes(searchQuery.toLowerCase()));
+  const qLower = searchQuery.toLowerCase().trim();
+  const matchedMessages = qLower
+    ? sessions.flatMap(sess => {
+        const msgs = messagesBySlot[sess.slotId] || [];
+        const sessionMatches = sess.title.toLowerCase().includes(qLower);
+        const matchingMsgs = msgs.filter(
+          m => m.id !== 'welcome' && m.content.toLowerCase().includes(qLower)
+        );
+        if (matchingMsgs.length > 0) {
+          return matchingMsgs.slice(0, 3).map(m => ({
+            id: `msg-${sess.slotId}-${m.id}`,
+            title: `${sess.title}: ${m.content.slice(0, 72).replace(/\n/g, ' ')}...`,
+            tab: 'chat' as const,
+            slotId: sess.slotId
+          }));
+        }
+        if (sessionMatches) {
+          return [{ id: `sess-${sess.slotId}`, title: sess.title, tab: 'chat' as const, slotId: sess.slotId }];
+        }
+        return [];
+      })
+    : [];
+
+  const workspaceResults = [
+    { id: 'w1', title: 'Chat Workspace', tab: 'chat' as const, slotId: undefined as number | undefined },
+    { id: 'w2', title: 'Interactive 3D Cortex Atlas', tab: 'atlas' as const, slotId: undefined as number | undefined },
+    { id: 'w3', title: 'Latency Profiler & Overlapped I/O', tab: 'profiler' as const, slotId: undefined as number | undefined },
+    { id: 'w4', title: 'System One Decision Engine', tab: 'systemone' as const, slotId: undefined as number | undefined },
+    { id: 'w5', title: 'Neural Latent Image Synthesis', tab: 'images' as const, slotId: undefined as number | undefined }
+  ].filter(item => !qLower || item.title.toLowerCase().includes(qLower));
+
+  const searchResults = [...matchedMessages, ...workspaceResults];
 
   return (
     <div
       className={`flex h-screen w-screen select-none overflow-hidden ${
-        theme === 'dark' ? 'bg-[#070a12] text-slate-100' : 'bg-slate-100 text-slate-900'
+        theme === 'dark' ? 'bg-[#070a12] text-slate-100' : 'theme-light bg-slate-100 text-slate-900'
       }`}
     >
       {/* Primary Left Navigation Rail */}
@@ -155,12 +248,9 @@ export const App: React.FC = () => {
 
           {/* New Chat Button */}
           <button
-            onClick={() => {
-              setCurrentSlot(prev => prev + 1);
-              setActiveTab('chat');
-            }}
+            onClick={handleNewChat}
             className="w-10 h-10 rounded-xl bg-blue-600/20 hover:bg-blue-600/30 text-blue-400 flex items-center justify-center transition-all border border-blue-500/30"
-            title={`${t.newChat} (Ctrl+N) - Slot #${currentSlot + 1}`}
+            title={`${t.newChat} (Ctrl+N)`}
           >
             <Plus className="w-5 h-5" />
           </button>
@@ -265,7 +355,14 @@ export const App: React.FC = () => {
             health={health}
             t={t}
             currentSlot={currentSlot}
+            onSelectSlot={setCurrentSlot}
+            onNewChat={handleNewChat}
+            sessions={sessions}
+            setSessions={setSessions}
+            messagesBySlot={messagesBySlot}
+            setMessagesBySlot={setMessagesBySlot}
             systemPrompt={systemPrompt}
+            samplerSettings={samplerSettings}
             onRefreshHealth={fetchHealth}
           />
         )}
@@ -285,6 +382,8 @@ export const App: React.FC = () => {
         t={t}
         systemPrompt={systemPrompt}
         onSaveSystemPrompt={setSystemPrompt}
+        samplerSettings={samplerSettings}
+        onSaveSamplerSettings={setSamplerSettings}
       />
 
       {/* Ctrl+K Conversation Search Dialog */}
@@ -312,13 +411,14 @@ export const App: React.FC = () => {
                   <button
                     key={item.id}
                     onClick={() => {
+                      if (item.slotId !== undefined) setCurrentSlot(item.slotId);
                       setActiveTab(item.tab);
                       setIsSearchOpen(false);
                     }}
                     className="w-full px-3.5 py-2.5 rounded-xl text-left text-xs font-mono text-slate-300 hover:bg-slate-800 hover:text-white transition-colors flex items-center justify-between"
                   >
-                    <span>{item.title}</span>
-                    <span className="text-[10px] uppercase text-slate-500">{item.tab}</span>
+                    <span className="truncate pr-3">{item.title}</span>
+                    <span className="text-[10px] uppercase text-slate-500 shrink-0">{item.tab}</span>
                   </button>
                 ))
               ) : (

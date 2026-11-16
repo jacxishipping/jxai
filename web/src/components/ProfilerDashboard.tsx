@@ -1,6 +1,6 @@
 import React, { useEffect, useState } from 'react';
-import { Activity, Zap, HardDrive, Cpu, Clock, Layers } from 'lucide-react';
-import { ProfileSample, EngineHealth } from '../types';
+import { Activity, Zap, HardDrive, Cpu, Clock, Layers, Trash2 } from 'lucide-react';
+import { ProfileSample, EngineHealth, SlotsResponse } from '../types';
 import { Translations } from '../utils/i18n';
 
 interface ProfilerDashboardProps {
@@ -10,14 +10,35 @@ interface ProfilerDashboardProps {
 
 export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t }) => {
   const [samples, setSamples] = useState<ProfileSample[]>([]);
+  const [slotsData, setSlotsData] = useState<SlotsResponse | null>(null);
 
   const fetchProfile = async () => {
     try {
-      const res = await fetch('/profile');
-      if (res.ok) {
-        const data = await res.json();
+      const [profRes, slotsRes] = await Promise.all([
+        fetch('/profile'),
+        fetch('/v1/slots')
+      ]);
+      if (profRes.ok) {
+        const data = await profRes.json();
         setSamples(data.samples || []);
       }
+      if (slotsRes.ok) {
+        const sData = await slotsRes.json();
+        setSlotsData(sData);
+      }
+    } catch (e) {
+      console.error(e);
+    }
+  };
+
+  const handleClearSlot = async (slotId: number) => {
+    try {
+      await fetch('/v1/slots/clear', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ slot_id: slotId })
+      });
+      fetchProfile();
     } catch (e) {
       console.error(e);
     }
@@ -173,7 +194,7 @@ export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t 
       </div>
 
       {/* Throughput Timeline Chart */}
-      <div className="p-6 rounded-2xl bg-slate-900/40 border border-slate-800/80 min-h-[220px] flex flex-col">
+      <div className="p-6 rounded-2xl bg-slate-900/40 border border-slate-800/80 min-h-[220px] flex flex-col mb-8">
         <div className="flex items-center justify-between mb-4">
           <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider font-mono">
             Decode Throughput Timeline ({t.speed})
@@ -194,6 +215,65 @@ export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t 
             );
           })}
         </div>
+      </div>
+
+      {/* PagedAttention KV-Cache Slot Inspector */}
+      <div className="p-6 rounded-2xl bg-slate-900/40 border border-slate-800/80 flex flex-col space-y-4">
+        <div className="flex items-center justify-between">
+          <div>
+            <h3 className="text-sm font-bold text-slate-200 uppercase tracking-wider font-mono">
+              PagedAttention KV-Cache Slot Inspector (/v1/slots)
+            </h3>
+            <p className="text-xs text-slate-500 font-mono mt-0.5">
+              {slotsData?.paged_block_manager
+                ? `Blocks: ${slotsData.paged_block_manager.used_blocks} / ${slotsData.paged_block_manager.total_blocks} used (${slotsData.paged_block_manager.block_size_tokens} tok/block) • Total KV RAM: ${(slotsData.paged_block_manager.memory_bytes / (1024 * 1024)).toFixed(2)} MB`
+                : 'Monitoring active KV-cache slots...'}
+            </p>
+          </div>
+        </div>
+
+        {slotsData && slotsData.slots.length > 0 ? (
+          <div className="grid grid-cols-3 gap-4">
+            {slotsData.slots.map(slot => (
+              <div
+                key={slot.slot_id}
+                className="p-4 rounded-xl bg-slate-950/70 border border-slate-800 flex flex-col space-y-2 font-mono text-xs"
+              >
+                <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+                  <span className="font-bold text-emerald-400">KV Slot #{slot.slot_id}</span>
+                  <button
+                    onClick={() => handleClearSlot(slot.slot_id)}
+                    className="flex items-center space-x-1 px-2 py-0.5 rounded bg-red-950/50 border border-red-500/30 text-red-400 hover:bg-red-900/50 transition-colors text-[11px]"
+                    title="Clear KV-cache slot"
+                  >
+                    <Trash2 className="w-3 h-3" />
+                    <span>Clear</span>
+                  </button>
+                </div>
+                <div className="flex justify-between text-slate-400">
+                  <span>Seq Position:</span>
+                  <span className="text-slate-200">{slot.seq_pos} tokens</span>
+                </div>
+                <div className="flex justify-between text-slate-400">
+                  <span>Pages Allocated:</span>
+                  <span className="text-cyan-400">{slot.pages_allocated} pages</span>
+                </div>
+                <div className="flex justify-between text-slate-400">
+                  <span>KV Memory:</span>
+                  <span className="text-indigo-300">{(slot.memory_bytes / (1024 * 1024)).toFixed(2)} MB</span>
+                </div>
+                <div className="flex justify-between text-slate-400">
+                  <span>Compactions:</span>
+                  <span className="text-slate-200">{slot.compactions}</span>
+                </div>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="text-xs font-mono text-slate-500 py-4 text-center">
+            No active KV-cache slots reported.
+          </div>
+        )}
       </div>
     </div>
   );
