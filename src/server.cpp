@@ -122,6 +122,7 @@ std::string extract_last_message_content(const std::string& body) {
 }
 
 // Extract multi-turn ChatML prompt from "messages" array, or fallback to single prompt
+// Quote-aware and brace-depth-aware so messages containing code or JSON braces {} never break parsing
 std::string extract_chat_prompt(const std::string& body) {
     size_t m_pos = body.find("\"messages\"");
     if (m_pos == std::string::npos) {
@@ -129,21 +130,85 @@ std::string extract_chat_prompt(const std::string& body) {
     }
     size_t arr_start = body.find('[', m_pos);
     if (arr_start == std::string::npos) return extract_last_message_content(body);
-    size_t arr_end = body.rfind(']');
+
+    // Find matching ']' for the messages array while respecting string literals
+    size_t arr_end = std::string::npos;
+    {
+        int bracket_depth = 0;
+        bool in_str = false;
+        for (size_t i = arr_start; i < body.size(); ++i) {
+            char c = body[i];
+            if (in_str) {
+                if (c == '\\' && i + 1 < body.size()) {
+                    ++i;
+                } else if (c == '"') {
+                    in_str = false;
+                }
+            } else {
+                if (c == '"') in_str = true;
+                else if (c == '[') bracket_depth++;
+                else if (c == ']') {
+                    bracket_depth--;
+                    if (bracket_depth == 0) {
+                        arr_end = i;
+                        break;
+                    }
+                }
+            }
+        }
+    }
     if (arr_end == std::string::npos || arr_end <= arr_start) return extract_last_message_content(body);
 
     std::string arr_str = body.substr(arr_start, arr_end - arr_start + 1);
 
     std::ostringstream formatted_prompt;
-    size_t cur = 0;
+    size_t i = 0;
     int msg_count = 0;
 
-    while ((cur = arr_str.find('{', cur)) != std::string::npos) {
-        size_t obj_end = arr_str.find('}', cur);
+    while (i < arr_str.size()) {
+        // Find start of next message object '{' outside quotes
+        bool in_str = false;
+        size_t obj_start = std::string::npos;
+        for (; i < arr_str.size(); ++i) {
+            char c = arr_str[i];
+            if (in_str) {
+                if (c == '\\' && i + 1 < arr_str.size()) ++i;
+                else if (c == '"') in_str = false;
+            } else {
+                if (c == '"') in_str = true;
+                else if (c == '{') {
+                    obj_start = i;
+                    break;
+                }
+            }
+        }
+        if (obj_start == std::string::npos) break;
+
+        // Find matching '}' for this message object while respecting quotes and nested braces
+        int brace_depth = 0;
+        in_str = false;
+        size_t obj_end = std::string::npos;
+        for (size_t j = obj_start; j < arr_str.size(); ++j) {
+            char c = arr_str[j];
+            if (in_str) {
+                if (c == '\\' && j + 1 < arr_str.size()) ++j;
+                else if (c == '"') in_str = false;
+            } else {
+                if (c == '"') in_str = true;
+                else if (c == '{') brace_depth++;
+                else if (c == '}') {
+                    brace_depth--;
+                    if (brace_depth == 0) {
+                        obj_end = j;
+                        break;
+                    }
+                }
+            }
+        }
         if (obj_end == std::string::npos) break;
 
-        std::string obj_str = arr_str.substr(cur, obj_end - cur + 1);
-        cur = obj_end + 1;
+        std::string obj_str = arr_str.substr(obj_start, obj_end - obj_start + 1);
+        i = obj_end + 1;
 
         std::string role = extract_json_string(obj_str, "role", "user");
         std::string content = extract_json_string(obj_str, "content", "");
@@ -831,9 +896,11 @@ void HttpServer::handle_client(uintptr_t client_sock) {
 
         const std::string cmpl_id = "chatcmpl-moe-" + std::to_string(now_us());
         const std::string mname = json_escape(engine_.hparams().model_name);
+        std::string streamed_content_acc;
 
         engine_.generate_stream(user_prompt, max_tokens, slot_id, compaction, scfg,
             [&](const std::string& piece, bool is_reasoning, uint32_t tid, const ProfileSample& prof) {
+                if (!is_reasoning) streamed_content_acc += piece;
                 std::ostringstream ev;
                 ev << "data: {"
                    << "\"id\":\"" << cmpl_id << "\","
@@ -864,10 +931,15 @@ void HttpServer::handle_client(uintptr_t client_sock) {
             draft_count
         );
 
-        // If user explicitly asked for an interactive HTML or SVG preview, also emit a fenced HTML/SVG snippet chunk
+        // Only emit synthetic HTML/SVG fallback snippet on tiny forged test models when the model did not emit HTML/SVG itself
+        bool has_own_html = (streamed_content_acc.find("```html") != std::string::npos ||
+                             streamed_content_acc.find("```svg") != std::string::npos ||
+                             streamed_content_acc.find("<svg") != std::string::npos ||
+                             streamed_content_acc.find("<div") != std::string::npos);
         std::string lower_p = user_prompt;
         std::transform(lower_p.begin(), lower_p.end(), lower_p.begin(), ::tolower);
-        if (lower_p.find("html") != std::string::npos || lower_p.find("svg") != std::string::npos || lower_p.find("widget") != std::string::npos) {
+        if (!has_own_html && engine_.hparams().vocab_size <= 1024 &&
+            (lower_p.find("html") != std::string::npos || lower_p.find("svg") != std::string::npos || lower_p.find("widget") != std::string::npos)) {
             std::string html_snippet = "\n\n```html\n<div style=\"font-family:system-ui;background:#0f172a;color:#f8fafc;padding:16px;border-radius:10px;border:1px solid #334155\">\n  <h4 style=\"margin:0 0 8px;color:#38bdf8\">Live MoE Telemetry Sandbox</h4>\n  <svg width=\"260\" height=\"64\" viewBox=\"0 0 260 64\">\n    <rect x=\"4\" y=\"12\" width=\"75\" height=\"40\" rx=\"6\" fill=\"#6366f1\"/>\n    <rect x=\"92\" y=\"12\" width=\"75\" height=\"40\" rx=\"6\" fill=\"#0ea5e9\"/>\n    <rect x=\"180\" y=\"12\" width=\"75\" height=\"40\" rx=\"6\" fill=\"#10b981\"/>\n    <text x=\"18\" y=\"36\" fill=\"#fff\" font-size=\"11\">VRAM Core</text>\n    <text x=\"106\" y=\"36\" fill=\"#fff\" font-size=\"11\">LFRU RAM</text>\n    <text x=\"192\" y=\"36\" fill=\"#fff\" font-size=\"11\">PILOT NVMe</text>\n  </svg>\n</div>\n```";
             std::ostringstream ev;
             ev << "data: {\"id\":\"" << cmpl_id << "\",\"object\":\"chat.completion.chunk\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\""

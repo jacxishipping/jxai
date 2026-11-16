@@ -47,7 +47,7 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
         except URLError as e:
             return 503, {"error": f"Ollama not reachable: {str(e)}"}
 
-    def _proxy_stream_to_ollama(self, path, body):
+    def _proxy_stream_to_ollama(self, path, body, openai_format=True, model_name="qwen3.6:35b-a3b"):
         url = f"{OLLAMA_HOST}{path}"
         req = Request(url, data=body, method="POST")
         req.add_header("Content-Type", "application/json")
@@ -60,12 +60,43 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Connection", "keep-alive")
             self.send_header("X-JXAI-Engine", "JXAI Inference Engine v2")
             self.end_headers()
+            cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
+            created_ts = int(time.time())
             while True:
-                chunk = resp.read(4096)
-                if not chunk:
+                line = resp.readline()
+                if not line:
                     break
-                self.wfile.write(chunk)
-                self.wfile.flush()
+                if not openai_format:
+                    self.wfile.write(line)
+                    self.wfile.flush()
+                    continue
+                line_str = line.decode("utf-8", errors="replace").strip()
+                if not line_str:
+                    continue
+                try:
+                    item = json.loads(line_str)
+                    msg = item.get("message", {})
+                    content = msg.get("content", "")
+                    done = item.get("done", False)
+                    sse_obj = {
+                        "id": cmpl_id,
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": item.get("model", model_name),
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"content": content} if content else {},
+                                "finish_reason": "stop" if done else None,
+                            }
+                        ],
+                    }
+                    self.wfile.write(f"data: {json.dumps(sse_obj)}\n\n".encode("utf-8"))
+                    if done:
+                        self.wfile.write(b"data: [DONE]\n\n")
+                    self.wfile.flush()
+                except Exception:
+                    pass
         except HTTPError as e:
             error_body = e.read().decode("utf-8")
             self._send_json(e.code, {"error": error_body})
@@ -157,7 +188,8 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
             ollama_body_bytes = json.dumps(ollama_body).encode("utf-8")
 
             if stream:
-                self._proxy_stream_to_ollama("/api/chat", ollama_body_bytes)
+                is_openai = path.startswith("/v1/")
+                self._proxy_stream_to_ollama("/api/chat", ollama_body_bytes, openai_format=is_openai, model_name=ollama_model)
             else:
                 status, data = self._proxy_to_ollama("/api/chat", ollama_body_bytes, "POST")
                 if status == 200:
