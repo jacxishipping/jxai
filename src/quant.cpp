@@ -432,20 +432,22 @@ void quantize_row_q6_K(const float* x, void* vy, int64_t k) {
         const float actual_d = fp16_to_fp32(y[i].d);
         const float id = (actual_d != 0.0f) ? (1.0f / actual_d) : 0.0f;
 
-        for (int sb = 0; sb < 16; ++sb) {
-            for (int l = 0; l < 16; ++l) {
-                int idx = sb * 16 + l;
-                float v = xb[idx] * id + 32.0f;
-                uint8_t q6 = static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(v)), 0, 63));
-                uint8_t ql = q6 & 0x0F;
-                uint8_t qh = (q6 >> 4) & 0x03;
-
-                if ((idx % 2) == 0) {
-                    y[i].ql[idx / 2] = ql;
-                } else {
-                    y[i].ql[idx / 2] |= (ql << 4);
-                }
-                y[i].qh[idx / 4] |= (qh << (2 * (idx % 4)));
+        // Write bits in the llama.cpp ggml layout (inverse of
+        // dequantize_row_q6_K above) so quantize/dequantize round-trips
+        // against real GGUF files, not just against itself.
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                const uint8_t q0 = static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(xb[n + l +  0] * id)) + 32, 0, 63));
+                const uint8_t q1 = static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(xb[n + l + 32] * id)) + 32, 0, 63));
+                const uint8_t q2 = static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(xb[n + l + 64] * id)) + 32, 0, 63));
+                const uint8_t q3 = static_cast<uint8_t>(std::clamp(static_cast<int>(std::round(xb[n + l + 96] * id)) + 32, 0, 63));
+                uint8_t* ql = y[i].ql + (n / 2);
+                uint8_t* qh = y[i].qh + (n / 4);
+                ql[l]      |= (q0 & 0x0F);
+                ql[l + 32] |= (q1 & 0x0F);
+                ql[l]      |= static_cast<uint8_t>((q2 & 0x0F) << 4);
+                ql[l + 32] |= static_cast<uint8_t>((q3 & 0x0F) << 4);
+                qh[l] = static_cast<uint8_t>((q0 >> 4) | ((q1 >> 4) << 2) | ((q2 >> 4) << 4) | ((q3 >> 4) << 6));
             }
         }
     }
@@ -479,22 +481,36 @@ void dequantize_row_q5_K(const void* vx, float* y, int64_t k) {
 }
 
 void dequantize_row_q6_K(const void* vx, float* y, int64_t k) {
+    // Layout matches llama.cpp ggml block_q6_K (ggml-quants.c): each
+    // 128-element half stores four strided elements per (ql[l], qh[l]) pair.
+    // The previous version read ql/qh in straight element order, which
+    // permutes the weights and scrambles any real Q6_K tensor (e.g. the
+    // output.weight LM head of a llama.cpp Q4_0 file).
     const int64_t nb = k / 256;
     const auto* x = static_cast<const block_q6_K*>(vx);
 
     for (int64_t i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d);
+        const uint8_t* ql = x[i].ql;
+        const uint8_t* qh = x[i].qh;
+        const int8_t* sc = x[i].scales;
         float* yb = y + i * 256;
 
-        for (int sb = 0; sb < 16; ++sb) {
-            const float sc = d * static_cast<float>(x[i].scales[sb]);
-            for (int l = 0; l < 16; ++l) {
-                int idx = sb * 16 + l;
-                uint8_t ql = (x[i].ql[idx / 2] >> (4 * (idx % 2))) & 0x0F;
-                uint8_t qh = (x[i].qh[idx / 4] >> (2 * (idx % 4))) & 0x03;
-                int8_t q6 = static_cast<int8_t>((ql | (qh << 4))) - 32;
-                yb[idx] = sc * static_cast<float>(q6);
+        for (int n = 0; n < 256; n += 128) {
+            for (int l = 0; l < 32; ++l) {
+                const int is = l / 16;
+                const int8_t q1 = static_cast<int8_t>(((ql[l +  0] & 0x0F) | (((qh[l] >> 0) & 3) << 4))) - 32;
+                const int8_t q2 = static_cast<int8_t>(((ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4))) - 32;
+                const int8_t q3 = static_cast<int8_t>(((ql[l +  0] >> 4)  | (((qh[l] >> 4) & 3) << 4))) - 32;
+                const int8_t q4 = static_cast<int8_t>(((ql[l + 32] >> 4)  | (((qh[l] >> 6) & 3) << 4))) - 32;
+                yb[n + l +  0] = d * static_cast<float>(sc[is + 0]) * static_cast<float>(q1);
+                yb[n + l + 32] = d * static_cast<float>(sc[is + 2]) * static_cast<float>(q2);
+                yb[n + l + 64] = d * static_cast<float>(sc[is + 4]) * static_cast<float>(q3);
+                yb[n + l + 96] = d * static_cast<float>(sc[is + 6]) * static_cast<float>(q4);
             }
+            ql += 64;
+            qh += 32;
+            sc += 8;
         }
     }
 }
