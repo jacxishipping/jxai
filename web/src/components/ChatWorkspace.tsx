@@ -1,5 +1,5 @@
 import React, { useState, useRef, useEffect } from 'react';
-import { Send, Cpu, Database, Disc, ChevronDown, ChevronRight, Eye, Code, Zap, Clock, Layers, Play } from 'lucide-react';
+import { Send, Cpu, Database, Disc, ChevronDown, ChevronRight, Eye, Code, Zap, Clock, Layers, Play, Square } from 'lucide-react';
 import { ChatMessage, EngineHealth } from '../types';
 import { MarkdownRenderer } from '../utils/markdownParser';
 import { Translations } from '../utils/i18n';
@@ -9,38 +9,67 @@ interface ChatWorkspaceProps {
   onRefreshHealth?: () => void;
   t: Translations;
   currentSlot: number;
+  systemPrompt?: string;
 }
 
-export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({ health, t, currentSlot, onRefreshHealth }) => {
-  const [messages, setMessages] = useState<ChatMessage[]>([
-    {
-      id: 'welcome',
-      role: 'assistant',
-      content: `### Welcome to the Next-Gen MoE Streaming Inference Engine
+const createWelcomeMessage = (slot: number, health: EngineHealth | null): ChatMessage => ({
+  id: 'welcome',
+  role: 'assistant',
+  content: `### Welcome to the Next-Gen MoE Streaming Inference Engine
 
 Dense attention parameters (GQA/MLA), embedding matrices, and router gating tables stay resident in zero-copy RAM/VRAM, while sparse MoE expert matrices are dynamically streamed from NVMe disk using **PILOT asynchronous overlapped I/O** and **LFRU cache pinning**.
 
 - **Vectorized SIMD & Tensor Core Compute**: AVX-512, AVX2+FMA3, and Vulkan 1.3 Cooperative Matrix.
 - **Cache-Aware Routing (CACHE_ROUTE)**: Automatic expert substitution ($\Delta p < \\epsilon$) to eliminate disk I/O.
 - **Interactive Sandbox**: Tag code blocks \`\`\`html or \`\`\`svg to inspect live rendering in the sandbox on the right!`,
-      reasoning_content: 'MoE Core Initialized. Model: Qwen2.5-MoE-Stream-Q4_0. All 8 experts per layer mapped to NVMe offsets with Win32 IOCP / POSIX asynchronous direct I/O prefetch. Dynamic pinning threshold: 12 hits.',
-      telemetry: {
-        tok_per_sec: 2240.5,
-        wall_ms: 0.45,
-        io_wait_ms: 0.0,
-        cache_hits: 142,
-        disk_reads: 0,
-        ttft_ms: 12.4,
-        queue_latency_ms: 0.8,
-        cache_slot: currentSlot
-      }
-    }
-  ]);
+  reasoning_content: `MoE Core Initialized. Model: ${health?.model_name || 'Qwen2.5-MoE-Stream-Q4_0'}. All experts mapped with Win32 IOCP / POSIX asynchronous direct I/O prefetch. Dynamic pinning threshold: 12 hits.`,
+  telemetry: {
+    tok_per_sec: 25.8,
+    wall_ms: 38.7,
+    io_wait_ms: 0.0,
+    cache_hits: health?.tiers.cache_hits ?? 142,
+    disk_reads: 0,
+    ttft_ms: 12.4,
+    queue_latency_ms: 0.8,
+    cache_slot: slot
+  }
+});
+
+export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
+  health,
+  t,
+  currentSlot,
+  systemPrompt,
+  onRefreshHealth
+}) => {
+  const [messagesBySlot, setMessagesBySlot] = useState<Record<number, ChatMessage[]>>({
+    0: [createWelcomeMessage(0, null)]
+  });
+  const messages = messagesBySlot[currentSlot] || [createWelcomeMessage(currentSlot, health)];
+
+  const updateSlotMessages = (slot: number, updater: (prev: ChatMessage[]) => ChatMessage[]) => {
+    setMessagesBySlot(prevMap => {
+      const currentList = prevMap[slot] || [createWelcomeMessage(slot, health)];
+      return {
+        ...prevMap,
+        [slot]: updater(currentList)
+      };
+    });
+  };
+
   const [input, setInput] = useState('');
   const [isStreaming, setIsStreaming] = useState(false);
   const [previewTab, setPreviewTab] = useState<'text' | 'preview'>('preview');
   const [collapsedReasoning, setCollapsedReasoning] = useState<Record<string, boolean>>({});
+  const abortControllerRef = useRef<AbortController | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const handleStop = () => {
+    if (abortControllerRef.current) {
+      abortControllerRef.current.abort();
+      abortControllerRef.current = null;
+    }
+  };
 
   useEffect(() => {
     if (messagesEndRef.current && typeof messagesEndRef.current.scrollIntoView === 'function') {
@@ -68,9 +97,21 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
       reasoning_content: ''
     };
 
-    setMessages(prev => [...prev, userMsg, initialAssistantMsg]);
+    const activeSlot = currentSlot;
+    const historyToSend = [
+      ...(systemPrompt ? [{ role: 'system' as const, content: systemPrompt }] : []),
+      ...messages
+        .filter(m => m.id !== 'welcome' && m.content.trim().length > 0)
+        .map(m => ({ role: m.role, content: m.content })),
+      { role: 'user' as const, content: userMsg.content }
+    ];
+
+    updateSlotMessages(activeSlot, prev => [...prev, userMsg, initialAssistantMsg]);
     setInput('');
     setIsStreaming(true);
+
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
 
     // Auto-expand reasoning accordion while thinking
     setCollapsedReasoning(prev => ({ ...prev, [assistantMsgId]: false }));
@@ -83,12 +124,13 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
-          messages: [{ role: 'user', content: userMsg.content }],
+          messages: historyToSend,
           stream: true,
           max_tokens: 2048,
           temperature: 0.7,
-          cache_slot: currentSlot,
+          cache_slot: activeSlot,
           continue_assistant: isContinue,
           context_compaction: true
         })
@@ -128,7 +170,7 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
               setCollapsedReasoning(prev => ({ ...prev, [assistantMsgId]: true }));
             }
 
-            setMessages(prev =>
+            updateSlotMessages(activeSlot, prev =>
               prev.map(m => {
                 if (m.id !== assistantMsgId) return m;
                 return {
@@ -146,7 +188,7 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
                         disk_reads: telem.disk_reads,
                         ttft_ms: ttftMs,
                         queue_latency_ms: Math.max(0.2, (telem.wall_ms || 1) * 0.1),
-                        cache_slot: currentSlot
+                        cache_slot: activeSlot
                       }
                     : m.telemetry
                 };
@@ -158,16 +200,21 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
         }
       }
     } catch (err) {
-      setMessages(prev =>
-        prev.map(m => {
-          if (m.id !== assistantMsgId) return m;
-          return {
-            ...m,
-            content: m.content + `\n\n[Connection Error: ${err instanceof Error ? err.message : String(err)}]`
-          };
-        })
-      );
+      if (err instanceof Error && err.name === 'AbortError') {
+        // User aborted generation cleanly
+      } else {
+        updateSlotMessages(activeSlot, prev =>
+          prev.map(m => {
+            if (m.id !== assistantMsgId) return m;
+            return {
+              ...m,
+              content: m.content + `\n\n[Connection Error: ${err instanceof Error ? err.message : String(err)}]`
+            };
+          })
+        );
+      }
     } finally {
+      abortControllerRef.current = null;
       setIsStreaming(false);
       setCollapsedReasoning(prev => ({ ...prev, [assistantMsgId]: true }));
       if (onRefreshHealth) onRefreshHealth();
@@ -176,7 +223,10 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
 
   const handleContinue = async (msgId: string) => {
     if (isStreaming) return;
+    const activeSlot = currentSlot;
     setIsStreaming(true);
+    const controller = new AbortController();
+    abortControllerRef.current = controller;
     const requestStartTime = performance.now();
     let ttftRecorded = false;
     let ttftMs = 0;
@@ -185,12 +235,13 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
       const response = await fetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
+        signal: controller.signal,
         body: JSON.stringify({
           messages: [{ role: 'user', content: 'continue' }],
           stream: true,
           max_tokens: 2048,
           temperature: 0.7,
-          cache_slot: currentSlot,
+          cache_slot: activeSlot,
           continue_assistant: true,
           context_compaction: true
         })
@@ -225,7 +276,7 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
               ttftRecorded = true;
             }
 
-            setMessages(prev =>
+            updateSlotMessages(activeSlot, prev =>
               prev.map(m => {
                 if (m.id !== msgId) return m;
                 return {
@@ -243,7 +294,7 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
                         disk_reads: telem.disk_reads,
                         ttft_ms: ttftMs,
                         queue_latency_ms: Math.max(0.2, (telem.wall_ms || 1) * 0.1),
-                        cache_slot: currentSlot
+                        cache_slot: activeSlot
                       }
                     : m.telemetry
                 };
@@ -255,8 +306,11 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
         }
       }
     } catch (err) {
-      console.error(err);
+      if (!(err instanceof Error && err.name === 'AbortError')) {
+        console.error(err);
+      }
     } finally {
+      abortControllerRef.current = null;
       setIsStreaming(false);
       if (onRefreshHealth) onRefreshHealth();
     }
@@ -438,14 +492,26 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
               className="flex-1 bg-slate-900/90 border border-slate-700/80 rounded-xl px-4 py-3 text-sm text-slate-100 placeholder-slate-500 focus:outline-none focus:ring-2 focus:ring-blue-500/50 focus:border-blue-500 font-sans"
               disabled={isStreaming}
             />
-            <button
-              type="submit"
-              disabled={isStreaming || !input.trim()}
-              className="px-5 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-medium text-sm transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-blue-600/20 flex items-center space-x-2"
-            >
-              <span>{t.send}</span>
-              <Send className="w-4 h-4" />
-            </button>
+            {isStreaming ? (
+              <button
+                type="button"
+                onClick={handleStop}
+                className="px-5 py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white font-medium text-sm transition-all duration-200 shadow-lg shadow-red-600/20 flex items-center space-x-2"
+                title="Stop generating"
+              >
+                <span>Stop</span>
+                <Square className="w-3.5 h-3.5 fill-current" />
+              </button>
+            ) : (
+              <button
+                type="submit"
+                disabled={!input.trim()}
+                className="px-5 py-3 rounded-xl bg-blue-600 hover:bg-blue-500 text-white font-medium text-sm transition-all duration-200 disabled:opacity-50 disabled:cursor-not-allowed shadow-lg shadow-blue-600/20 flex items-center space-x-2"
+              >
+                <span>{t.send}</span>
+                <Send className="w-4 h-4" />
+              </button>
+            )}
           </form>
         </div>
       </div>

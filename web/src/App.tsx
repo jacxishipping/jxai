@@ -261,7 +261,13 @@ export const App: React.FC = () => {
       {/* Main Content Area */}
       <div className="flex-1 h-full overflow-hidden relative">
         {activeTab === 'chat' && (
-          <ChatWorkspace health={health} t={t} currentSlot={currentSlot} onRefreshHealth={fetchHealth} />
+          <ChatWorkspace
+            health={health}
+            t={t}
+            currentSlot={currentSlot}
+            systemPrompt={systemPrompt}
+            onRefreshHealth={fetchHealth}
+          />
         )}
         {activeTab === 'atlas' && <CortexAtlas t={t} />}
         {activeTab === 'profiler' && <ProfilerDashboard health={health} t={t} />}
