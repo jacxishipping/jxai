@@ -23,3 +23,61 @@
   background: rgba(148, 163, 184, 0.6);
 }
 
+/* Complete Light Theme Overrides for All 5 Workspaces & Modals */
+.theme-light .bg-\[\#080b13\],
+.theme-light .bg-\[\#0b0f19\],
+.theme-light .bg-\[\#070a12\] {
+  background-color: #f8fafc !important;
+  color: #0f172a !important;
+}
+
+.theme-light .bg-slate-950,
+.theme-light .bg-slate-950\/80,
+.theme-light .bg-slate-950\/60,
+.theme-light .bg-slate-950\/50,
+.theme-light .bg-slate-950\/40 {
+  background-color: #f1f5f9 !important;
+  color: #0f172a !important;
+}
+
+.theme-light .bg-slate-900,
+.theme-light .bg-slate-900\/90,
+.theme-light .bg-slate-900\/80,
+.theme-light .bg-slate-900\/60,
+.theme-light .bg-slate-900\/40,
+.theme-light .bg-slate-900\/30 {
+  background-color: #ffffff !important;
+  color: #0f172a !important;
+}
+
+.theme-light .bg-slate-800,
+.theme-light .bg-slate-800\/80,
+.theme-light .bg-slate-800\/40 {
+  background-color: #e2e8f0 !important;
+  color: #1e293b !important;
+}
+
+.theme-light .border-slate-800,
+.theme-light .border-slate-800\/80,
+.theme-light .border-slate-800\/60,
+.theme-light .border-slate-800\/40,
+.theme-light .border-slate-700,
+.theme-light .border-slate-700\/80,
+.theme-light .border-slate-700\/60,
+.theme-light .border-slate-700\/50 {
+  border-color: #cbd5e1 !important;
+}
+
+.theme-light .text-slate-100,
+.theme-light .text-slate-200 {
+  color: #0f172a !important;
+}
+
+.theme-light .text-slate-300 {
+  color: #334155 !important;
+}
+
+.theme-light .text-slate-400 {
+  color: #475569 !important;
+}
+

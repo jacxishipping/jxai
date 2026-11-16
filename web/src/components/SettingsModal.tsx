@@ -1,6 +1,6 @@
-import React, { useState } from 'react';
-import { Settings as SettingsIcon, Key, Globe, Terminal, Save, Cpu } from 'lucide-react';
-import { EngineHealth, SupportedLanguage } from '../types';
+import React, { useState, useEffect } from 'react';
+import { Settings as SettingsIcon, Key, Globe, Terminal, Save, Cpu, Sliders, Zap } from 'lucide-react';
+import { EngineHealth, SamplerSettings, SupportedLanguage } from '../types';
 import { Translations } from '../utils/i18n';
 
 interface SettingsModalProps {
@@ -12,6 +12,8 @@ interface SettingsModalProps {
   t: Translations;
   systemPrompt: string;
   onSaveSystemPrompt: (prompt: string) => void;
+  samplerSettings: SamplerSettings;
+  onSaveSamplerSettings: (settings: SamplerSettings) => void;
 }
 
 export const SettingsModal: React.FC<SettingsModalProps> = ({
@@ -22,11 +24,22 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSelectLanguage,
   t,
   systemPrompt,
-  onSaveSystemPrompt
+  onSaveSystemPrompt,
+  samplerSettings,
+  onSaveSamplerSettings
 }) => {
   // Memory-only API key: NOT written to localStorage or sessionStorage!
   const [apiKey, setApiKey] = useState('');
   const [currentPrompt, setCurrentPrompt] = useState(systemPrompt);
+  const [localSampler, setLocalSampler] = useState<SamplerSettings>(samplerSettings);
+
+  useEffect(() => {
+    setCurrentPrompt(systemPrompt);
+  }, [systemPrompt, isOpen]);
+
+  useEffect(() => {
+    setLocalSampler(samplerSettings);
+  }, [samplerSettings, isOpen]);
 
   const presets = [
     {
@@ -49,8 +62,23 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
   if (!isOpen) return null;
 
-  const handleSave = () => {
+  const handleSave = async () => {
     onSaveSystemPrompt(currentPrompt);
+    onSaveSamplerSettings(localSampler);
+    try {
+      await fetch('/v1/config', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          temperature: localSampler.temperature,
+          top_p: localSampler.top_p,
+          speculative_draft_tokens: localSampler.draft_tokens,
+          max_context: health?.hparams.max_seq_len ?? 32768
+        })
+      });
+    } catch {
+      // ignore offline preview
+    }
     onClose();
   };
 
@@ -118,6 +146,127 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               onChange={e => setCurrentPrompt(e.target.value)}
               className="w-full bg-slate-950/80 border border-slate-800 rounded-xl p-3 text-xs text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/50 font-sans"
             />
+          </div>
+
+          {/* Sampling & Speculative Decoding Controls */}
+          <div className="p-4 rounded-xl border border-slate-800 bg-slate-950/60 space-y-3">
+            <div className="text-xs font-bold text-slate-300 uppercase tracking-wider font-mono flex items-center justify-between border-b border-slate-800 pb-2">
+              <span className="flex items-center space-x-2">
+                <Sliders className="w-3.5 h-3.5 text-cyan-400" />
+                <span>Sampling & Speculative Decoding</span>
+              </span>
+              <span className="text-[10px] text-slate-500 font-normal">Synced with /v1/config</span>
+            </div>
+
+            <div className="grid grid-cols-2 gap-4 text-xs font-mono">
+              <div>
+                <div className="flex justify-between text-slate-400 mb-1">
+                  <span>Temperature</span>
+                  <span className="text-cyan-400">{localSampler.temperature.toFixed(2)}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0}
+                  max={1.5}
+                  step={0.05}
+                  value={localSampler.temperature}
+                  onChange={e => setLocalSampler({ ...localSampler, temperature: Number(e.target.value) })}
+                  className="w-full accent-cyan-500 bg-slate-800 h-1.5 rounded-lg appearance-none cursor-pointer"
+                />
+              </div>
+
+              <div>
+                <div className="flex justify-between text-slate-400 mb-1">
+                  <span>Top-P (Nucleus)</span>
+                  <span className="text-cyan-400">{localSampler.top_p.toFixed(2)}</span>
+                </div>
+                <input
+                  type="range"
+                  min={0.1}
+                  max={1.0}
+                  step={0.05}
+                  value={localSampler.top_p}
+                  onChange={e => setLocalSampler({ ...localSampler, top_p: Number(e.target.value) })}
+                  className="w-full accent-cyan-500 bg-slate-800 h-1.5 rounded-lg appearance-none cursor-pointer"
+                />
+              </div>
+
+              <div>
+                <div className="flex justify-between text-slate-400 mb-1">
+                  <span>Top-K</span>
+                  <span className="text-cyan-400">{localSampler.top_k}</span>
+                </div>
+                <input
+                  type="range"
+                  min={1}
+                  max={100}
+                  step={1}
+                  value={localSampler.top_k}
+                  onChange={e => setLocalSampler({ ...localSampler, top_k: Number(e.target.value) })}
+                  className="w-full accent-cyan-500 bg-slate-800 h-1.5 rounded-lg appearance-none cursor-pointer"
+                />
+              </div>
+
+              <div>
+                <div className="flex justify-between text-slate-400 mb-1">
+                  <span>Repetition Penalty</span>
+                  <span className="text-cyan-400">{localSampler.repetition_penalty.toFixed(2)}</span>
+                </div>
+                <input
+                  type="range"
+                  min={1.0}
+                  max={1.5}
+                  step={0.02}
+                  value={localSampler.repetition_penalty}
+                  onChange={e => setLocalSampler({ ...localSampler, repetition_penalty: Number(e.target.value) })}
+                  className="w-full accent-cyan-500 bg-slate-800 h-1.5 rounded-lg appearance-none cursor-pointer"
+                />
+              </div>
+
+              <div>
+                <div className="flex justify-between text-slate-400 mb-1">
+                  <span>Max Tokens</span>
+                  <span className="text-cyan-400">{localSampler.max_tokens}</span>
+                </div>
+                <input
+                  type="range"
+                  min={64}
+                  max={4096}
+                  step={64}
+                  value={localSampler.max_tokens}
+                  onChange={e => setLocalSampler({ ...localSampler, max_tokens: Number(e.target.value) })}
+                  className="w-full accent-cyan-500 bg-slate-800 h-1.5 rounded-lg appearance-none cursor-pointer"
+                />
+              </div>
+
+              <div className="flex flex-col justify-between">
+                <label className="flex items-center justify-between cursor-pointer text-slate-300">
+                  <span className="flex items-center space-x-1.5">
+                    <Zap className="w-3.5 h-3.5 text-amber-400" />
+                    <span>Speculative MTP</span>
+                  </span>
+                  <input
+                    type="checkbox"
+                    checked={localSampler.speculative}
+                    onChange={e => setLocalSampler({ ...localSampler, speculative: e.target.checked })}
+                    className="accent-amber-500 w-4 h-4 rounded"
+                  />
+                </label>
+                {localSampler.speculative && (
+                  <div className="flex items-center justify-between mt-1.5 text-[11px] text-slate-400">
+                    <span>Draft Tokens:</span>
+                    <input
+                      type="number"
+                      min={1}
+                      max={4}
+                      value={localSampler.draft_tokens}
+                      onChange={e => setLocalSampler({ ...localSampler, draft_tokens: Math.max(1, Math.min(4, Number(e.target.value))) })}
+                      className="w-14 bg-slate-900 border border-slate-700 rounded px-1.5 py-0.5 text-center text-amber-300"
+                    />
+                  </div>
+                )}
+              </div>
+            </div>
           </div>
 
           {/* Language Selection */}

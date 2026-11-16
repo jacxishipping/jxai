@@ -510,6 +510,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
             return;
         }
 
+        const std::string active_path = engine_.model_file().path();
         std::ostringstream js;
         js << "{"
            << "\"object\":\"list\","
@@ -519,29 +520,72 @@ void HttpServer::handle_client(uintptr_t client_sock) {
            << "\"object\":\"model\","
            << "\"created\":1730000000,"
            << "\"owned_by\":\"moe-engine\","
+           << "\"path\":\"" << json_escape(active_path) << "\","
+           << "\"size\":" << engine_.model_file().file_size() << ","
+           << "\"active\":true,"
            << "\"permission\":[],"
            << "\"root\":\"" << json_escape(mname) << "\","
            << "\"parent\":null"
-           << "},"
-           << "{"
+           << "}";
+
+        // Discover additional local .gguf / .safetensors models in models/ directory
+        std::error_code ec;
+        if (std::filesystem::exists("models", ec) && std::filesystem::is_directory("models", ec)) {
+            for (const auto& entry : std::filesystem::directory_iterator("models", ec)) {
+                if (!entry.is_regular_file(ec)) continue;
+                std::string ext = entry.path().extension().string();
+                if (ext != ".gguf" && ext != ".safetensors") continue;
+                std::string rel_path = "models/" + entry.path().filename().string();
+                std::string fname = entry.path().filename().string();
+                bool is_curr = (active_path == rel_path || active_path.ends_with(fname));
+                uint64_t fsize = entry.file_size(ec);
+                js << ",{"
+                   << "\"id\":\"" << json_escape(fname) << "\","
+                   << "\"object\":\"model\","
+                   << "\"created\":1730000000,"
+                   << "\"owned_by\":\"local-gguf\","
+                   << "\"path\":\"" << json_escape(rel_path) << "\","
+                   << "\"size\":" << fsize << ","
+                   << "\"active\":" << (is_curr ? "true" : "false")
+                   << "}";
+            }
+        }
+
+        js << ",{"
            << "\"id\":\"default\","
-           << "\"object\":\"model\","
-           << "\"created\":1730000000,"
-           << "\"owned_by\":\"moe-engine\""
-           << "},"
-           << "{"
-           << "\"id\":\"gpt-3.5-turbo\","
-           << "\"object\":\"model\","
-           << "\"created\":1730000000,"
-           << "\"owned_by\":\"moe-engine\""
-           << "},"
-           << "{"
-           << "\"id\":\"gpt-4\","
            << "\"object\":\"model\","
            << "\"created\":1730000000,"
            << "\"owned_by\":\"moe-engine\""
            << "}"
            << "]"
+           << "}";
+        send_http_json(client_sock, 200, "OK", js.str());
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // 0a-2. POST /v1/models/load (Hot-Swap Active Model in Engine)
+    // ------------------------------------------------------------------------
+    if (method == "POST" && path == "/v1/models/load") {
+        std::string model_path = extract_json_string(body, "model_path", "");
+        if (model_path.empty() || model_path.find("..") != std::string::npos) {
+            send_http_json(client_sock, 400, "Bad Request", "{\"error\":\"Invalid or missing model_path\"}");
+            return;
+        }
+        std::string err_msg;
+        if (!engine_.load_model(model_path, err_msg)) {
+            std::ostringstream err_js;
+            err_js << "{\"status\":\"error\",\"error\":\"" << json_escape(err_msg) << "\"}";
+            send_http_json(client_sock, 400, "Bad Request", err_js.str());
+            return;
+        }
+        const auto& hp = engine_.hparams();
+        std::ostringstream js;
+        js << "{"
+           << "\"status\":\"ok\","
+           << "\"model_path\":\"" << json_escape(model_path) << "\","
+           << "\"model_name\":\"" << json_escape(hp.model_name) << "\","
+           << "\"architecture\":\"" << json_escape(hp.arch) << "\""
            << "}";
         send_http_json(client_sock, 200, "OK", js.str());
         return;
