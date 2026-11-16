@@ -84,12 +84,69 @@ bool VulkanComputeBackend::init(std::string& err_msg) {
     vulkan_module_ = hMod;
 #endif
 
-    // Basic functional device discovery probe
+    // Query real Vulkan physical device via dynamically loaded vkGetInstanceProcAddr
+    using PFN_vkVoidFunction = void(*)();
+    using PFN_vkGetInstanceProcAddr = PFN_vkVoidFunction(*)(void*, const char*);
+    using PFN_vkCreateInstance = int32_t(*)(const void*, const void*, void**);
+    using PFN_vkDestroyInstance = void(*)(void*, const void*);
+    using PFN_vkEnumeratePhysicalDevices = int32_t(*)(void*, uint32_t*, void**);
+    using PFN_vkGetPhysicalDeviceProperties = void(*)(void*, void*);
+
+#ifdef _WIN32
+    auto get_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(GetProcAddress(hMod, "vkGetInstanceProcAddr"));
+#else
+    auto get_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(hMod, "vkGetInstanceProcAddr"));
+#endif
+
+    std::string detected_gpu = "Vulkan 1.3 Compatible Compute Device";
+    uint32_t maj = 1, min = 3;
+
+    if (get_proc) {
+        auto vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(get_proc(nullptr, "vkCreateInstance"));
+        if (vkCreateInstance) {
+            struct VkAppInfo {
+                int32_t sType; const void* pNext; const char* pAppName; uint32_t appVer;
+                const char* pEngineName; uint32_t engineVer; uint32_t apiVer;
+            } app_info{0, nullptr, "moe_engine", 1, "moe", 1, (1u << 22) | (3u << 12)};
+            struct VkInstCreateInfo {
+                int32_t sType; const void* pNext; uint32_t flags; const void* pAppInfo;
+                uint32_t layerCount; const char* const* ppLayers;
+                uint32_t extCount; const char* const* ppExts;
+            } create_info{1, nullptr, 0, &app_info, 0, nullptr, 0, nullptr};
+
+            void* vk_inst = nullptr;
+            if (vkCreateInstance(&create_info, nullptr, &vk_inst) == 0 && vk_inst) {
+                auto vkEnumPhys = reinterpret_cast<PFN_vkEnumeratePhysicalDevices>(get_proc(vk_inst, "vkEnumeratePhysicalDevices"));
+                auto vkGetProps = reinterpret_cast<PFN_vkGetPhysicalDeviceProperties>(get_proc(vk_inst, "vkGetPhysicalDeviceProperties"));
+                auto vkDestroyInst = reinterpret_cast<PFN_vkDestroyInstance>(get_proc(vk_inst, "vkDestroyInstance"));
+
+                if (vkEnumPhys && vkGetProps) {
+                    uint32_t dev_count = 0;
+                    if (vkEnumPhys(vk_inst, &dev_count, nullptr) == 0 && dev_count > 0) {
+                        std::vector<void*> devs(dev_count);
+                        if (vkEnumPhys(vk_inst, &dev_count, devs.data()) == 0) {
+                            struct VkPhysProps {
+                                uint32_t apiVersion; uint32_t driverVersion; uint32_t vendorID;
+                                uint32_t deviceID; uint32_t deviceType; char deviceName[256];
+                                uint8_t pipelineCacheUUID[16]; uint8_t rest[1024];
+                            } props{};
+                            vkGetProps(devs[0], &props);
+                            detected_gpu = props.deviceName;
+                            maj = (props.apiVersion >> 22) & 0x3FF;
+                            min = (props.apiVersion >> 12) & 0x3FF;
+                        }
+                    }
+                }
+                if (vkDestroyInst) vkDestroyInst(vk_inst, nullptr);
+            }
+        }
+    }
+
     device_info_.available = true;
-    device_info_.device_name = "Vulkan 1.3 Compatible Compute Device (Generic / Cooperative Matrix)";
-    device_info_.api_version_major = 1;
-    device_info_.api_version_minor = 3;
-    device_info_.device_memory_bytes = 4ULL * 1024 * 1024 * 1024; // 4GB default budget
+    device_info_.device_name = detected_gpu;
+    device_info_.api_version_major = maj;
+    device_info_.api_version_minor = min;
+    device_info_.device_memory_bytes = 4ULL * 1024 * 1024 * 1024;
     device_info_.has_subgroups = true;
     device_info_.subgroup_size = 32;
     device_info_.has_cooperative_matrix = true;

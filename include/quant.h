@@ -131,6 +131,8 @@ float vec_dot_quant_f32(GGMLType type, const void* vx, const float* y, int64_t k
 // Integer SIMD Dot Products with pre-quantized Q8_0 activations: dot(weight_row[k], x_q8[k])
 float vec_dot_q4_0_q8_0(const void* vx, const block_q8_0* y, int64_t k);
 float vec_dot_q8_0_q8_0(const void* vx, const block_q8_0* y, int64_t k);
+float vec_dot_q4_K_q8_0(const void* vx, const block_q8_0* y, int64_t k);
+float vec_dot_q5_K_q8_0(const void* vx, const block_q8_0* y, int64_t k);
 float vec_dot_q6_K_q8_0(const void* vx, const block_q8_0* y, int64_t k);
 
 // Matrix-Vector Multiplication: out[rows] = W[rows, cols] * x[cols]

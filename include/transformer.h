@@ -22,6 +22,8 @@ struct ModelHyperparams {
     uint32_t n_heads = 4;
     uint32_t n_kv_heads = 2;
     uint32_t head_dim = 32;
+    uint32_t q_dim = 128;
+    uint32_t kv_dim = 64;
     uint32_t rope_dim = 32;
     uint32_t n_experts = 8;
     uint32_t n_experts_used = 2;
@@ -40,10 +42,17 @@ struct LayerDenseWeights {
     const TensorDescriptor* bq = nullptr;
     const TensorDescriptor* bk = nullptr;
     const TensorDescriptor* bv = nullptr;
+    const TensorDescriptor* bo = nullptr;
     const TensorDescriptor* attn_q_norm = nullptr;
     const TensorDescriptor* attn_k_norm = nullptr;
     const TensorDescriptor* ffn_norm = nullptr;
     const TensorDescriptor* router_gate = nullptr; // [n_experts, dim]
+
+    // Shared Expert weights (Qwen2.5-MoE / DeepSeek-MoE)
+    const TensorDescriptor* shexp_gate = nullptr;
+    const TensorDescriptor* shexp_up   = nullptr;
+    const TensorDescriptor* shexp_down = nullptr;
+    const TensorDescriptor* shexp_gate_inp = nullptr;
 
     // Sparse experts on NVMe disk (per expert slice offsets) or zero-copy mapped FFN
     bool is_dense_ffn = false;
@@ -78,14 +87,15 @@ struct KVCacheSlot {
     uint32_t compactions = 0;
     std::vector<uint32_t> token_history;
     std::vector<uint32_t> page_table;
-    // [n_layers][max_seq_len * n_kv_heads * head_dim]
-    std::vector<std::vector<float>> k_cache;
-    std::vector<std::vector<float>> v_cache;
+    // FP16 KV Cache: [n_layers][max_seq_len * kv_dim]
+    std::vector<std::vector<uint16_t>> k_cache;
+    std::vector<std::vector<uint16_t>> v_cache;
 
     void init(uint32_t id, const ModelHyperparams& hp);
     void clear();
     // Compact KV cache by retaining sink tokens (first 4) + most recent window
     void compact(const ModelHyperparams& hp, uint32_t keep_recent = 128);
+    void rollback(uint32_t new_seq_pos);
     uint32_t pages_allocated() const {
         return (seq_pos == 0) ? 0 : static_cast<uint32_t>((seq_pos + KV_BLOCK_TOKENS - 1) / KV_BLOCK_TOKENS);
     }
@@ -145,8 +155,12 @@ public:
         uint32_t token_id,
         uint32_t slot_id,
         ProfileSample* out_profile = nullptr,
-        bool compute_logits = true
+        bool compute_logits = true,
+        std::vector<float>* out_hidden = nullptr
     );
+
+    // Compute L2-normalized mean-pooled hidden-state embedding for `text`
+    std::vector<float> compute_embeddings(const std::string& text);
 
     // Sample next token ID from logits using temperature, top-K, top-P, repetition penalty
     uint32_t sample_next_token(
