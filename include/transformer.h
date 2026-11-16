@@ -28,12 +28,31 @@ struct ModelHyperparams {
     uint32_t n_experts = 8;
     uint32_t n_experts_used = 2;
     uint32_t max_seq_len = 2048;
+    uint32_t kv_cache_capacity = 2048;
+    uint32_t ple_dim = 0;
+    uint32_t sliding_window = 0;
+    uint32_t shared_kv_layers = 0;
+    uint32_t rope_dim_swa = 0;
+    float    rope_freq_base_swa = 10000.0f;
+    float    final_logit_softcapping = 0.0f;
+    bool     use_gelu = false;
+    bool     scale_embeddings = false;
+    bool     v_norm = false;
     float    rms_norm_eps = 1e-5f;
     float    rope_freq_base = 10000.0f;
     float    yarn_scale = 1.0f;
 };
 
 struct LayerDenseWeights {
+    uint32_t q_dim = 0;
+    uint32_t kv_dim = 0;
+    uint32_t head_dim = 0;
+    uint32_t rope_dim = 0;
+    uint32_t kv_source_layer = 0;
+    bool     shares_kv = false;
+    float    rope_freq_base = 10000.0f;
+    bool     is_swa = false;
+
     const TensorDescriptor* attn_norm = nullptr;
     const TensorDescriptor* wq = nullptr;
     const TensorDescriptor* wk = nullptr;
@@ -45,7 +64,13 @@ struct LayerDenseWeights {
     const TensorDescriptor* bo = nullptr;
     const TensorDescriptor* attn_q_norm = nullptr;
     const TensorDescriptor* attn_k_norm = nullptr;
+    const TensorDescriptor* post_attn_norm = nullptr;
     const TensorDescriptor* ffn_norm = nullptr;
+    const TensorDescriptor* post_ffw_norm = nullptr;
+    const TensorDescriptor* inp_gate = nullptr;
+    const TensorDescriptor* ple_proj = nullptr;
+    const TensorDescriptor* post_norm = nullptr;
+    const TensorDescriptor* layer_output_scale = nullptr;
     const TensorDescriptor* router_gate = nullptr; // [n_experts, dim]
 
     // Shared Expert weights (Qwen2.5-MoE / DeepSeek-MoE)
@@ -144,7 +169,8 @@ public:
     static void apply_rope(
         float* q, float* k,
         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
-        uint32_t pos, float freq_base, float yarn_scale = 1.0f, bool is_neox = true
+        uint32_t pos, float freq_base, float yarn_scale = 1.0f, bool is_neox = true,
+        const float* rope_freqs = nullptr
     );
     static void softmax(float* x, int64_t size);
     static float silu(float x) { return x / (1.0f + std::exp(-x)); }
@@ -230,6 +256,10 @@ private:
     const TensorDescriptor* tok_emb_ = nullptr;
     const TensorDescriptor* out_norm_ = nullptr;
     const TensorDescriptor* lm_head_ = nullptr;
+    const TensorDescriptor* per_layer_tok_emb_ = nullptr;
+    const TensorDescriptor* per_layer_model_proj_ = nullptr;
+    const TensorDescriptor* per_layer_proj_norm_ = nullptr;
+    const TensorDescriptor* rope_freqs_ = nullptr;
     std::vector<LayerDenseWeights> layers_;
 
     uint64_t dense_bytes_ = 0;

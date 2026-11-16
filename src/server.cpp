@@ -235,6 +235,37 @@ std::string extract_chat_prompt(const std::string& body) {
     return extract_last_message_content(body);
 }
 
+std::string format_chat_prompt_for_arch(const std::string& body, const std::string& arch) {
+    if (arch != "gemma4" && arch != "gemma3" && arch != "gemma2" && arch != "gemma") {
+        return extract_chat_prompt(body);
+    }
+    std::string chatml = extract_chat_prompt(body);
+    if (chatml.find("<|im_start|>") == std::string::npos) {
+        return chatml;
+    }
+    // Convert ChatML turns into Gemma <|turn>role\n...<turn|>\n format
+    std::ostringstream out;
+    size_t pos = 0;
+    while (true) {
+        size_t s = chatml.find("<|im_start|>", pos);
+        if (s == std::string::npos) break;
+        s += 12;
+        size_t nl = chatml.find('\n', s);
+        if (nl == std::string::npos) break;
+        std::string role = chatml.substr(s, nl - s);
+        size_t e = chatml.find("<|im_end|>", nl + 1);
+        if (e == std::string::npos) {
+            if (role == "assistant") out << "<|turn>model\n";
+            break;
+        }
+        std::string content = chatml.substr(nl + 1, e - (nl + 1));
+        std::string gemma_role = (role == "assistant") ? "model" : role;
+        out << "<|turn>" << gemma_role << "\n" << content << "<turn|>\n";
+        pos = e + 10;
+    }
+    return out.str();
+}
+
 double extract_json_number(const std::string& body, const std::string& key, double def) {
     std::string pat = "\"" + key + "\"";
     size_t pos = body.find(pat);
@@ -958,7 +989,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     // 4. POST /v1/chat/completions, /v1/completions, /api/chat, /api/generate
     // ------------------------------------------------------------------------
     if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions" || path == "/api/chat" || path == "/api/generate")) {
-        std::string user_prompt = extract_chat_prompt(body);
+        std::string user_prompt = format_chat_prompt_for_arch(body, engine_.hparams().arch);
         bool stream = extract_json_bool(body, "stream", true);
         uint32_t max_tokens = static_cast<uint32_t>(std::clamp(extract_json_number(body, "max_tokens", 1024.0), 1.0, 4096.0));
         uint32_t slot_id = static_cast<uint32_t>(std::max(0.0, extract_json_number(body, "cache_slot", 0.0)));

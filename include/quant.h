@@ -154,14 +154,15 @@ void matmul_qkv_quant_f32(
     const float* x, int64_t cols
 );
 
-// Fused SwiGLU Gate+Up Projection: swiglu_out[r] = SiLU((W_gate * x)[r]) * (W_up * x)[r]
+// Fused SwiGLU / GeGLU Gate+Up Projection: out[r] = Act((W_gate * x)[r]) * (W_up * x)[r]
 void matmul_swiglu_quant_f32(
     GGMLType gate_type, const void* W_gate,
     GGMLType up_type,   const void* W_up,
     const float* x,
     float* swiglu_out,
     int64_t exp_dim,
-    int64_t cols
+    int64_t cols,
+    bool use_gelu = false
 );
 
 } // namespace moe

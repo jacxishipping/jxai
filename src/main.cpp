@@ -168,11 +168,20 @@ bool run_verification_tests() {
     quantize_row_q6_K(x256.data(), q6k_buf.data(), K256);
     float q6k_dot = vec_dot_q6_K_f32(q6k_buf.data(), y256.data(), K256);
 
+    std::vector<uint8_t> y256_q8(tensor_byte_size(GGMLType::Q8_0, K256));
+    quantize_row_q8_0(y256.data(), y256_q8.data(), K256);
+    float q4k_q8_dot = vec_dot_q4_K_q8_0(q4k_buf.data(), reinterpret_cast<const block_q8_0*>(y256_q8.data()), K256);
+    float q5k_q8_dot = vec_dot_q5_K_q8_0(q5k_buf.data(), reinterpret_cast<const block_q8_0*>(y256_q8.data()), K256);
+    float q6k_q8_dot = vec_dot_q6_K_q8_0(q6k_buf.data(), reinterpret_cast<const block_q8_0*>(y256_q8.data()), K256);
+
     assert(std::fabs(ref_dot - q8_dot) < 0.2f);
     assert(std::fabs(ref_dot - q4_dot) < 0.8f);
     assert(std::fabs(ref_dot256 - q4k_dot) < 3.0f);
     assert(std::fabs(ref_dot256 - q5k_dot) < 2.0f);
     assert(std::fabs(ref_dot256 - q6k_dot) < 1.0f);
+    assert(std::fabs(q4k_dot - q4k_q8_dot) < 0.5f);
+    assert(std::fabs(q5k_dot - q5k_q8_dot) < 0.5f);
+    assert(std::fabs(q6k_dot - q6k_q8_dot) < 0.5f);
     std::cout << " \033[1;32mPASSED\033[0m (Ref: " << ref_dot << ", Q8: " << q8_dot << ", Q4: " << q4_dot << ", Q6_K: " << q6k_dot << ")\n";
 
     // 2. RMSNorm Math Verification
