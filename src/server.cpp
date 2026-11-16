@@ -13,6 +13,7 @@
 #endif
 
 #include "server.h"
+#include "model_pull.h"
 #include "vulkan_backend.h"
 #include <fstream>
 #include <sstream>
@@ -234,6 +235,37 @@ std::string extract_chat_prompt(const std::string& body) {
     return extract_last_message_content(body);
 }
 
+std::string format_chat_prompt_for_arch(const std::string& body, const std::string& arch) {
+    if (arch != "gemma4" && arch != "gemma3" && arch != "gemma2" && arch != "gemma") {
+        return extract_chat_prompt(body);
+    }
+    std::string chatml = extract_chat_prompt(body);
+    if (chatml.find("<|im_start|>") == std::string::npos) {
+        return chatml;
+    }
+    // Convert ChatML turns into Gemma <|turn>role\n...<turn|>\n format
+    std::ostringstream out;
+    size_t pos = 0;
+    while (true) {
+        size_t s = chatml.find("<|im_start|>", pos);
+        if (s == std::string::npos) break;
+        s += 12;
+        size_t nl = chatml.find('\n', s);
+        if (nl == std::string::npos) break;
+        std::string role = chatml.substr(s, nl - s);
+        size_t e = chatml.find("<|im_end|>", nl + 1);
+        if (e == std::string::npos) {
+            if (role == "assistant") out << "<|turn>model\n";
+            break;
+        }
+        std::string content = chatml.substr(nl + 1, e - (nl + 1));
+        std::string gemma_role = (role == "assistant") ? "model" : role;
+        out << "<|turn>" << gemma_role << "\n" << content << "<turn|>\n";
+        pos = e + 10;
+    }
+    return out.str();
+}
+
 double extract_json_number(const std::string& body, const std::string& key, double def) {
     std::string pat = "\"" + key + "\"";
     size_t pos = body.find(pat);
@@ -440,6 +472,14 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         ~Guard() { cnt--; close_sock(s); }
     } guard{active_requests_, client_sock};
 
+#ifdef _WIN32
+    DWORD rcv_timeout_ms = 5000;
+    setsockopt(static_cast<SOCKET>(client_sock), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv_timeout_ms), sizeof(rcv_timeout_ms));
+#else
+    struct timeval tv{5, 0};
+    setsockopt(static_cast<int>(client_sock), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
     std::string req;
     char buf[8192];
     size_t header_end = std::string::npos;
@@ -586,6 +626,83 @@ void HttpServer::handle_client(uintptr_t client_sock) {
            << "\"model_path\":\"" << json_escape(model_path) << "\","
            << "\"model_name\":\"" << json_escape(hp.model_name) << "\","
            << "\"architecture\":\"" << json_escape(hp.arch) << "\""
+           << "}";
+        send_http_json(client_sock, 200, "OK", js.str());
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // 0a-3. POST /v1/models/pull (Stream Hugging Face GGUF Download Progress via SSE)
+    // ------------------------------------------------------------------------
+    if (method == "POST" && path == "/v1/models/pull") {
+        std::string source = extract_json_string(body, "source", "");
+        if (source.empty()) source = extract_json_string(body, "url", "");
+        if (source.empty()) {
+            send_http_json(client_sock, 400, "Bad Request", "{\"error\":\"Missing source or url\"}");
+            return;
+        }
+
+        std::ostringstream sse_hdr;
+        sse_hdr << "HTTP/1.1 200 OK\r\n"
+                << "Content-Type: text/event-stream; charset=utf-8\r\n"
+                << "Cache-Control: no-cache\r\n"
+                << "Connection: close\r\n"
+                << "Access-Control-Allow-Origin: *\r\n\r\n";
+        std::string hstr = sse_hdr.str();
+        if (!send_all(client_sock, hstr.data(), hstr.size())) return;
+
+        std::string out_file, err_msg;
+        bool ok = pull_model_from_hub(source, "models", out_file, err_msg,
+            [&](size_t downloaded, size_t total, double mb_s, double eta_s) {
+                double pct = (total > 0) ? (static_cast<double>(downloaded) * 100.0 / static_cast<double>(total)) : 0.0;
+                std::ostringstream ev;
+                ev << "data: {\"status\":\"downloading\",\"downloaded\":" << downloaded
+                   << ",\"total\":" << total
+                   << ",\"percent\":" << std::fixed << std::setprecision(1) << pct
+                   << ",\"mb_per_sec\":" << mb_s
+                   << ",\"eta_sec\":" << eta_s << "}\n\n";
+                std::string chunk = ev.str();
+                send_all(client_sock, chunk.data(), chunk.size());
+            }
+        );
+
+        std::ostringstream fin;
+        if (ok) {
+            fin << "data: {\"status\":\"done\",\"file\":\"" << json_escape(out_file) << "\"}\n\n";
+        } else {
+            fin << "data: {\"status\":\"error\",\"error\":\"" << json_escape(err_msg) << "\"}\n\n";
+        }
+        std::string fstr = fin.str();
+        send_all(client_sock, fstr.data(), fstr.size());
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // 0a-4. POST /v1/embeddings (OpenAI-Compatible Mean-Pooled Hidden Embeddings)
+    // ------------------------------------------------------------------------
+    if (method == "POST" && path == "/v1/embeddings") {
+        std::string input_text = extract_json_string(body, "input", "");
+        if (input_text.empty()) {
+            auto arr = extract_json_string_array(body, "input");
+            if (!arr.empty()) input_text = arr[0];
+        }
+        if (input_text.empty()) {
+            send_http_json(client_sock, 400, "Bad Request", "{\"error\":\"Missing input text\"}");
+            return;
+        }
+
+        auto emb = engine_.compute_embeddings(input_text);
+        std::ostringstream js;
+        js << "{"
+           << "\"object\":\"list\","
+           << "\"model\":\"" << json_escape(engine_.hparams().model_name) << "\","
+           << "\"data\":[{\"object\":\"embedding\",\"index\":0,\"embedding\":[";
+        for (size_t i = 0; i < emb.size(); ++i) {
+            if (i > 0) js << ",";
+            js << std::fixed << std::setprecision(6) << emb[i];
+        }
+        js << "]}],"
+           << "\"usage\":{\"prompt_tokens\":" << (input_text.size() / 4 + 1) << ",\"total_tokens\":" << (input_text.size() / 4 + 1) << "}"
            << "}";
         send_http_json(client_sock, 200, "OK", js.str());
         return;
@@ -872,7 +989,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     // 4. POST /v1/chat/completions, /v1/completions, /api/chat, /api/generate
     // ------------------------------------------------------------------------
     if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions" || path == "/api/chat" || path == "/api/generate")) {
-        std::string user_prompt = extract_chat_prompt(body);
+        std::string user_prompt = format_chat_prompt_for_arch(body, engine_.hparams().arch);
         bool stream = extract_json_bool(body, "stream", true);
         uint32_t max_tokens = static_cast<uint32_t>(std::clamp(extract_json_number(body, "max_tokens", 1024.0), 1.0, 4096.0));
         uint32_t slot_id = static_cast<uint32_t>(std::max(0.0, extract_json_number(body, "cache_slot", 0.0)));

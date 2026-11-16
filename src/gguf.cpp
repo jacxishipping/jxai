@@ -214,6 +214,13 @@ bool read_gguf_value(BinaryCursor& cur, GGUFValueType vtype, GGUFValue& val) {
                 for (uint64_t i = 0; i < arr_len; ++i) {
                     if (!cur.read(val.i32_arr[static_cast<size_t>(i)])) return false;
                 }
+            } else if (etype == GGUFValueType::BOOL || etype == GGUFValueType::UINT8 || etype == GGUFValueType::INT8) {
+                val.i32_arr.resize(static_cast<size_t>(arr_len));
+                for (uint64_t i = 0; i < arr_len; ++i) {
+                    uint8_t b = 0;
+                    if (!cur.read(b)) return false;
+                    val.i32_arr[static_cast<size_t>(i)] = static_cast<int32_t>(b);
+                }
             } else {
                 for (uint64_t i = 0; i < arr_len; ++i) {
                     GGUFValue dummy;

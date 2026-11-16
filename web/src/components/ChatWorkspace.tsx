@@ -115,6 +115,15 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   const [models, setModels] = useState<LocalModelInfo[]>([]);
   const [isSwitchingModel, setIsSwitchingModel] = useState(false);
   const [slotStats, setSlotStats] = useState<KVSlotInfo | null>(null);
+  const [renamingSlotId, setRenamingSlotId] = useState<number | null>(null);
+  const [renamingText, setRenamingText] = useState('');
+  const [streamTokens, setStreamTokens] = useState(0);
+  const [streamElapsedSec, setStreamElapsedSec] = useState(0);
+  const [isPullOpen, setIsPullOpen] = useState(false);
+  const [pullSource, setPullSource] = useState('');
+  const [pullStatus, setPullStatus] = useState('');
+  const [pullPercent, setPullPercent] = useState(0);
+  const [isPulling, setIsPulling] = useState(false);
 
   const abortControllerRef = useRef<AbortController | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -212,6 +221,8 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     isContinue: boolean
   ) => {
     setIsStreaming(true);
+    setStreamTokens(0);
+    setStreamElapsedSec(0);
     const controller = new AbortController();
     abortControllerRef.current = controller;
     setCollapsedReasoning(prev => ({ ...prev, [assistantMsgId]: false }));
@@ -219,6 +230,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     const requestStartTime = performance.now();
     let ttftRecorded = false;
     let ttftMs = 0;
+    let tokenCount = 0;
 
     try {
       const response = await fetch('/v1/chat/completions', {
@@ -268,6 +280,11 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
             if (!ttftRecorded && (delta?.reasoning_content || delta?.content)) {
               ttftMs = performance.now() - requestStartTime;
               ttftRecorded = true;
+            }
+            if (delta?.reasoning_content || delta?.content) {
+              tokenCount++;
+              setStreamTokens(tokenCount);
+              setStreamElapsedSec((performance.now() - requestStartTime) / 1000);
             }
 
             if (delta?.content && !collapsedReasoning[assistantMsgId]) {
@@ -494,6 +511,54 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     });
   };
 
+  const handlePullModel = async () => {
+    if (!pullSource.trim() || isPulling) return;
+    setIsPulling(true);
+    setPullPercent(0);
+    setPullStatus('Connecting to Hugging Face Hub...');
+    try {
+      const res = await fetch('/v1/models/pull', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ source: pullSource.trim() })
+      });
+      if (!res.body) throw new Error('No response stream');
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = '';
+      while (true) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        const lines = buf.split('\n');
+        buf = lines.pop() || '';
+        for (const line of lines) {
+          const trimmed = line.trim();
+          if (!trimmed.startsWith('data: ')) continue;
+          try {
+            const ev = JSON.parse(trimmed.slice(6));
+            if (ev.status === 'downloading') {
+              setPullPercent(ev.percent || 0);
+              const dlMb = ((ev.downloaded || 0) / (1024 * 1024)).toFixed(1);
+              const totMb = ((ev.total || 0) / (1024 * 1024)).toFixed(1);
+              setPullStatus(`${dlMb} / ${totMb} MB (${(ev.mb_per_sec || 0).toFixed(1)} MB/s, ETA ${Math.round(ev.eta_sec || 0)}s)`);
+            } else if (ev.status === 'done') {
+              setPullPercent(100);
+              setPullStatus(`Downloaded: ${ev.file}`);
+              await fetchModelsAndSlots();
+            } else if (ev.status === 'error') {
+              setPullStatus(`Error: ${ev.error}`);
+            }
+          } catch {}
+        }
+      }
+    } catch (err) {
+      setPullStatus(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    } finally {
+      setIsPulling(false);
+    }
+  };
+
   const toggleReasoning = (id: string) => {
     setCollapsedReasoning(prev => ({ ...prev, [id]: !prev[id] }));
   };
@@ -557,20 +622,61 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                       : 'text-slate-400 hover:bg-slate-800/60 hover:text-slate-200 border border-transparent'
                   }`}
                 >
-                  <div className="truncate pr-2">
-                    <div className="font-medium truncate">{sess.title}</div>
-                    <div className="text-[10px] font-mono text-slate-500">KV Slot #{sess.slotId}</div>
+                  {renamingSlotId === sess.slotId ? (
+                    <input
+                      autoFocus
+                      value={renamingText}
+                      onChange={e => setRenamingText(e.target.value)}
+                      onClick={e => e.stopPropagation()}
+                      onKeyDown={e => {
+                        if (e.key === 'Enter') {
+                          const next = renamingText.trim();
+                          if (next) {
+                            setSessions(prev => prev.map(s => (s.slotId === sess.slotId ? { ...s, title: next } : s)));
+                          }
+                          setRenamingSlotId(null);
+                        } else if (e.key === 'Escape') {
+                          setRenamingSlotId(null);
+                        }
+                      }}
+                      onBlur={() => {
+                        const next = renamingText.trim();
+                        if (next) {
+                          setSessions(prev => prev.map(s => (s.slotId === sess.slotId ? { ...s, title: next } : s)));
+                        }
+                        setRenamingSlotId(null);
+                      }}
+                      className="flex-1 bg-slate-900 border border-blue-500 rounded px-1.5 py-0.5 text-xs text-slate-100 focus:outline-none mr-1"
+                    />
+                  ) : (
+                    <div className="truncate pr-2">
+                      <div className="font-medium truncate">{sess.title}</div>
+                      <div className="text-[10px] font-mono text-slate-500">KV Slot #{sess.slotId}</div>
+                    </div>
+                  )}
+                  <div className="flex items-center space-x-0.5 opacity-0 group-hover:opacity-100 transition-opacity">
+                    <button
+                      onClick={e => {
+                        e.stopPropagation();
+                        setRenamingSlotId(sess.slotId);
+                        setRenamingText(sess.title);
+                      }}
+                      className="p-1 text-slate-500 hover:text-blue-400"
+                      title="Rename session"
+                    >
+                      <Pencil className="w-3 h-3" />
+                    </button>
+                    <button
+                      onClick={e => {
+                        e.stopPropagation();
+                        handleDeleteSession(sess.slotId);
+                      }}
+                      className="p-1 text-slate-500 hover:text-red-400"
+                      title="Delete session"
+                    >
+                      <Trash2 className="w-3 h-3" />
+                    </button>
                   </div>
-                  <button
-                    onClick={e => {
-                      e.stopPropagation();
-                      handleDeleteSession(sess.slotId);
-                    }}
-                    className="opacity-0 group-hover:opacity-100 p-1 text-slate-500 hover:text-red-400 transition-opacity"
-                    title="Delete session"
-                  >
-                    <Trash2 className="w-3 h-3" />
-                  </button>
                 </div>
               );
             })}
@@ -628,6 +734,13 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
                       </option>
                     ))}
                   </select>
+                  <button
+                    onClick={() => setIsPullOpen(true)}
+                    className="px-2 py-1 rounded-lg bg-slate-900 border border-slate-700/80 text-[11px] font-mono text-cyan-400 hover:bg-slate-800 transition-colors"
+                    title="Download GGUF model from Hugging Face"
+                  >
+                    + Pull
+                  </button>
                   {isSwitchingModel && <Loader2 className="w-3.5 h-3.5 animate-spin text-blue-400" />}
                 </div>
               ) : (
@@ -916,15 +1029,20 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
             />
 
             {isStreaming ? (
-              <button
-                type="button"
-                onClick={handleStop}
-                className="px-5 py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white font-medium text-sm transition-all duration-200 shadow-lg shadow-red-600/20 flex items-center space-x-2"
-                title="Stop generating"
-              >
-                <span>Stop</span>
-                <Square className="w-3.5 h-3.5 fill-current" />
-              </button>
+              <div className="flex items-center space-x-2">
+                <span className="text-[11px] font-mono text-emerald-400 px-2 py-1 rounded-lg bg-slate-900 border border-slate-800 whitespace-nowrap">
+                  {streamTokens} tok • {streamElapsedSec.toFixed(1)}s
+                </span>
+                <button
+                  type="button"
+                  onClick={handleStop}
+                  className="px-5 py-3 rounded-xl bg-red-600 hover:bg-red-500 text-white font-medium text-sm transition-all duration-200 shadow-lg shadow-red-600/20 flex items-center space-x-2"
+                  title="Stop generating"
+                >
+                  <span>Stop</span>
+                  <Square className="w-3.5 h-3.5 fill-current" />
+                </button>
+              </div>
             ) : (
               <button
                 type="submit"
@@ -992,6 +1110,62 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
           )}
         </div>
       </div>
+      {/* Hugging Face GGUF Model Pull Modal */}
+      {isPullOpen && (
+        <div className="fixed inset-0 z-50 bg-black/75 backdrop-blur-sm flex items-center justify-center p-6">
+          <div className="bg-slate-900 border border-slate-800 rounded-2xl w-full max-w-md p-6 shadow-2xl space-y-4">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-3">
+              <h3 className="text-sm font-bold text-slate-100 font-mono">Download GGUF Model (/v1/models/pull)</h3>
+              <button
+                onClick={() => !isPulling && setIsPullOpen(false)}
+                className="text-slate-400 hover:text-slate-200"
+              >
+                <X className="w-4 h-4" />
+              </button>
+            </div>
+            <div className="space-y-2">
+              <label className="block text-xs font-mono text-slate-400">
+                Hugging Face repo:file or direct .gguf URL
+              </label>
+              <input
+                type="text"
+                value={pullSource}
+                onChange={e => setPullSource(e.target.value)}
+                placeholder="Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_0.gguf"
+                className="w-full bg-slate-950 border border-slate-700 rounded-xl px-3 py-2 text-xs font-mono text-slate-100 focus:outline-none focus:ring-2 focus:ring-cyan-500/50"
+              />
+            </div>
+            {pullStatus && (
+              <div className="space-y-1.5">
+                <div className="w-full bg-slate-950 rounded-full h-2.5 overflow-hidden border border-slate-800">
+                  <div
+                    style={{ width: `${Math.min(100, pullPercent)}%` }}
+                    className="h-full bg-gradient-to-r from-cyan-500 to-blue-500 transition-all"
+                  />
+                </div>
+                <div className="text-[11px] font-mono text-slate-300">{pullStatus}</div>
+              </div>
+            )}
+            <div className="flex justify-end space-x-2 pt-2">
+              <button
+                onClick={() => setIsPullOpen(false)}
+                disabled={isPulling}
+                className="px-4 py-2 rounded-xl text-xs text-slate-400 hover:bg-slate-800 disabled:opacity-50"
+              >
+                Close
+              </button>
+              <button
+                onClick={handlePullModel}
+                disabled={isPulling || !pullSource.trim()}
+                className="px-4 py-2 rounded-xl bg-cyan-600 hover:bg-cyan-500 text-white text-xs font-medium disabled:opacity-50 flex items-center space-x-1.5"
+              >
+                {isPulling && <Loader2 className="w-3.5 h-3.5 animate-spin" />}
+                <span>{isPulling ? 'Downloading...' : 'Download'}</span>
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 };

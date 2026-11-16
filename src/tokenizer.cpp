@@ -110,6 +110,7 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
     special_tokens_.clear();
     has_byte_fallback_ = false;
     is_byte_level_bpe_ = false;
+    is_sentencepiece_ = false;
 
     const auto& meta = mf.metadata();
     auto it_tok = meta.find("tokenizer.ggml.tokens");
@@ -133,6 +134,8 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
     std::string tok_model = mf.get_str("tokenizer.ggml.model", "");
     if (tok_model == "gpt2") {
         is_byte_level_bpe_ = true;
+    } else if (tok_model == "llama" || tok_model == "gemma" || tok_model == "gemma4") {
+        is_sentencepiece_ = true;
     } else {
         for (const auto& m : merge_ranks_) {
             if (m.first.find("\xC4\xA0") != std::string::npos) {
@@ -178,12 +181,12 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
         const std::string& t = vocab_[i];
         token_to_id_[t] = i;
 
-        if (t == "<s>" || t == "<|begin_of_text|>") bos_id_ = i;
-        else if (t == "</s>" || t == "<|endoftext|>" || t == "<|end_of_text|>") eos_id_ = i;
+        if (t == "<s>" || t == "<|begin_of_text|>" || t == "<bos>") bos_id_ = i;
+        else if (t == "</s>" || t == "<|endoftext|>" || t == "<|end_of_text|>" || t == "<eos>" || t == "<turn|>") eos_id_ = i;
         else if (t == "<|im_start|>") im_start_id_ = i;
         else if (t == "<|im_end|>") im_end_id_ = i;
-        else if (t == "<think>") think_start_id_ = i;
-        else if (t == "</think>") think_end_id_ = i;
+        else if (t == "<think>" || t == "<|channel>") think_start_id_ = i;
+        else if (t == "</think>" || t == "<channel|>") think_end_id_ = i;
 
         // Detect <0xXX> byte fallback tokens
         if (t.size() == 6 && t[0] == '<' && t[1] == '0' && (t[2] == 'x' || t[2] == 'X') && t[5] == '>') {
@@ -297,6 +300,15 @@ std::vector<uint32_t> Tokenizer::encode_segment_bpe(const std::string& segment) 
         text_for_bpe.reserve(segment.size() * 2);
         for (unsigned char b : segment) {
             text_for_bpe += codepoint_to_utf8(kByteToUnicode[b]);
+        }
+    } else if (is_sentencepiece_) {
+        text_for_bpe.reserve(segment.size() * 2);
+        for (char ch : segment) {
+            if (ch == ' ') {
+                text_for_bpe += "\xE2\x96\x81";
+            } else {
+                text_for_bpe.push_back(ch);
+            }
         }
     } else {
         text_for_bpe = segment;

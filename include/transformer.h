@@ -22,16 +22,37 @@ struct ModelHyperparams {
     uint32_t n_heads = 4;
     uint32_t n_kv_heads = 2;
     uint32_t head_dim = 32;
+    uint32_t q_dim = 128;
+    uint32_t kv_dim = 64;
     uint32_t rope_dim = 32;
     uint32_t n_experts = 8;
     uint32_t n_experts_used = 2;
     uint32_t max_seq_len = 2048;
+    uint32_t kv_cache_capacity = 2048;
+    uint32_t ple_dim = 0;
+    uint32_t sliding_window = 0;
+    uint32_t shared_kv_layers = 0;
+    uint32_t rope_dim_swa = 0;
+    float    rope_freq_base_swa = 10000.0f;
+    float    final_logit_softcapping = 0.0f;
+    bool     use_gelu = false;
+    bool     scale_embeddings = false;
+    bool     v_norm = false;
     float    rms_norm_eps = 1e-5f;
     float    rope_freq_base = 10000.0f;
     float    yarn_scale = 1.0f;
 };
 
 struct LayerDenseWeights {
+    uint32_t q_dim = 0;
+    uint32_t kv_dim = 0;
+    uint32_t head_dim = 0;
+    uint32_t rope_dim = 0;
+    uint32_t kv_source_layer = 0;
+    bool     shares_kv = false;
+    float    rope_freq_base = 10000.0f;
+    bool     is_swa = false;
+
     const TensorDescriptor* attn_norm = nullptr;
     const TensorDescriptor* wq = nullptr;
     const TensorDescriptor* wk = nullptr;
@@ -40,10 +61,23 @@ struct LayerDenseWeights {
     const TensorDescriptor* bq = nullptr;
     const TensorDescriptor* bk = nullptr;
     const TensorDescriptor* bv = nullptr;
+    const TensorDescriptor* bo = nullptr;
     const TensorDescriptor* attn_q_norm = nullptr;
     const TensorDescriptor* attn_k_norm = nullptr;
+    const TensorDescriptor* post_attn_norm = nullptr;
     const TensorDescriptor* ffn_norm = nullptr;
+    const TensorDescriptor* post_ffw_norm = nullptr;
+    const TensorDescriptor* inp_gate = nullptr;
+    const TensorDescriptor* ple_proj = nullptr;
+    const TensorDescriptor* post_norm = nullptr;
+    const TensorDescriptor* layer_output_scale = nullptr;
     const TensorDescriptor* router_gate = nullptr; // [n_experts, dim]
+
+    // Shared Expert weights (Qwen2.5-MoE / DeepSeek-MoE)
+    const TensorDescriptor* shexp_gate = nullptr;
+    const TensorDescriptor* shexp_up   = nullptr;
+    const TensorDescriptor* shexp_down = nullptr;
+    const TensorDescriptor* shexp_gate_inp = nullptr;
 
     // Sparse experts on NVMe disk (per expert slice offsets) or zero-copy mapped FFN
     bool is_dense_ffn = false;
@@ -78,14 +112,15 @@ struct KVCacheSlot {
     uint32_t compactions = 0;
     std::vector<uint32_t> token_history;
     std::vector<uint32_t> page_table;
-    // [n_layers][max_seq_len * n_kv_heads * head_dim]
-    std::vector<std::vector<float>> k_cache;
-    std::vector<std::vector<float>> v_cache;
+    // FP16 KV Cache: [n_layers][max_seq_len * kv_dim]
+    std::vector<std::vector<uint16_t>> k_cache;
+    std::vector<std::vector<uint16_t>> v_cache;
 
     void init(uint32_t id, const ModelHyperparams& hp);
     void clear();
     // Compact KV cache by retaining sink tokens (first 4) + most recent window
     void compact(const ModelHyperparams& hp, uint32_t keep_recent = 128);
+    void rollback(uint32_t new_seq_pos);
     uint32_t pages_allocated() const {
         return (seq_pos == 0) ? 0 : static_cast<uint32_t>((seq_pos + KV_BLOCK_TOKENS - 1) / KV_BLOCK_TOKENS);
     }
@@ -134,7 +169,8 @@ public:
     static void apply_rope(
         float* q, float* k,
         uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
-        uint32_t pos, float freq_base, float yarn_scale = 1.0f, bool is_neox = true
+        uint32_t pos, float freq_base, float yarn_scale = 1.0f, bool is_neox = true,
+        const float* rope_freqs = nullptr
     );
     static void softmax(float* x, int64_t size);
     static float silu(float x) { return x / (1.0f + std::exp(-x)); }
@@ -145,8 +181,12 @@ public:
         uint32_t token_id,
         uint32_t slot_id,
         ProfileSample* out_profile = nullptr,
-        bool compute_logits = true
+        bool compute_logits = true,
+        std::vector<float>* out_hidden = nullptr
     );
+
+    // Compute L2-normalized mean-pooled hidden-state embedding for `text`
+    std::vector<float> compute_embeddings(const std::string& text);
 
     // Sample next token ID from logits using temperature, top-K, top-P, repetition penalty
     uint32_t sample_next_token(
@@ -216,6 +256,10 @@ private:
     const TensorDescriptor* tok_emb_ = nullptr;
     const TensorDescriptor* out_norm_ = nullptr;
     const TensorDescriptor* lm_head_ = nullptr;
+    const TensorDescriptor* per_layer_tok_emb_ = nullptr;
+    const TensorDescriptor* per_layer_model_proj_ = nullptr;
+    const TensorDescriptor* per_layer_proj_norm_ = nullptr;
+    const TensorDescriptor* rope_freqs_ = nullptr;
     std::vector<LayerDenseWeights> layers_;
 
     uint64_t dense_bytes_ = 0;

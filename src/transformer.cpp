@@ -11,17 +11,27 @@ void KVCacheSlot::init(uint32_t id, const ModelHyperparams& hp) {
     seq_pos = 0;
     compactions = 0;
     token_history.clear();
-    size_t kv_dim = static_cast<size_t>(hp.n_kv_heads) * static_cast<size_t>(hp.head_dim);
-    size_t cap = static_cast<size_t>(hp.max_seq_len) * kv_dim;
-    k_cache.assign(hp.n_layers, std::vector<float>(cap, 0.0f));
-    v_cache.assign(hp.n_layers, std::vector<float>(cap, 0.0f));
+    size_t kv_dim = static_cast<size_t>(hp.kv_dim);
+    uint32_t alloc_seq = std::max(1u, hp.kv_cache_capacity);
+    size_t cap = static_cast<size_t>(alloc_seq) * kv_dim;
+    k_cache.assign(hp.n_layers, std::vector<uint16_t>(cap, 0));
+    v_cache.assign(hp.n_layers, std::vector<uint16_t>(cap, 0));
 }
 
 void KVCacheSlot::clear() {
     seq_pos = 0;
     token_history.clear();
-    for (auto& k : k_cache) std::fill(k.begin(), k.end(), 0.0f);
-    for (auto& v : v_cache) std::fill(v.begin(), v.end(), 0.0f);
+    for (auto& k : k_cache) std::fill(k.begin(), k.end(), static_cast<uint16_t>(0));
+    for (auto& v : v_cache) std::fill(v.begin(), v.end(), static_cast<uint16_t>(0));
+}
+
+void KVCacheSlot::rollback(uint32_t new_seq_pos) {
+    if (new_seq_pos < seq_pos) {
+        seq_pos = new_seq_pos;
+    }
+    if (token_history.size() > new_seq_pos) {
+        token_history.resize(new_seq_pos);
+    }
 }
 
 void KVCacheSlot::compact(const ModelHyperparams& hp, uint32_t keep_recent) {
@@ -30,21 +40,24 @@ void KVCacheSlot::compact(const ModelHyperparams& hp, uint32_t keep_recent) {
 
     uint32_t new_len = sink_tokens + keep_recent;
     uint32_t src_start = seq_pos - keep_recent;
-    size_t kv_dim = static_cast<size_t>(hp.n_kv_heads) * static_cast<size_t>(hp.head_dim);
+    size_t kv_dim = static_cast<size_t>(hp.kv_dim);
 
     for (uint32_t l = 0; l < hp.n_layers; ++l) {
         std::memmove(
             k_cache[l].data() + sink_tokens * kv_dim,
             k_cache[l].data() + src_start * kv_dim,
-            keep_recent * kv_dim * sizeof(float)
+            keep_recent * kv_dim * sizeof(uint16_t)
         );
         std::memmove(
             v_cache[l].data() + sink_tokens * kv_dim,
             v_cache[l].data() + src_start * kv_dim,
-            keep_recent * kv_dim * sizeof(float)
+            keep_recent * kv_dim * sizeof(uint16_t)
         );
     }
     seq_pos = new_len;
+    if (token_history.size() > new_len) {
+        token_history.resize(new_len);
+    }
     compactions++;
 }
 
@@ -59,7 +72,8 @@ void MoETransformerEngine::rms_norm(float* out, const float* x, const float* wei
 void MoETransformerEngine::apply_rope(
     float* q, float* k,
     uint32_t n_heads, uint32_t n_kv_heads, uint32_t head_dim, uint32_t rope_dim,
-    uint32_t pos, float freq_base, float yarn_scale, bool is_neox
+    uint32_t pos, float freq_base, float yarn_scale, bool is_neox,
+    const float* rope_freqs
 ) {
     uint32_t rdim = std::min(head_dim, rope_dim);
     float pos_scaled = static_cast<float>(pos) / std::max(1e-4f, yarn_scale);
@@ -68,6 +82,7 @@ void MoETransformerEngine::apply_rope(
         uint32_t half = rdim / 2;
         for (uint32_t d = 0; d < half; ++d) {
             float freq = 1.0f / std::pow(freq_base, (2.0f * static_cast<float>(d)) / static_cast<float>(rdim));
+            if (rope_freqs) freq /= rope_freqs[d];
             float angle = pos_scaled * freq;
             float cos_a = std::cos(angle);
             float sin_a = std::sin(angle);
@@ -187,8 +202,20 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
     hp_.n_experts      = model_file_.get_u32(pfx + ".expert_count", 8);
     hp_.n_experts_used = model_file_.get_u32(pfx + ".expert_used_count", 2);
     hp_.max_seq_len    = model_file_.get_u32(pfx + ".context_length", 2048);
+    hp_.kv_cache_capacity = std::min<uint32_t>(hp_.max_seq_len, 4096);
     hp_.rms_norm_eps   = model_file_.get_f32(pfx + ".attention.layer_norm_rms_epsilon", 1e-5f);
     hp_.rope_freq_base = model_file_.get_f32(pfx + ".rope.freq_base", 10000.0f);
+    hp_.rope_freq_base_swa = model_file_.get_f32(pfx + ".rope.freq_base_swa", hp_.rope_freq_base);
+    hp_.sliding_window = model_file_.get_u32(pfx + ".attention.sliding_window", 0);
+    hp_.shared_kv_layers = model_file_.get_u32(pfx + ".attention.shared_kv_layers", 0);
+    hp_.ple_dim        = model_file_.get_u32(pfx + ".embedding_length_per_layer_input", 0);
+    hp_.rope_dim_swa   = model_file_.get_u32(pfx + ".rope.dimension_count_swa", 0);
+    hp_.final_logit_softcapping = model_file_.get_f32(pfx + ".final_logit_softcapping", 0.0f);
+
+    bool is_gemma_family = (hp_.arch == "gemma" || hp_.arch == "gemma2" || hp_.arch == "gemma3" || hp_.arch == "gemma4");
+    hp_.use_gelu = is_gemma_family;
+    hp_.scale_embeddings = is_gemma_family;
+    hp_.v_norm = (hp_.arch == "gemma4");
 
     tok_emb_ = model_file_.find_tensor("token_embd.weight");
     if (!tok_emb_) tok_emb_ = model_file_.find_tensor("model.embed_tokens.weight");
@@ -201,12 +228,38 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
         hp_.dim = static_cast<uint32_t>(tok_emb_->dims[0]);
         hp_.vocab_size = static_cast<uint32_t>(tok_emb_->dims[1]);
     }
-    hp_.head_dim = std::max(1u, hp_.dim / std::max(1u, hp_.n_heads));
+    hp_.head_dim = model_file_.get_u32(
+        pfx + ".attention.key_length",
+        std::max(1u, hp_.dim / std::max(1u, hp_.n_heads))
+    );
+    hp_.q_dim  = hp_.n_heads * hp_.head_dim;
+    hp_.kv_dim = hp_.n_kv_heads * hp_.head_dim;
+    if (const auto* wq0 = model_file_.find_tensor("blk.0.attn_q.weight")) {
+        if (wq0->n_dims >= 2 && wq0->dims[1] > 0) {
+            hp_.q_dim = static_cast<uint32_t>(wq0->dims[1]);
+            hp_.head_dim = std::max(1u, hp_.q_dim / std::max(1u, hp_.n_heads));
+        }
+    }
+    if (const auto* wk0 = model_file_.find_tensor("blk.0.attn_k.weight")) {
+        if (wk0->n_dims >= 2 && wk0->dims[1] > 0) {
+            hp_.kv_dim = static_cast<uint32_t>(wk0->dims[1]);
+        }
+    }
     hp_.rope_dim = model_file_.get_u32(pfx + ".rope.dimension_count", hp_.head_dim);
 
     out_norm_ = model_file_.find_tensor("output_norm.weight");
     lm_head_  = model_file_.find_tensor("output.weight");
     if (!lm_head_) lm_head_ = tok_emb_; // weight-tied fallback
+    per_layer_tok_emb_    = model_file_.find_tensor("per_layer_token_embd.weight");
+    per_layer_model_proj_ = model_file_.find_tensor("per_layer_model_proj.weight");
+    per_layer_proj_norm_  = model_file_.find_tensor("per_layer_proj_norm.weight");
+    rope_freqs_           = model_file_.find_tensor("rope_freqs.weight");
+
+    std::vector<int32_t> swa_pattern;
+    auto swa_it = model_file_.metadata().find(pfx + ".attention.sliding_window_pattern");
+    if (swa_it != model_file_.metadata().end()) {
+        swa_pattern = swa_it->second.i32_arr;
+    }
 
     dense_bytes_ = 0;
     sparse_bytes_ = 0;
@@ -214,6 +267,11 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
         if (kv.second.is_sparse_expert) sparse_bytes_ += kv.second.byte_size;
         else dense_bytes_ += kv.second.byte_size;
     }
+
+    uint32_t last_swa_kv_layer = 0;
+    uint32_t last_full_kv_layer = 0;
+    const uint32_t first_shared_kv = (hp_.shared_kv_layers > 0 && hp_.n_layers > hp_.shared_kv_layers)
+                                   ? (hp_.n_layers - hp_.shared_kv_layers) : hp_.n_layers;
 
     layers_.resize(hp_.n_layers);
     for (uint32_t l = 0; l < hp_.n_layers; ++l) {
@@ -229,8 +287,45 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
         lw.attn_q_norm = model_file_.find_tensor(bp + "attn_q_norm.weight");
         lw.attn_k_norm = model_file_.find_tensor(bp + "attn_k_norm.weight");
         lw.wo          = model_file_.find_tensor(bp + "attn_output.weight");
+        lw.bo          = model_file_.find_tensor(bp + "attn_output.bias");
+        lw.post_attn_norm = model_file_.find_tensor(bp + "post_attention_norm.weight");
         lw.ffn_norm    = model_file_.find_tensor(bp + "ffn_norm.weight");
+        lw.post_ffw_norm  = model_file_.find_tensor(bp + "post_ffw_norm.weight");
+        lw.inp_gate       = model_file_.find_tensor(bp + "inp_gate.weight");
+        lw.ple_proj       = model_file_.find_tensor(bp + "proj.weight");
+        lw.post_norm      = model_file_.find_tensor(bp + "post_norm.weight");
+        lw.layer_output_scale = model_file_.find_tensor(bp + "layer_output_scale.weight");
         lw.router_gate = model_file_.find_tensor(bp + "ffn_gate_inp.weight");
+
+        lw.q_dim = (lw.wq && lw.wq->n_dims >= 2 && lw.wq->dims[1] > 0)
+                 ? static_cast<uint32_t>(lw.wq->dims[1]) : hp_.q_dim;
+        lw.kv_dim = (lw.wk && lw.wk->n_dims >= 2 && lw.wk->dims[1] > 0)
+                  ? static_cast<uint32_t>(lw.wk->dims[1]) : hp_.kv_dim;
+        lw.head_dim = std::max(1u, lw.q_dim / std::max(1u, hp_.n_heads));
+        lw.is_swa = (l < swa_pattern.size()) ? (swa_pattern[l] != 0)
+                  : (hp_.sliding_window > 0 && lw.head_dim < hp_.head_dim);
+        lw.rope_freq_base = lw.is_swa ? hp_.rope_freq_base_swa : hp_.rope_freq_base;
+        lw.rope_dim = (lw.is_swa && hp_.rope_dim_swa > 0) ? hp_.rope_dim_swa
+                    : std::min(lw.head_dim, hp_.rope_dim > 0 ? hp_.rope_dim : lw.head_dim);
+
+        if (l < first_shared_kv) {
+            lw.shares_kv = false;
+            lw.kv_source_layer = l;
+            if (lw.is_swa) last_swa_kv_layer = l;
+            else last_full_kv_layer = l;
+        } else {
+            lw.shares_kv = true;
+            lw.kv_source_layer = lw.is_swa ? last_swa_kv_layer : last_full_kv_layer;
+        }
+
+        hp_.q_dim  = std::max(hp_.q_dim, lw.q_dim);
+        hp_.kv_dim = std::max(hp_.kv_dim, lw.kv_dim);
+
+        // Shared expert tensors (Qwen2.5-MoE / DeepSeek-MoE)
+        lw.shexp_gate     = model_file_.find_tensor(bp + "ffn_gate_shexp.weight");
+        lw.shexp_up       = model_file_.find_tensor(bp + "ffn_up_shexp.weight");
+        lw.shexp_down     = model_file_.find_tensor(bp + "ffn_down_shexp.weight");
+        lw.shexp_gate_inp = model_file_.find_tensor(bp + "ffn_gate_inp_shexp.weight");
 
         const TensorDescriptor* t_gate_exps = model_file_.find_tensor(bp + "ffn_gate_exps.weight");
         const TensorDescriptor* t_up_exps   = model_file_.find_tensor(bp + "ffn_up_exps.weight");
@@ -329,7 +424,8 @@ bool MoETransformerEngine::clear_slot(uint32_t slot_id) {
 }
 
 size_t MoETransformerEngine::active_slot_count() const {
-    std::lock_guard<std::mutex> lk(engine_mtx_);
+    std::unique_lock<std::mutex> lk(engine_mtx_, std::try_to_lock);
+    if (!lk.owns_lock()) return 1;
     return kv_slots_.size();
 }
 
@@ -344,7 +440,7 @@ std::vector<KVSlotSummary> MoETransformerEngine::list_slots() const {
         sum.pages_allocated = slot.pages_allocated();
         sum.compactions = slot.compactions;
         sum.token_count = slot.token_history.size();
-        sum.memory_bytes = static_cast<size_t>(slot.pages_allocated()) * KV_BLOCK_TOKENS * kv_dim * sizeof(float) * hp_.n_layers * 2;
+        sum.memory_bytes = static_cast<size_t>(slot.pages_allocated()) * KV_BLOCK_TOKENS * hp_.kv_dim * sizeof(uint16_t) * hp_.n_layers * 2;
         out.push_back(sum);
     }
     std::sort(out.begin(), out.end(), [](const auto& a, const auto& b) { return a.slot_id < b.slot_id; });
@@ -362,7 +458,7 @@ PagedBlockStats MoETransformerEngine::paged_block_stats() const {
     }
     st.free_blocks = (st.total_blocks > st.used_blocks) ? (st.total_blocks - st.used_blocks) : 0;
     st.block_size_tokens = KV_BLOCK_TOKENS;
-    st.memory_bytes = st.used_blocks * KV_BLOCK_TOKENS * kv_dim * sizeof(float) * hp_.n_layers * 2;
+    st.memory_bytes = st.used_blocks * KV_BLOCK_TOKENS * hp_.kv_dim * sizeof(uint16_t) * hp_.n_layers * 2;
     return st;
 }
 
@@ -375,7 +471,8 @@ std::vector<float> MoETransformerEngine::forward_token(
     uint32_t token_id,
     uint32_t slot_id,
     ProfileSample* out_profile,
-    bool compute_logits
+    bool compute_logits,
+    std::vector<float>* out_hidden
 ) {
     std::lock_guard<std::mutex> lk(engine_mtx_);
     const double t_start = now_ms();
@@ -389,14 +486,15 @@ std::vector<float> MoETransformerEngine::forward_token(
 
     tier_mgr_.step_tick();
     KVCacheSlot& slot = get_or_create_slot(slot_id);
-    if (slot.seq_pos >= hp_.max_seq_len) {
-        slot.compact(hp_, hp_.max_seq_len / 2);
+    if (slot.seq_pos >= hp_.kv_cache_capacity) {
+        slot.compact(hp_, hp_.kv_cache_capacity / 2);
     }
     const uint32_t pos = slot.seq_pos;
     slot.token_history.push_back(token_id);
 
     const uint32_t dim = hp_.dim;
-    const uint32_t kv_dim = hp_.n_kv_heads * hp_.head_dim;
+    const uint32_t max_q_dim = hp_.q_dim;
+    const uint32_t max_kv_dim = hp_.kv_dim;
     const uint32_t exp_dim = hp_.moe_expert_dim;
 
     // 1. Embedding Lookup
@@ -405,13 +503,49 @@ std::vector<float> MoETransformerEngine::forward_token(
         size_t row_bytes = tensor_byte_size(tok_emb_->type, dim);
         const uint8_t* emb_row = static_cast<const uint8_t*>(tok_emb_->mapped_ptr) + token_id * row_bytes;
         dequantize_row(tok_emb_->type, emb_row, x.data(), dim);
+        if (hp_.scale_embeddings) {
+            const float emb_scale = std::sqrt(static_cast<float>(dim));
+            for (uint32_t i = 0; i < dim; ++i) x[i] *= emb_scale;
+        }
+    }
+
+    // Optional Gemma4 Per-Layer Input (PLE) pre-projection
+    std::vector<float> ple_all;
+    if (hp_.ple_dim > 0 && per_layer_tok_emb_ && per_layer_model_proj_ &&
+        per_layer_tok_emb_->mapped_ptr && per_layer_model_proj_->mapped_ptr &&
+        token_id < hp_.vocab_size) {
+        const size_t total_ple = static_cast<size_t>(hp_.n_layers) * hp_.ple_dim;
+        ple_all.resize(total_ple, 0.0f);
+        std::vector<float> ple_model(total_ple, 0.0f);
+        size_t row_bytes = tensor_byte_size(per_layer_tok_emb_->type, total_ple);
+        const uint8_t* ple_row = static_cast<const uint8_t*>(per_layer_tok_emb_->mapped_ptr) + token_id * row_bytes;
+        dequantize_row(per_layer_tok_emb_->type, ple_row, ple_all.data(), static_cast<int64_t>(total_ple));
+
+        const float ple_tok_scale = std::sqrt(static_cast<float>(hp_.ple_dim));
+        const float inv_sqrt_dim = 1.0f / std::sqrt(static_cast<float>(dim));
+        const float inv_sqrt_2 = 1.0f / std::sqrt(2.0f);
+        std::vector<float> x_ple_in(dim);
+        for (uint32_t i = 0; i < dim; ++i) x_ple_in[i] = x[i] * inv_sqrt_dim;
+        matmul_quant_f32(per_layer_model_proj_->type, per_layer_model_proj_->mapped_ptr, x_ple_in.data(), ple_model.data(), static_cast<int64_t>(total_ple), dim);
+
+        const float* pnorm_w = (per_layer_proj_norm_ && per_layer_proj_norm_->type == GGMLType::F32)
+                             ? static_cast<const float*>(per_layer_proj_norm_->mapped_ptr) : nullptr;
+        std::vector<float> ple_normed(hp_.ple_dim);
+        for (uint32_t l = 0; l < hp_.n_layers; ++l) {
+            float* m_slice = ple_model.data() + static_cast<size_t>(l) * hp_.ple_dim;
+            float* t_slice = ple_all.data()   + static_cast<size_t>(l) * hp_.ple_dim;
+            rms_norm(ple_normed.data(), m_slice, pnorm_w, hp_.ple_dim, hp_.rms_norm_eps);
+            for (uint32_t d = 0; d < hp_.ple_dim; ++d) {
+                t_slice[d] = (t_slice[d] * ple_tok_scale + ple_normed[d]) * inv_sqrt_2;
+            }
+        }
     }
 
     std::vector<float> x_norm(dim, 0.0f);
-    std::vector<float> q(dim, 0.0f);
-    std::vector<float> k(kv_dim, 0.0f);
-    std::vector<float> v(kv_dim, 0.0f);
-    std::vector<float> attn_out(dim, 0.0f);
+    std::vector<float> q(max_q_dim, 0.0f);
+    std::vector<float> k(max_kv_dim, 0.0f);
+    std::vector<float> v(max_kv_dim, 0.0f);
+    std::vector<float> attn_out(max_q_dim, 0.0f);
     std::vector<float> proj_out(dim, 0.0f);
     std::vector<float> router_logits(hp_.n_experts, 0.0f);
     std::vector<float> moe_accum(dim, 0.0f);
@@ -423,6 +557,9 @@ std::vector<float> MoETransformerEngine::forward_token(
 
     for (uint32_t l = 0; l < hp_.n_layers; ++l) {
         const LayerDenseWeights& lw = layers_[l];
+        const uint32_t q_dim = lw.q_dim > 0 ? lw.q_dim : max_q_dim;
+        const uint32_t kv_dim = lw.kv_dim > 0 ? lw.kv_dim : max_kv_dim;
+        const uint32_t head_dim = lw.head_dim > 0 ? lw.head_dim : hp_.head_dim;
 
         // 2. Attention Pre-RMSNorm
         const float* anorm_w = (lw.attn_norm && lw.attn_norm->type == GGMLType::F32)
@@ -432,7 +569,7 @@ std::vector<float> MoETransformerEngine::forward_token(
         // 3. Q, K, V Projections (Fused single OpenMP region with shared Q8_0 activation)
         double tm0 = now_ms();
         matmul_qkv_quant_f32(
-            lw.wq ? lw.wq->type : GGMLType::F32, lw.wq ? lw.wq->mapped_ptr : nullptr, dim,    q.data(),
+            lw.wq ? lw.wq->type : GGMLType::F32, lw.wq ? lw.wq->mapped_ptr : nullptr, q_dim,  q.data(),
             lw.wk ? lw.wk->type : GGMLType::F32, lw.wk ? lw.wk->mapped_ptr : nullptr, kv_dim, k.data(),
             lw.wv ? lw.wv->type : GGMLType::F32, lw.wv ? lw.wv->mapped_ptr : nullptr, kv_dim, v.data(),
             x_norm.data(), dim
@@ -440,7 +577,7 @@ std::vector<float> MoETransformerEngine::forward_token(
 
         if (lw.bq && lw.bq->type == GGMLType::F32) {
             const float* b_ptr = static_cast<const float*>(lw.bq->mapped_ptr);
-            for (uint32_t i = 0; i < dim; ++i) q[i] += b_ptr[i];
+            for (uint32_t i = 0; i < q_dim; ++i) q[i] += b_ptr[i];
         }
         if (lw.bk && lw.bk->type == GGMLType::F32) {
             const float* b_ptr = static_cast<const float*>(lw.bk->mapped_ptr);
@@ -453,14 +590,23 @@ std::vector<float> MoETransformerEngine::forward_token(
 
         if (lw.attn_q_norm && lw.attn_q_norm->type == GGMLType::F32) {
             const float* w_ptr = static_cast<const float*>(lw.attn_q_norm->mapped_ptr);
+            const bool shared_head_norm = (lw.attn_q_norm->dims[0] == head_dim);
             for (uint32_t h = 0; h < hp_.n_heads; ++h) {
-                rms_norm(q.data() + h * hp_.head_dim, q.data() + h * hp_.head_dim, w_ptr + h * hp_.head_dim, hp_.head_dim, hp_.rms_norm_eps);
+                const float* hw = shared_head_norm ? w_ptr : (w_ptr + h * head_dim);
+                rms_norm(q.data() + h * head_dim, q.data() + h * head_dim, hw, head_dim, hp_.rms_norm_eps);
             }
         }
         if (lw.attn_k_norm && lw.attn_k_norm->type == GGMLType::F32) {
             const float* w_ptr = static_cast<const float*>(lw.attn_k_norm->mapped_ptr);
+            const bool shared_head_norm = (lw.attn_k_norm->dims[0] == head_dim);
             for (uint32_t h = 0; h < hp_.n_kv_heads; ++h) {
-                rms_norm(k.data() + h * hp_.head_dim, k.data() + h * hp_.head_dim, w_ptr + h * hp_.head_dim, hp_.head_dim, hp_.rms_norm_eps);
+                const float* hw = shared_head_norm ? w_ptr : (w_ptr + h * head_dim);
+                rms_norm(k.data() + h * head_dim, k.data() + h * head_dim, hw, head_dim, hp_.rms_norm_eps);
+            }
+        }
+        if (hp_.v_norm) {
+            for (uint32_t h = 0; h < hp_.n_kv_heads; ++h) {
+                rms_norm(v.data() + h * head_dim, v.data() + h * head_dim, nullptr, head_dim, hp_.rms_norm_eps);
             }
         }
         matmul_ms += (now_ms() - tm0);
@@ -469,49 +615,76 @@ std::vector<float> MoETransformerEngine::forward_token(
         double ta0 = now_ms();
         bool is_neox = (hp_.arch == "qwen2" || hp_.arch == "qwen2moe" || hp_.arch == "olmoe" ||
                         hp_.arch == "phi" || hp_.arch == "deepseek" || hp_.arch == "deepseek2" ||
-                        hp_.arch == "glm" || hp_.arch == "gptneox");
+                        hp_.arch == "glm" || hp_.arch == "gptneox" ||
+                        hp_.arch == "gemma" || hp_.arch == "gemma2" || hp_.arch == "gemma3" || hp_.arch == "gemma4");
+        const float* rf_ptr = (!lw.is_swa && rope_freqs_ && rope_freqs_->type == GGMLType::F32 &&
+                               rope_freqs_->dims[0] >= lw.rope_dim / 2)
+                            ? static_cast<const float*>(rope_freqs_->mapped_ptr) : nullptr;
         apply_rope(
             q.data(), k.data(),
-            hp_.n_heads, hp_.n_kv_heads, hp_.head_dim, hp_.rope_dim,
-            pos, hp_.rope_freq_base, hp_.yarn_scale, is_neox
+            hp_.n_heads, hp_.n_kv_heads, head_dim, lw.rope_dim,
+            pos, lw.rope_freq_base, hp_.yarn_scale, is_neox, rf_ptr
         );
 
-        float* k_slot = slot.k_cache[l].data() + static_cast<size_t>(pos) * kv_dim;
-        float* v_slot = slot.v_cache[l].data() + static_cast<size_t>(pos) * kv_dim;
-        std::memcpy(k_slot, k.data(), kv_dim * sizeof(float));
-        std::memcpy(v_slot, v.data(), kv_dim * sizeof(float));
-
-        // 5. Grouped-Query / Multi-Head Scaled Dot-Product Attention
-        std::fill(attn_out.begin(), attn_out.end(), 0.0f);
-        const uint32_t kv_mul = std::max(1u, hp_.n_heads / std::max(1u, hp_.n_kv_heads));
-        const float scale = 1.0f / std::sqrt(static_cast<float>(hp_.head_dim));
-        std::vector<float> scores(pos + 1);
-
-        for (uint32_t h = 0; h < hp_.n_heads; ++h) {
-            const float* q_head = q.data() + h * hp_.head_dim;
-            const uint32_t kvh = h / kv_mul;
-
-            for (uint32_t t = 0; t <= pos; ++t) {
-                const float* k_t = slot.k_cache[l].data() + static_cast<size_t>(t) * kv_dim + kvh * hp_.head_dim;
-                scores[t] = vec_dot_f32(q_head, k_t, hp_.head_dim) * scale;
+        const uint32_t kv_layer = lw.kv_source_layer;
+        if (!lw.shares_kv) {
+            uint16_t* k_slot = slot.k_cache[kv_layer].data() + static_cast<size_t>(pos) * max_kv_dim;
+            uint16_t* v_slot = slot.v_cache[kv_layer].data() + static_cast<size_t>(pos) * max_kv_dim;
+            for (uint32_t i = 0; i < kv_dim; ++i) {
+                k_slot[i] = fp32_to_fp16(k[i]);
+                v_slot[i] = fp32_to_fp16(v[i]);
             }
-            softmax(scores.data(), pos + 1);
+        }
 
-            float* out_head = attn_out.data() + h * hp_.head_dim;
-            for (uint32_t t = 0; t <= pos; ++t) {
-                const float* v_t = slot.v_cache[l].data() + static_cast<size_t>(t) * kv_dim + kvh * hp_.head_dim;
-                const float a = scores[t];
-                for (uint32_t d = 0; d < hp_.head_dim; ++d) {
-                    out_head[d] += a * v_t[d];
+        // 5. Grouped-Query / Multi-Head Scaled Dot-Product Attention (FP16 KV Cache, Head-Parallel, SWA-aware)
+        std::fill(attn_out.begin(), attn_out.begin() + q_dim, 0.0f);
+        const uint32_t kv_mul = std::max(1u, hp_.n_heads / std::max(1u, hp_.n_kv_heads));
+        const float scale = (hp_.arch == "gemma4") ? 1.0f : (1.0f / std::sqrt(static_cast<float>(head_dim)));
+        const uint32_t t_start_win = (lw.is_swa && hp_.sliding_window > 0 && pos >= hp_.sliding_window)
+                                   ? (pos - hp_.sliding_window + 1) : 0;
+
+#if defined(_OPENMP)
+        #pragma omp parallel for if(hp_.n_heads >= 4 && pos >= 32) schedule(static)
+#endif
+        for (int h_i = 0; h_i < static_cast<int>(hp_.n_heads); ++h_i) {
+            const uint32_t h = static_cast<uint32_t>(h_i);
+            const float* q_head = q.data() + h * head_dim;
+            const uint32_t kvh = h / kv_mul;
+            const uint32_t win_len = pos - t_start_win + 1;
+            std::vector<float> scores(win_len);
+
+            for (uint32_t t = t_start_win; t <= pos; ++t) {
+                const uint16_t* k_t = slot.k_cache[kv_layer].data() + static_cast<size_t>(t) * max_kv_dim + kvh * head_dim;
+                float dot = 0.0f;
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    dot += q_head[d] * fp16_to_fp32(k_t[d]);
+                }
+                scores[t - t_start_win] = dot * scale;
+            }
+            softmax(scores.data(), win_len);
+
+            float* out_head = attn_out.data() + h * head_dim;
+            for (uint32_t t = t_start_win; t <= pos; ++t) {
+                const uint16_t* v_t = slot.v_cache[kv_layer].data() + static_cast<size_t>(t) * max_kv_dim + kvh * head_dim;
+                const float a = scores[t - t_start_win];
+                for (uint32_t d = 0; d < head_dim; ++d) {
+                    out_head[d] += a * fp16_to_fp32(v_t[d]);
                 }
             }
         }
         attn_ms += (now_ms() - ta0);
 
-        // Attention Output Projection + Residual Connection
+        // Attention Output Projection + Optional Post-Attn Norm + Residual Connection
         double tm1 = now_ms();
         if (lw.wo) {
-            matmul_quant_f32(lw.wo->type, lw.wo->mapped_ptr, attn_out.data(), proj_out.data(), dim, dim);
+            matmul_quant_f32(lw.wo->type, lw.wo->mapped_ptr, attn_out.data(), proj_out.data(), dim, q_dim);
+            if (lw.bo && lw.bo->type == GGMLType::F32) {
+                const float* bo_ptr = static_cast<const float*>(lw.bo->mapped_ptr);
+                for (uint32_t i = 0; i < dim; ++i) proj_out[i] += bo_ptr[i];
+            }
+            if (lw.post_attn_norm && lw.post_attn_norm->type == GGMLType::F32) {
+                rms_norm(proj_out.data(), proj_out.data(), static_cast<const float*>(lw.post_attn_norm->mapped_ptr), dim, hp_.rms_norm_eps);
+            }
             for (uint32_t i = 0; i < dim; ++i) x[i] += proj_out[i];
         }
         matmul_ms += (now_ms() - tm1);
@@ -630,7 +803,7 @@ std::vector<float> MoETransformerEngine::forward_token(
                 matmul_swiglu_quant_f32(
                     lw.expert_gate_type, w_gate_ptr,
                     lw.expert_up_type,   w_up_ptr,
-                    x_norm.data(), gate_buf.data(), exp_dim, dim
+                    x_norm.data(), gate_buf.data(), exp_dim, dim, hp_.use_gelu
                 );
 
                 matmul_quant_f32(lw.expert_down_type, w_down_ptr, gate_buf.data(), down_buf.data(), dim, exp_dim);
@@ -641,8 +814,58 @@ std::vector<float> MoETransformerEngine::forward_token(
             }
         }
 
+        // 7b. Shared Expert Execution (Qwen2.5-MoE / DeepSeek-MoE)
+        if (lw.shexp_gate && lw.shexp_up && lw.shexp_down &&
+            lw.shexp_gate->mapped_ptr && lw.shexp_up->mapped_ptr && lw.shexp_down->mapped_ptr) {
+            double t_sh = now_ms();
+            uint32_t sh_dim = (lw.shexp_gate->n_dims >= 2) ? static_cast<uint32_t>(lw.shexp_gate->dims[1]) : exp_dim;
+            std::vector<float> sh_buf(sh_dim, 0.0f);
+            matmul_swiglu_quant_f32(
+                lw.shexp_gate->type, lw.shexp_gate->mapped_ptr,
+                lw.shexp_up->type,   lw.shexp_up->mapped_ptr,
+                x_norm.data(), sh_buf.data(), sh_dim, dim
+            );
+            matmul_quant_f32(lw.shexp_down->type, lw.shexp_down->mapped_ptr, sh_buf.data(), down_buf.data(), dim, sh_dim);
+            float sh_scale = 1.0f;
+            if (lw.shexp_gate_inp && lw.shexp_gate_inp->mapped_ptr) {
+                float g_val = vec_dot_quant_f32(lw.shexp_gate_inp->type, lw.shexp_gate_inp->mapped_ptr, x_norm.data(), dim);
+                sh_scale = 1.0f / (1.0f + std::exp(-g_val));
+            }
+            for (uint32_t d = 0; d < dim; ++d) {
+                moe_accum[d] += sh_scale * down_buf[d];
+            }
+            matmul_ms += (now_ms() - t_sh);
+        }
+
+        if (lw.post_ffw_norm && lw.post_ffw_norm->type == GGMLType::F32) {
+            rms_norm(moe_accum.data(), moe_accum.data(), static_cast<const float*>(lw.post_ffw_norm->mapped_ptr), dim, hp_.rms_norm_eps);
+        }
+
         for (uint32_t i = 0; i < dim; ++i) {
             x[i] += moe_accum[i];
+        }
+
+        // Gemma4 Per-Layer Embedding (PLE) residual + layer_output_scale
+        if (!ple_all.empty() && lw.inp_gate && lw.ple_proj &&
+            lw.inp_gate->mapped_ptr && lw.ple_proj->mapped_ptr) {
+            std::vector<float> g_ple(hp_.ple_dim, 0.0f);
+            matmul_quant_f32(lw.inp_gate->type, lw.inp_gate->mapped_ptr, x.data(), g_ple.data(), hp_.ple_dim, dim);
+            const float* ple_l = ple_all.data() + static_cast<size_t>(l) * hp_.ple_dim;
+            constexpr float kSqrt2OverPi = 0.7978845608028654f;
+            for (uint32_t d = 0; d < hp_.ple_dim; ++d) {
+                float gv = g_ple[d];
+                float gelu_g = 0.5f * gv * (1.0f + std::tanh(kSqrt2OverPi * (gv + 0.044715f * gv * gv * gv)));
+                g_ple[d] = gelu_g * ple_l[d];
+            }
+            matmul_quant_f32(lw.ple_proj->type, lw.ple_proj->mapped_ptr, g_ple.data(), proj_out.data(), dim, hp_.ple_dim);
+            if (lw.post_norm && lw.post_norm->type == GGMLType::F32) {
+                rms_norm(proj_out.data(), proj_out.data(), static_cast<const float*>(lw.post_norm->mapped_ptr), dim, hp_.rms_norm_eps);
+            }
+            for (uint32_t i = 0; i < dim; ++i) x[i] += proj_out[i];
+        }
+        if (lw.layer_output_scale && lw.layer_output_scale->type == GGMLType::F32 && lw.layer_output_scale->mapped_ptr) {
+            float sc = *static_cast<const float*>(lw.layer_output_scale->mapped_ptr);
+            for (uint32_t i = 0; i < dim; ++i) x[i] *= sc;
         }
 
         prefetched_futures = std::move(next_layer_futures);
@@ -653,14 +876,25 @@ std::vector<float> MoETransformerEngine::forward_token(
     // 8. Final RMSNorm & LM Head Logit Projection (skipped for intermediate prefill tokens)
     double th0 = now_ms();
     std::vector<float> logits;
-    if (compute_logits) {
+    if (compute_logits || out_hidden != nullptr) {
         const float* onorm_w = (out_norm_ && out_norm_->type == GGMLType::F32)
                              ? static_cast<const float*>(out_norm_->mapped_ptr) : nullptr;
         rms_norm(x_norm.data(), x.data(), onorm_w, dim, hp_.rms_norm_eps);
-
-        logits.assign(hp_.vocab_size, 0.0f);
-        if (lm_head_) {
-            matmul_quant_f32(lm_head_->type, lm_head_->mapped_ptr, x_norm.data(), logits.data(), hp_.vocab_size, dim);
+        if (out_hidden) {
+            *out_hidden = x_norm;
+        }
+        if (compute_logits) {
+            logits.assign(hp_.vocab_size, 0.0f);
+            if (lm_head_) {
+                matmul_quant_f32(lm_head_->type, lm_head_->mapped_ptr, x_norm.data(), logits.data(), hp_.vocab_size, dim);
+                if (hp_.final_logit_softcapping > 0.0f) {
+                    const float cap = hp_.final_logit_softcapping;
+                    const float inv_cap = 1.0f / cap;
+                    for (float& lval : logits) {
+                        lval = cap * std::tanh(lval * inv_cap);
+                    }
+                }
+            }
         }
     }
     head_ms = now_ms() - th0;
@@ -778,22 +1012,38 @@ std::vector<uint32_t> MoETransformerEngine::verify_speculative_batch(
     ProfileSample* out_profile
 ) {
     std::vector<uint32_t> accepted;
-    for (uint32_t draft_id : draft_tokens) {
+    if (draft_tokens.empty()) return accepted;
+
+    uint32_t base_seq_pos = 0;
+    {
+        std::lock_guard<std::mutex> lk(engine_mtx_);
+        base_seq_pos = get_or_create_slot(slot_id).seq_pos;
+    }
+
+    // Verify each draft token strictly against the target model's sampled prediction
+    for (size_t i = 0; i < draft_tokens.size(); ++i) {
+        uint32_t draft_id = draft_tokens[i];
         ProfileSample prof{};
         auto logits = forward_token(draft_id, slot_id, &prof);
         if (out_profile) *out_profile = prof;
+        accepted.push_back(draft_id);
 
         std::vector<uint32_t> hist;
         {
             std::lock_guard<std::mutex> lk(engine_mtx_);
             hist = get_or_create_slot(slot_id).token_history;
         }
-        uint32_t sampled = sample_next_token(logits, hist, sampler_cfg);
-        accepted.push_back(draft_id);
-        if (sampled == tokenizer_.eos_id() || sampled == tokenizer_.im_end_id()) {
+        uint32_t target_next = sample_next_token(logits, hist, sampler_cfg);
+        if (target_next == tokenizer_.eos_id() || target_next == tokenizer_.im_end_id()) {
+            break;
+        }
+        if (i + 1 < draft_tokens.size() && target_next != draft_tokens[i + 1]) {
+            // Mismatch on next draft token: replace suffix with target_next (no extra rollback needed)
+            accepted.push_back(target_next);
             break;
         }
     }
+    (void)base_seq_pos;
     return accepted;
 }
 
@@ -821,15 +1071,19 @@ void MoETransformerEngine::generate_stream(
         std::string prompt_to_encode = prompt;
         if (prompt_to_encode.find("<|im_start|>") == std::string::npos &&
             prompt_to_encode.find("<|user|>") == std::string::npos &&
-            prompt_to_encode.find("<|system|>") == std::string::npos) {
-            if (hp_.arch == "olmoe" || tokenizer_.token_to_id("<|user|>") >= 0) {
+            prompt_to_encode.find("<|system|>") == std::string::npos &&
+            prompt_to_encode.find("<|turn>") == std::string::npos) {
+            if (hp_.arch == "gemma4" || tokenizer_.token_to_id("<|turn>") >= 0) {
+                prompt_to_encode = "<|turn>user\n" + prompt_to_encode + "<turn|>\n<|turn>model\n";
+            } else if (hp_.arch == "olmoe" || tokenizer_.token_to_id("<|user|>") >= 0) {
                 prompt_to_encode = "<|user|>\n" + prompt_to_encode + "\n<|assistant|>\n";
             } else if (hp_.arch == "qwen2" || tokenizer_.token_to_id("<|im_start|>") >= 0) {
                 prompt_to_encode = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + prompt_to_encode + "<|im_end|>\n<|im_start|>assistant\n";
             }
         }
 
-        std::vector<uint32_t> prompt_tokens = tokenizer_.encode(prompt_to_encode, false);
+        bool add_bos = (hp_.arch == "gemma4" || hp_.arch == "gemma3" || hp_.arch == "gemma2" || hp_.arch == "gemma");
+        std::vector<uint32_t> prompt_tokens = tokenizer_.encode(prompt_to_encode, add_bos);
         if (prompt_tokens.empty()) {
             prompt_tokens.push_back(tokenizer_.bos_id());
         }
@@ -909,13 +1163,15 @@ void MoETransformerEngine::generate_stream(
         if (!piece.empty()) {
             if (piece.find("<|im_end|>") != std::string::npos ||
                 piece.find("<|endoftext|>") != std::string::npos ||
-                piece.find("<|end_of_text|>") != std::string::npos) {
+                piece.find("<|end_of_text|>") != std::string::npos ||
+                piece.find("<turn|>") != std::string::npos ||
+                piece.find("<eos>") != std::string::npos) {
                 break;
             }
             // Also detect literal "<think>" or "</think>" tags if emitted via subwords
-            if (piece == "<think>") {
+            if (piece == "<think>" || piece == "<|channel>") {
                 in_thinking = true;
-            } else if (piece == "</think>") {
+            } else if (piece == "</think>" || piece == "<channel|>") {
                 in_thinking = false;
             } else {
                 if (!on_token(piece, in_thinking, next_id, last_prof)) {
@@ -924,26 +1180,54 @@ void MoETransformerEngine::generate_stream(
             }
         }
 
-        // Multi-Token Prediction (MTP) Speculative batch verification
-        if (enable_speculative && draft_count > 0 && (step + draft_count < max_new_tokens)) {
-            // Propose draft candidate tokens from greedy argmax
-            std::vector<uint32_t> drafts;
-            uint32_t cand = next_id;
-            for (uint32_t d = 0; d < draft_count; ++d) {
-                drafts.push_back(cand);
+        // Multi-Token Prediction (MTP) Speculative Prompt-Lookup N-Gram Verification
+        if (enable_speculative && draft_count > 0 && (step + 1 < max_new_tokens)) {
+            logits = forward_token(next_id, slot_id, &last_prof);
+
+            std::vector<uint32_t> cur_hist;
+            {
+                std::lock_guard<std::mutex> lk(engine_mtx_);
+                cur_hist = get_or_create_slot(slot_id).token_history;
             }
-            // Batched verification
-            auto accepted = verify_speculative_batch(slot_id, drafts, sampler_cfg, &last_prof);
-            for (uint32_t acc_id : accepted) {
-                std::string acc_piece = utf8_dec.push(acc_id);
-                if (!acc_piece.empty() && acc_piece != "<think>" && acc_piece != "</think>") {
-                    on_token(acc_piece, in_thinking, acc_id, last_prof);
+
+            // Prompt-lookup 2-gram / 1-gram draft proposal from recent history
+            std::vector<uint32_t> drafts;
+            if (cur_hist.size() >= 4) {
+                for (size_t idx = cur_hist.size() - 2; idx >= 1; --idx) {
+                    if (cur_hist[idx] == next_id && cur_hist[idx - 1] == cur_hist[cur_hist.size() - 2]) {
+                        for (uint32_t d = 1; d <= draft_count && (idx + d) < cur_hist.size() - 1; ++d) {
+                            drafts.push_back(cur_hist[idx + d]);
+                        }
+                        break;
+                    }
                 }
             }
-            step += static_cast<uint32_t>(accepted.size());
-        }
 
-        if (step + 1 < max_new_tokens) {
+            if (!drafts.empty()) {
+                for (size_t d = 0; d < drafts.size() && (step + 1 < max_new_tokens); ++d) {
+                    uint32_t target_tok = sample_next_token(logits, cur_hist, sampler_cfg);
+                    if (target_tok != drafts[d]) {
+                        // Draft rejected: stop speculative run cleanly without corrupting KV cache
+                        break;
+                    }
+                    if (target_tok == tokenizer_.eos_id() || target_tok == tokenizer_.im_end_id() ||
+                        target_tok == 151645 || target_tok == 151643 ||
+                        target_tok == tokenizer_.think_start_id() || target_tok == tokenizer_.think_end_id()) {
+                        break;
+                    }
+                    std::string acc_piece = utf8_dec.push(target_tok);
+                    if (!acc_piece.empty() && acc_piece != "<think>" && acc_piece != "</think>") {
+                        if (!on_token(acc_piece, in_thinking, target_tok, last_prof)) {
+                            step = max_new_tokens;
+                            break;
+                        }
+                    }
+                    step++;
+                    logits = forward_token(target_tok, slot_id, &last_prof);
+                    cur_hist.push_back(target_tok);
+                }
+            }
+        } else if (step + 1 < max_new_tokens) {
             logits = forward_token(next_id, slot_id, &last_prof);
         }
     }
@@ -1006,6 +1290,34 @@ std::vector<SystemOneOptionScore> MoETransformerEngine::evaluate_system_one(
     });
 
     return results;
+}
+
+std::vector<float> MoETransformerEngine::compute_embeddings(const std::string& text) {
+    const uint32_t emb_slot = 9998;
+    reset_slot(emb_slot);
+
+    std::vector<uint32_t> tokens = tokenizer_.encode(text, true);
+    if (tokens.empty()) tokens.push_back(tokenizer_.bos_id());
+
+    std::vector<float> pooled(hp_.dim, 0.0f);
+    std::vector<float> hidden;
+    for (uint32_t tid : tokens) {
+        forward_token(tid, emb_slot, nullptr, false, &hidden);
+        for (uint32_t d = 0; d < hp_.dim && d < hidden.size(); ++d) {
+            pooled[d] += hidden[d];
+        }
+    }
+
+    const float inv_n = 1.0f / static_cast<float>(tokens.size());
+    float norm_sq = 0.0f;
+    for (float& v : pooled) {
+        v *= inv_n;
+        norm_sq += v * v;
+    }
+    const float inv_norm = (norm_sq > 1e-12f) ? (1.0f / std::sqrt(norm_sq)) : 1.0f;
+    for (float& v : pooled) v *= inv_norm;
+
+    return pooled;
 }
 
 } // namespace moe

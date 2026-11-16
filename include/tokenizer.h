@@ -50,6 +50,7 @@ private:
     uint32_t byte_fallback_[256] = {0};
     bool has_byte_fallback_ = false;
     bool is_byte_level_bpe_ = false;
+    bool is_sentencepiece_ = false;
 
     uint32_t bos_id_ = 1;
     uint32_t eos_id_ = 2;

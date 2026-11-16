@@ -47,7 +47,8 @@ bool pull_model_from_hub(
     const std::string& input,
     const std::string& out_dir,
     std::string& out_file,
-    std::string& err_msg
+    std::string& err_msg,
+    PullProgressCallback on_progress
 ) {
     std::string url = input;
     std::string filename;
@@ -159,7 +160,11 @@ bool pull_model_from_hub(
                 ? (static_cast<double>(total_bytes - downloaded) / (mb_per_sec * 1024.0 * 1024.0))
                 : 0.0;
 
-            render_progress_bar(downloaded, total_bytes, mb_per_sec, eta_sec);
+            if (on_progress) {
+                on_progress(downloaded, total_bytes, mb_per_sec, eta_sec);
+            } else {
+                render_progress_bar(downloaded, total_bytes, mb_per_sec, eta_sec);
+            }
             last_update = now;
         }
     }
