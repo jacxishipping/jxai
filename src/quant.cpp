@@ -788,6 +788,32 @@ float vec_dot_iq4_nl_f32(const void* vx, const float* y, int64_t k) {
     const auto* x = static_cast<const block_iq4_nl*>(vx);
     float total = 0.0f;
 
+#if defined(__AVX2__)
+    const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
+    const __m128i mask_low = _mm_set1_epi8(0x0F);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d);
+        const __m256 vd = _mm256_set1_ps(d);
+        const __m128i qbytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x[i].qs));
+        const __m128i q_lo = _mm_and_si128(qbytes, mask_low);
+        const __m128i q_hi = _mm_and_si128(_mm_srli_epi16(qbytes, 4), mask_low);
+
+        const __m128i v_lo = _mm_shuffle_epi8(lut, q_lo);
+        const __m128i v_hi = _mm_shuffle_epi8(lut, q_hi);
+
+        const float* yb = y + i * 32;
+        __m256 bsum = _mm256_mul_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v_lo)), _mm256_loadu_ps(yb + 0));
+        bsum = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v_lo, 8))), _mm256_loadu_ps(yb + 8),  bsum);
+        bsum = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(v_hi)),                    _mm256_loadu_ps(yb + 16), bsum);
+        bsum = _mm256_fmadd_ps(_mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(v_hi, 8))), _mm256_loadu_ps(yb + 24), bsum);
+        acc = _mm256_fmadd_ps(vd, bsum, acc);
+    }
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, acc);
+    for (int j = 0; j < 8; ++j) total += tmp[j];
+#else
     for (int64_t i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d);
         float bsum = 0.0f;
@@ -799,6 +825,7 @@ float vec_dot_iq4_nl_f32(const void* vx, const float* y, int64_t k) {
         }
         total += d * bsum;
     }
+#endif
     return total;
 }
 
@@ -955,14 +982,61 @@ float vec_dot_fp8_f32(const void* vx, const float* y, int64_t k) {
 }
 
 float vec_dot_q5_K_f32(const void* vx, const float* y, int64_t k) {
-    alignas(32) float deq[256];
     const int64_t nb = k / 256;
     const auto* blocks = static_cast<const block_q5_K*>(vx);
     float sum = 0.0f;
+
+#if defined(__AVX2__)
+    __m256 acc = _mm256_setzero_ps();
+    alignas(16) uint8_t q5_vals[32];
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d    = fp16_to_fp32(blocks[i].d);
+        const float dmin = fp16_to_fp32(blocks[i].dmin);
+        const float* yb  = y + i * 256;
+
+        for (int sb = 0; sb < 8; ++sb) {
+            uint8_t sc = 0, m = 0;
+            get_scale_min_k4(sb, blocks[i].scales, &sc, &m);
+            const float dl = d * static_cast<float>(sc);
+            const float ml = dmin * static_cast<float>(m);
+
+            const int qh_offset = (sb * 32) / 8;
+            const int qs_offset = sb * 16;
+            for (int l = 0; l < 16; ++l) {
+                const uint8_t qs_b = blocks[i].qs[qs_offset + l];
+                const uint8_t qh0 = (blocks[i].qh[qh_offset + (2 * l) / 8] >> ((2 * l) % 8)) & 1;
+                const uint8_t qh1 = (blocks[i].qh[qh_offset + (2 * l + 1) / 8] >> ((2 * l + 1) % 8)) & 1;
+                q5_vals[2 * l]     = (qs_b & 0x0F) | (qh0 << 4);
+                q5_vals[2 * l + 1] = (qs_b >> 4)   | (qh1 << 4);
+            }
+
+            const float* y_sb = yb + sb * 32;
+            __m256 qsum = _mm256_setzero_ps();
+            __m256 ysum = _mm256_setzero_ps();
+            for (int h = 0; h < 2; ++h) {
+                const __m128i qv = _mm_load_si128(reinterpret_cast<const __m128i*>(q5_vals + h * 16));
+                const __m256 y0 = _mm256_loadu_ps(y_sb + h * 16 + 0);
+                const __m256 y1 = _mm256_loadu_ps(y_sb + h * 16 + 8);
+                ysum = _mm256_add_ps(ysum, _mm256_add_ps(y0, y1));
+                __m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(qv));
+                __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepu8_epi32(_mm_srli_si128(qv, 8)));
+                qsum = _mm256_fmadd_ps(f0, y0, qsum);
+                qsum = _mm256_fmadd_ps(f1, y1, qsum);
+            }
+            acc = _mm256_add_ps(acc, _mm256_sub_ps(_mm256_mul_ps(_mm256_set1_ps(dl), qsum), _mm256_mul_ps(_mm256_set1_ps(ml), ysum)));
+        }
+    }
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, acc);
+    for (int j = 0; j < 8; ++j) sum += tmp[j];
+#else
+    alignas(32) float deq[256];
     for (int64_t i = 0; i < nb; ++i) {
         dequantize_row_q5_K(&blocks[i], deq, 256);
         sum += vec_dot_f32(deq, y + i * 256, 256);
     }
+#endif
     return sum;
 }
 
@@ -1081,6 +1155,200 @@ float vec_dot_quant_f32(GGMLType type, const void* vx, const float* y, int64_t k
     }
 }
 
+float vec_dot_q4_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q4_0*>(vx);
+    float total = 0.0f;
+
+#if defined(__AVX2__)
+    const __m128i mask_0f = _mm_set1_epi8(0x0F);
+    const __m256i offset_8 = _mm256_set1_epi8(8);
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
+        const __m128i qbytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x[i].qs));
+        const __m128i q_lo = _mm_and_si128(qbytes, mask_0f);
+        const __m128i q_hi = _mm_and_si128(_mm_srli_epi16(qbytes, 4), mask_0f);
+        const __m256i q = _mm256_sub_epi8(_mm256_set_m128i(q_hi, q_lo), offset_8);
+        const __m256i yv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[i].qs));
+
+        const __m256i ax = _mm256_sign_epi8(q, q);
+        const __m256i sy = _mm256_sign_epi8(yv, q);
+        const __m256i dot16 = _mm256_maddubs_epi16(ax, sy);
+        const __m256i dot32 = _mm256_madd_epi16(ones_16, dot16);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(dot32), acc);
+    }
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, acc);
+    for (int j = 0; j < 8; ++j) total += tmp[j];
+#else
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
+        int32_t bsum = 0;
+        for (int j = 0; j < 16; ++j) {
+            const int x0 = (x[i].qs[j] & 0x0F) - 8;
+            const int x1 = (x[i].qs[j] >> 4) - 8;
+            bsum += x0 * y[i].qs[j] + x1 * y[i].qs[j + 16];
+        }
+        total += d * static_cast<float>(bsum);
+    }
+#endif
+    return total;
+}
+
+float vec_dot_q8_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q8_0*>(vx);
+    float total = 0.0f;
+
+#if defined(__AVX2__)
+    const __m256i ones_16 = _mm256_set1_epi16(1);
+    __m256 acc = _mm256_setzero_ps();
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
+        const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[i].qs));
+        const __m256i yv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[i].qs));
+
+        const __m256i ax = _mm256_sign_epi8(xv, xv);
+        const __m256i sy = _mm256_sign_epi8(yv, xv);
+        const __m256i dot16 = _mm256_maddubs_epi16(ax, sy);
+        const __m256i dot32 = _mm256_madd_epi16(ones_16, dot16);
+        acc = _mm256_fmadd_ps(_mm256_set1_ps(d), _mm256_cvtepi32_ps(dot32), acc);
+    }
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, acc);
+    for (int j = 0; j < 8; ++j) total += tmp[j];
+#else
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
+        int32_t bsum = 0;
+        for (int j = 0; j < 32; ++j) {
+            bsum += static_cast<int32_t>(x[i].qs[j]) * static_cast<int32_t>(y[i].qs[j]);
+        }
+        total += d * static_cast<float>(bsum);
+    }
+#endif
+    return total;
+}
+
+float vec_dot_q6_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* blocks = static_cast<const block_q6_K*>(vx);
+    float sum = 0.0f;
+
+#if defined(__AVX2__)
+    const __m128i mask_0f = _mm_set1_epi8(0x0F);
+    const __m128i mask_03 = _mm_set1_epi8(0x03);
+    const __m128i offset_32 = _mm_set1_epi8(32);
+    __m256 acc = _mm256_setzero_ps();
+
+    auto dot16_q8 = [](__m128i qv, __m128i yv, int8_t sc_val) -> __m128i {
+        __m128i ax = _mm_sign_epi8(qv, qv);
+        __m128i sy = _mm_sign_epi8(yv, qv);
+        __m128i dot16 = _mm_maddubs_epi16(ax, sy);
+        return _mm_madd_epi16(dot16, _mm_set1_epi16(static_cast<int16_t>(sc_val)));
+    };
+
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(blocks[i].d);
+        const uint8_t* ql = blocks[i].ql;
+        const uint8_t* qh = blocks[i].qh;
+        const int8_t* sc  = blocks[i].scales;
+        const block_q8_0* yb = y + i * 8;
+
+        for (int n = 0; n < 256; n += 128) {
+            const block_q8_0* yh = yb + (n / 32);
+            __m128i s0 = _mm_setzero_si128();
+            __m128i s1 = _mm_setzero_si128();
+            __m128i s2 = _mm_setzero_si128();
+            __m128i s3 = _mm_setzero_si128();
+
+            for (int is = 0; is < 2; ++is) {
+                const int l_off = is * 16;
+                const __m128i ql0  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ql + l_off));
+                const __m128i ql1  = _mm_loadu_si128(reinterpret_cast<const __m128i*>(ql + l_off + 32));
+                const __m128i qh_v = _mm_loadu_si128(reinterpret_cast<const __m128i*>(qh + l_off));
+
+                const __m128i q1 = _mm_sub_epi8(
+                    _mm_or_si128(_mm_and_si128(ql0, mask_0f), _mm_slli_epi16(_mm_and_si128(qh_v, mask_03), 4)),
+                    offset_32
+                );
+                const __m128i q2 = _mm_sub_epi8(
+                    _mm_or_si128(_mm_and_si128(ql1, mask_0f), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh_v, 2), mask_03), 4)),
+                    offset_32
+                );
+                const __m128i q3 = _mm_sub_epi8(
+                    _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql0, 4), mask_0f), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh_v, 4), mask_03), 4)),
+                    offset_32
+                );
+                const __m128i q4 = _mm_sub_epi8(
+                    _mm_or_si128(_mm_and_si128(_mm_srli_epi16(ql1, 4), mask_0f), _mm_slli_epi16(_mm_and_si128(_mm_srli_epi16(qh_v, 6), mask_03), 4)),
+                    offset_32
+                );
+
+                const __m128i y0 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(yh[0].qs + l_off));
+                const __m128i y1 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(yh[1].qs + l_off));
+                const __m128i y2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(yh[2].qs + l_off));
+                const __m128i y3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(yh[3].qs + l_off));
+
+                s0 = _mm_add_epi32(s0, dot16_q8(q1, y0, sc[is + 0]));
+                s1 = _mm_add_epi32(s1, dot16_q8(q2, y1, sc[is + 2]));
+                s2 = _mm_add_epi32(s2, dot16_q8(q3, y2, sc[is + 4]));
+                s3 = _mm_add_epi32(s3, dot16_q8(q4, y3, sc[is + 6]));
+            }
+
+            const float dy0 = d * fp16_to_fp32(yh[0].d);
+            const float dy1 = d * fp16_to_fp32(yh[1].d);
+            const float dy2 = d * fp16_to_fp32(yh[2].d);
+            const float dy3 = d * fp16_to_fp32(yh[3].d);
+
+            __m256 scale01 = _mm256_set_m128(_mm_set1_ps(dy1), _mm_set1_ps(dy0));
+            __m256 scale23 = _mm256_set_m128(_mm_set1_ps(dy3), _mm_set1_ps(dy2));
+            acc = _mm256_fmadd_ps(scale01, _mm256_cvtepi32_ps(_mm256_set_m128i(s1, s0)), acc);
+            acc = _mm256_fmadd_ps(scale23, _mm256_cvtepi32_ps(_mm256_set_m128i(s3, s2)), acc);
+
+            ql += 64;
+            qh += 32;
+            sc += 8;
+        }
+    }
+    alignas(32) float tmp[8];
+    _mm256_store_ps(tmp, acc);
+    for (int j = 0; j < 8; ++j) sum += tmp[j];
+#else
+    (void)vx; (void)y; (void)k;
+#endif
+    return sum;
+}
+
+static inline float vec_dot_row_with_q8(
+    GGMLType type,
+    const void* row_ptr,
+    const float* x,
+    const block_q8_0* x_q8,
+    int64_t cols
+) {
+#if defined(__AVX2__)
+    if (x_q8) {
+        if (type == GGMLType::Q4_0 && (cols % 32 == 0)) {
+            return vec_dot_q4_0_q8_0(row_ptr, x_q8, cols);
+        }
+        if (type == GGMLType::Q8_0 && (cols % 32 == 0)) {
+            return vec_dot_q8_0_q8_0(row_ptr, x_q8, cols);
+        }
+        if (type == GGMLType::Q6_K && (cols % 256 == 0)) {
+            return vec_dot_q6_K_q8_0(row_ptr, x_q8, cols);
+        }
+    }
+#else
+    (void)x_q8;
+#endif
+    return vec_dot_quant_f32(type, row_ptr, x, cols);
+}
+
 void matmul_quant_f32(
     GGMLType type,
     const void* W,
@@ -1092,11 +1360,101 @@ void matmul_quant_f32(
     const size_t row_bytes = tensor_byte_size(type, static_cast<uint64_t>(cols));
     const auto* base = static_cast<const uint8_t*>(W);
 
+    std::vector<block_q8_0> x_q8;
+    const block_q8_0* x_q8_ptr = nullptr;
+#if defined(__AVX2__)
+    if (rows >= 8 && (cols % 32 == 0) &&
+        (type == GGMLType::Q4_0 || type == GGMLType::Q8_0 || (type == GGMLType::Q6_K && (cols % 256 == 0)))) {
+        x_q8.resize(static_cast<size_t>(cols / 32));
+        quantize_row_q8_0(x, x_q8.data(), cols);
+        x_q8_ptr = x_q8.data();
+    }
+#endif
+
 #if defined(_OPENMP)
     #pragma omp parallel for if(rows >= 64) schedule(static)
 #endif
     for (int64_t r = 0; r < rows; ++r) {
-        out[r] = vec_dot_quant_f32(type, base + r * row_bytes, x, cols);
+        out[r] = vec_dot_row_with_q8(type, base + r * row_bytes, x, x_q8_ptr, cols);
+    }
+}
+
+void matmul_qkv_quant_f32(
+    GGMLType wq_type, const void* Wq, int64_t q_rows, float* q_out,
+    GGMLType wk_type, const void* Wk, int64_t k_rows, float* k_out,
+    GGMLType wv_type, const void* Wv, int64_t v_rows, float* v_out,
+    const float* x, int64_t cols
+) {
+    const size_t q_row_bytes = Wq ? tensor_byte_size(wq_type, static_cast<uint64_t>(cols)) : 0;
+    const size_t k_row_bytes = Wk ? tensor_byte_size(wk_type, static_cast<uint64_t>(cols)) : 0;
+    const size_t v_row_bytes = Wv ? tensor_byte_size(wv_type, static_cast<uint64_t>(cols)) : 0;
+
+    const auto* q_base = static_cast<const uint8_t*>(Wq);
+    const auto* k_base = static_cast<const uint8_t*>(Wk);
+    const auto* v_base = static_cast<const uint8_t*>(Wv);
+
+    const int64_t total_rows = (Wq ? q_rows : 0) + (Wk ? k_rows : 0) + (Wv ? v_rows : 0);
+    if (total_rows <= 0) return;
+
+    std::vector<block_q8_0> x_q8;
+    const block_q8_0* x_q8_ptr = nullptr;
+#if defined(__AVX2__)
+    if (total_rows >= 8 && (cols % 32 == 0)) {
+        x_q8.resize(static_cast<size_t>(cols / 32));
+        quantize_row_q8_0(x, x_q8.data(), cols);
+        x_q8_ptr = x_q8.data();
+    }
+#endif
+
+    const int64_t q_end = Wq ? q_rows : 0;
+    const int64_t k_end = q_end + (Wk ? k_rows : 0);
+
+#if defined(_OPENMP)
+    #pragma omp parallel for if(total_rows >= 64) schedule(static)
+#endif
+    for (int64_t idx = 0; idx < total_rows; ++idx) {
+        if (idx < q_end) {
+            q_out[idx] = vec_dot_row_with_q8(wq_type, q_base + idx * q_row_bytes, x, x_q8_ptr, cols);
+        } else if (idx < k_end) {
+            int64_t kr = idx - q_end;
+            k_out[kr] = vec_dot_row_with_q8(wk_type, k_base + kr * k_row_bytes, x, x_q8_ptr, cols);
+        } else {
+            int64_t vr = idx - k_end;
+            v_out[vr] = vec_dot_row_with_q8(wv_type, v_base + vr * v_row_bytes, x, x_q8_ptr, cols);
+        }
+    }
+}
+
+void matmul_swiglu_quant_f32(
+    GGMLType gate_type, const void* W_gate,
+    GGMLType up_type,   const void* W_up,
+    const float* x,
+    float* swiglu_out,
+    int64_t exp_dim,
+    int64_t cols
+) {
+    const size_t gate_row_bytes = tensor_byte_size(gate_type, static_cast<uint64_t>(cols));
+    const size_t up_row_bytes   = tensor_byte_size(up_type,   static_cast<uint64_t>(cols));
+    const auto* gate_base = static_cast<const uint8_t*>(W_gate);
+    const auto* up_base   = static_cast<const uint8_t*>(W_up);
+
+    std::vector<block_q8_0> x_q8;
+    const block_q8_0* x_q8_ptr = nullptr;
+#if defined(__AVX2__)
+    if (exp_dim >= 8 && (cols % 32 == 0)) {
+        x_q8.resize(static_cast<size_t>(cols / 32));
+        quantize_row_q8_0(x, x_q8.data(), cols);
+        x_q8_ptr = x_q8.data();
+    }
+#endif
+
+#if defined(_OPENMP)
+    #pragma omp parallel for if(exp_dim >= 64) schedule(static)
+#endif
+    for (int64_t r = 0; r < exp_dim; ++r) {
+        float g = vec_dot_row_with_q8(gate_type, gate_base + r * gate_row_bytes, x, x_q8_ptr, cols);
+        float u = vec_dot_row_with_q8(up_type,   up_base   + r * up_row_bytes,   x, x_q8_ptr, cols);
+        swiglu_out[r] = (g / (1.0f + std::exp(-g))) * u;
     }
 }
 

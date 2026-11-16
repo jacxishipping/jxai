@@ -223,8 +223,74 @@ int32_t Tokenizer::token_to_id(const std::string& tok) const {
     return (it != token_to_id_.end()) ? static_cast<int32_t>(it->second) : -1;
 }
 
+static std::vector<std::string> split_gpt2_pretokens(const std::string& text) {
+    std::vector<std::string> words;
+    size_t i = 0;
+    const size_t n = text.size();
+
+    auto is_ascii_letter = [](unsigned char c) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c >= 0x80;
+    };
+    auto is_ascii_digit = [](unsigned char c) {
+        return (c >= '0' && c <= '9');
+    };
+    auto is_ws = [](unsigned char c) {
+        return c == ' ' || c == '\t' || c == '\n' || c == '\r';
+    };
+
+    while (i < n) {
+        size_t start = i;
+        unsigned char c = static_cast<unsigned char>(text[i]);
+
+        // Attach a single leading space to a following word/number/punctuation token (GPT-2 / Qwen2 rule)
+        if (c == ' ' && i + 1 < n && !is_ws(static_cast<unsigned char>(text[i + 1]))) {
+            i++;
+            c = static_cast<unsigned char>(text[i]);
+        }
+
+        if (is_ascii_letter(c)) {
+            while (i < n && is_ascii_letter(static_cast<unsigned char>(text[i]))) i++;
+        } else if (is_ascii_digit(c)) {
+            while (i < n && is_ascii_digit(static_cast<unsigned char>(text[i]))) i++;
+        } else if (is_ws(c)) {
+            if (c == '\n' || c == '\r') {
+                while (i < n && (text[i] == '\n' || text[i] == '\r')) i++;
+            } else {
+                while (i < n && (text[i] == ' ' || text[i] == '\t')) {
+                    // Leave the last space for the next non-ws token if followed by non-ws
+                    if (i > start && i + 1 < n && !is_ws(static_cast<unsigned char>(text[i + 1]))) {
+                        break;
+                    }
+                    i++;
+                }
+            }
+        } else {
+            while (i < n) {
+                unsigned char nc = static_cast<unsigned char>(text[i]);
+                if (is_ascii_letter(nc) || is_ascii_digit(nc) || is_ws(nc)) break;
+                i++;
+            }
+        }
+        words.push_back(text.substr(start, i - start));
+    }
+    return words;
+}
+
 std::vector<uint32_t> Tokenizer::encode_segment_bpe(const std::string& segment) const {
     if (segment.empty()) return {};
+
+    if (is_byte_level_bpe_ && segment.size() > 1) {
+        auto chunks = split_gpt2_pretokens(segment);
+        if (chunks.size() > 1) {
+            std::vector<uint32_t> combined;
+            combined.reserve(segment.size());
+            for (const auto& ch : chunks) {
+                auto sub = encode_segment_bpe(ch);
+                combined.insert(combined.end(), sub.begin(), sub.end());
+            }
+            return combined;
+        }
+    }
 
     std::string text_for_bpe;
     if (is_byte_level_bpe_) {

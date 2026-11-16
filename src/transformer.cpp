@@ -416,7 +416,6 @@ std::vector<float> MoETransformerEngine::forward_token(
     std::vector<float> router_logits(hp_.n_experts, 0.0f);
     std::vector<float> moe_accum(dim, 0.0f);
     std::vector<float> gate_buf(exp_dim, 0.0f);
-    std::vector<float> up_buf(exp_dim, 0.0f);
     std::vector<float> down_buf(dim, 0.0f);
 
     // Map holding PILOT async prefetch futures for Layer L+1
@@ -430,11 +429,14 @@ std::vector<float> MoETransformerEngine::forward_token(
                              ? static_cast<const float*>(lw.attn_norm->mapped_ptr) : nullptr;
         rms_norm(x_norm.data(), x.data(), anorm_w, dim, hp_.rms_norm_eps);
 
-        // 3. Q, K, V Projections
+        // 3. Q, K, V Projections (Fused single OpenMP region with shared Q8_0 activation)
         double tm0 = now_ms();
-        if (lw.wq) matmul_quant_f32(lw.wq->type, lw.wq->mapped_ptr, x_norm.data(), q.data(), dim, dim);
-        if (lw.wk) matmul_quant_f32(lw.wk->type, lw.wk->mapped_ptr, x_norm.data(), k.data(), kv_dim, dim);
-        if (lw.wv) matmul_quant_f32(lw.wv->type, lw.wv->mapped_ptr, x_norm.data(), v.data(), kv_dim, dim);
+        matmul_qkv_quant_f32(
+            lw.wq ? lw.wq->type : GGMLType::F32, lw.wq ? lw.wq->mapped_ptr : nullptr, dim,    q.data(),
+            lw.wk ? lw.wk->type : GGMLType::F32, lw.wk ? lw.wk->mapped_ptr : nullptr, kv_dim, k.data(),
+            lw.wv ? lw.wv->type : GGMLType::F32, lw.wv ? lw.wv->mapped_ptr : nullptr, kv_dim, v.data(),
+            x_norm.data(), dim
+        );
 
         if (lw.bq && lw.bq->type == GGMLType::F32) {
             const float* b_ptr = static_cast<const float*>(lw.bq->mapped_ptr);
@@ -625,12 +627,11 @@ std::vector<float> MoETransformerEngine::forward_token(
 
             if (w_gate_ptr && w_up_ptr && w_down_ptr) {
                 double t_exp = now_ms();
-                matmul_quant_f32(lw.expert_gate_type, w_gate_ptr, x_norm.data(), gate_buf.data(), exp_dim, dim);
-                matmul_quant_f32(lw.expert_up_type,   w_up_ptr,   x_norm.data(), up_buf.data(),   exp_dim, dim);
-
-                for (uint32_t d = 0; d < exp_dim; ++d) {
-                    gate_buf[d] = silu(gate_buf[d]) * up_buf[d];
-                }
+                matmul_swiglu_quant_f32(
+                    lw.expert_gate_type, w_gate_ptr,
+                    lw.expert_up_type,   w_up_ptr,
+                    x_norm.data(), gate_buf.data(), exp_dim, dim
+                );
 
                 matmul_quant_f32(lw.expert_down_type, w_down_ptr, gate_buf.data(), down_buf.data(), dim, exp_dim);
                 for (uint32_t d = 0; d < dim; ++d) {
@@ -817,11 +818,6 @@ void MoETransformerEngine::generate_stream(
     }
 
     if (!continue_assistant || !has_existing_context) {
-        {
-            std::lock_guard<std::mutex> lk(engine_mtx_);
-            get_or_create_slot(slot_id).clear();
-        }
-
         std::string prompt_to_encode = prompt;
         if (prompt_to_encode.find("<|im_start|>") == std::string::npos &&
             prompt_to_encode.find("<|user|>") == std::string::npos &&
@@ -838,8 +834,28 @@ void MoETransformerEngine::generate_stream(
             prompt_tokens.push_back(tokenizer_.bos_id());
         }
 
-        // Prefill prompt tokens through real forward pass (only compute LM head logits on final prompt token)
-        for (size_t i = 0; i < prompt_tokens.size(); ++i) {
+        // Reuse Longest Common Prefix (LCP) from existing KV cache in this slot
+        size_t lcp = 0;
+        {
+            std::lock_guard<std::mutex> lk(engine_mtx_);
+            auto& slot = get_or_create_slot(slot_id);
+            if (slot.compactions == 0 && slot.seq_pos == slot.token_history.size()) {
+                while (lcp < slot.seq_pos &&
+                       lcp + 1 < prompt_tokens.size() &&
+                       slot.token_history[lcp] == prompt_tokens[lcp]) {
+                    lcp++;
+                }
+            }
+            if (lcp > 0) {
+                slot.seq_pos = static_cast<uint32_t>(lcp);
+                slot.token_history.resize(lcp);
+            } else {
+                slot.clear();
+            }
+        }
+
+        // Prefill remaining prompt tokens through real forward pass (only compute LM head logits on final prompt token)
+        for (size_t i = lcp; i < prompt_tokens.size(); ++i) {
             const bool is_last = (i + 1 == prompt_tokens.size());
             logits = forward_token(prompt_tokens[i], slot_id, &last_prof, is_last);
         }

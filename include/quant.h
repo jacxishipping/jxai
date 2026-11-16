@@ -128,6 +128,11 @@ float vec_dot_fp8_f32(const void* vx, const float* y, int64_t k);
 
 float vec_dot_quant_f32(GGMLType type, const void* vx, const float* y, int64_t k);
 
+// Integer SIMD Dot Products with pre-quantized Q8_0 activations: dot(weight_row[k], x_q8[k])
+float vec_dot_q4_0_q8_0(const void* vx, const block_q8_0* y, int64_t k);
+float vec_dot_q8_0_q8_0(const void* vx, const block_q8_0* y, int64_t k);
+float vec_dot_q6_K_q8_0(const void* vx, const block_q8_0* y, int64_t k);
+
 // Matrix-Vector Multiplication: out[rows] = W[rows, cols] * x[cols]
 // Supports any GGMLType without full-matrix dequantization allocation
 void matmul_quant_f32(
@@ -136,6 +141,24 @@ void matmul_quant_f32(
     const float* x,
     float* out,
     int64_t rows,
+    int64_t cols
+);
+
+// Fused QKV Projection: computes q_out, k_out, v_out in a single OpenMP region with shared Q8_0 activation
+void matmul_qkv_quant_f32(
+    GGMLType wq_type, const void* Wq, int64_t q_rows, float* q_out,
+    GGMLType wk_type, const void* Wk, int64_t k_rows, float* k_out,
+    GGMLType wv_type, const void* Wv, int64_t v_rows, float* v_out,
+    const float* x, int64_t cols
+);
+
+// Fused SwiGLU Gate+Up Projection: swiglu_out[r] = SiLU((W_gate * x)[r]) * (W_up * x)[r]
+void matmul_swiglu_quant_f32(
+    GGMLType gate_type, const void* W_gate,
+    GGMLType up_type,   const void* W_up,
+    const float* x,
+    float* swiglu_out,
+    int64_t exp_dim,
     int64_t cols
 );
 
