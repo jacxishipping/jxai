@@ -157,10 +157,10 @@ bool MoETransformerEngine::load_model(const std::string& path, std::string& err_
         return false;
     }
 
-    // Initialize LFRU tier cache: keep ~50% of experts eligible for RAM/VRAM residency
+    // Initialize LFRU tier cache: keep ~50% of experts eligible for RAM/VRAM residency (or 100% for dense 1-expert models)
     size_t total_experts = static_cast<size_t>(hp_.n_layers) * static_cast<size_t>(hp_.n_experts);
-    size_t vram_slots = std::max<size_t>(4, total_experts / 4);
-    size_t ram_slots  = std::max<size_t>(4, total_experts / 4);
+    size_t vram_slots = (hp_.n_experts <= 1) ? total_experts : std::max<size_t>(4, total_experts / 4);
+    size_t ram_slots  = (hp_.n_experts <= 1) ? total_experts : std::max<size_t>(4, total_experts / 4);
     tier_mgr_.init(hp_.n_layers, hp_.n_experts, ram_slots, vram_slots, 0.08f);
 
     kv_slots_.clear();
@@ -261,6 +261,15 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
                 lw.expert_slices[e].up_bytes    = up_slice_sz;
                 lw.expert_slices[e].down_offset = t_down_exps->abs_file_offset + e * down_slice_sz;
                 lw.expert_slices[e].down_bytes  = down_slice_sz;
+                if (t_gate_exps->mapped_ptr) {
+                    lw.expert_slices[e].gate_mapped_ptr = static_cast<const uint8_t*>(t_gate_exps->mapped_ptr) + e * gate_slice_sz;
+                }
+                if (t_up_exps->mapped_ptr) {
+                    lw.expert_slices[e].up_mapped_ptr = static_cast<const uint8_t*>(t_up_exps->mapped_ptr) + e * up_slice_sz;
+                }
+                if (t_down_exps->mapped_ptr) {
+                    lw.expert_slices[e].down_mapped_ptr = static_cast<const uint8_t*>(t_down_exps->mapped_ptr) + e * down_slice_sz;
+                }
             }
         } else {
             // Check for standard Dense MLP (Qwen2.5, LLaMA, Mistral)
@@ -271,6 +280,7 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
                 hp_.n_experts = 1;
                 hp_.n_experts_used = 1;
                 hp_.moe_expert_dim = (t_gate->n_dims >= 2) ? static_cast<uint32_t>(t_gate->dims[1]) : hp_.hidden_dim;
+                lw.is_dense_ffn = true;
                 lw.expert_slices.resize(1);
                 lw.expert_gate_type = t_gate->type;
                 lw.expert_up_type   = t_up->type;
@@ -281,6 +291,9 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
                 lw.expert_slices[0].up_bytes    = t_up->byte_size;
                 lw.expert_slices[0].down_offset = t_down->abs_file_offset;
                 lw.expert_slices[0].down_bytes  = t_down->byte_size;
+                lw.expert_slices[0].gate_mapped_ptr = t_gate->mapped_ptr;
+                lw.expert_slices[0].up_mapped_ptr   = t_up->mapped_ptr;
+                lw.expert_slices[0].down_mapped_ptr = t_down->mapped_ptr;
             }
         }
     }
@@ -361,7 +374,8 @@ std::vector<ProfileSample> MoETransformerEngine::recent_profiles() const {
 std::vector<float> MoETransformerEngine::forward_token(
     uint32_t token_id,
     uint32_t slot_id,
-    ProfileSample* out_profile
+    ProfileSample* out_profile,
+    bool compute_logits
 ) {
     std::lock_guard<std::mutex> lk(engine_mtx_);
     const double t_start = now_ms();
@@ -399,6 +413,11 @@ std::vector<float> MoETransformerEngine::forward_token(
     std::vector<float> v(kv_dim, 0.0f);
     std::vector<float> attn_out(dim, 0.0f);
     std::vector<float> proj_out(dim, 0.0f);
+    std::vector<float> router_logits(hp_.n_experts, 0.0f);
+    std::vector<float> moe_accum(dim, 0.0f);
+    std::vector<float> gate_buf(exp_dim, 0.0f);
+    std::vector<float> up_buf(exp_dim, 0.0f);
+    std::vector<float> down_buf(dim, 0.0f);
 
     // Map holding PILOT async prefetch futures for Layer L+1
     std::unordered_map<uint32_t, std::future<StreamedExpertWeights>> prefetched_futures;
@@ -500,7 +519,7 @@ std::vector<float> MoETransformerEngine::forward_token(
                              ? static_cast<const float*>(lw.ffn_norm->mapped_ptr) : nullptr;
         rms_norm(x_norm.data(), x.data(), fnorm_w, dim, hp_.rms_norm_eps);
 
-        std::vector<float> router_logits(hp_.n_experts, 0.0f);
+        std::fill(router_logits.begin(), router_logits.end(), 0.0f);
         if (lw.router_gate) {
             matmul_quant_f32(lw.router_gate->type, lw.router_gate->mapped_ptr, x_norm.data(), router_logits.data(), hp_.n_experts, dim);
         } else {
@@ -532,7 +551,8 @@ std::vector<float> MoETransformerEngine::forward_token(
 
             for (uint32_t k_idx = 0; k_idx < std::min(hp_.n_experts_used, hp_.n_experts); ++k_idx) {
                 uint32_t cand_e = idx_order[k_idx];
-                if (!tier_mgr_.is_resident(l + 1, cand_e) && cand_e < next_lw.expert_slices.size()) {
+                if (!tier_mgr_.is_resident(l + 1, cand_e) && cand_e < next_lw.expert_slices.size() &&
+                    !next_lw.expert_slices[cand_e].gate_mapped_ptr) {
                     next_layer_futures[cand_e] = io_engine_.prefetch_expert_async(
                         l + 1, cand_e, next_lw.expert_slices[cand_e]
                     );
@@ -541,52 +561,65 @@ std::vector<float> MoETransformerEngine::forward_token(
         }
 
         // 7. Execute Selected MoE Experts (SwiGLU: (SiLU(u * W_gate) * (u * W_up)) * W_down)
-        std::vector<float> moe_accum(dim, 0.0f);
-        std::vector<float> gate_buf(exp_dim, 0.0f);
-        std::vector<float> up_buf(exp_dim, 0.0f);
-        std::vector<float> down_buf(dim, 0.0f);
+        std::fill(moe_accum.begin(), moe_accum.end(), 0.0f);
 
         for (const auto& sel : selected) {
             if (sel.was_cache_routed) step_routed++;
             const uint32_t e = sel.expert_idx;
-            const ExpertCacheEntry* cached = tier_mgr_.get_resident(l, e);
+            const ExpertCacheEntry* cached = lw.is_dense_ffn ? nullptr : tier_mgr_.get_resident(l, e);
 
             const void* w_gate_ptr = nullptr;
             const void* w_up_ptr   = nullptr;
             const void* w_down_ptr = nullptr;
             StreamedExpertWeights scratch;
 
-            if (cached) {
+            if (lw.is_dense_ffn && e < lw.expert_slices.size() &&
+                lw.expert_slices[e].gate_mapped_ptr &&
+                lw.expert_slices[e].up_mapped_ptr &&
+                lw.expert_slices[e].down_mapped_ptr) {
+                // Zero-copy direct memory-mapped execution for dense FFN backbone
                 step_hits++;
-                w_gate_ptr = cached->weight_gate.data();
-                w_up_ptr   = cached->weight_up.data();
-                w_down_ptr = cached->weight_down.data();
+                w_gate_ptr = lw.expert_slices[e].gate_mapped_ptr;
+                w_up_ptr   = lw.expert_slices[e].up_mapped_ptr;
+                w_down_ptr = lw.expert_slices[e].down_mapped_ptr;
+            } else if (cached) {
+                step_hits++;
+                w_gate_ptr = !cached->weight_gate.empty() ? cached->weight_gate.data() : lw.expert_slices[e].gate_mapped_ptr;
+                w_up_ptr   = !cached->weight_up.empty()   ? cached->weight_up.data()   : lw.expert_slices[e].up_mapped_ptr;
+                w_down_ptr = !cached->weight_down.empty() ? cached->weight_down.data() : lw.expert_slices[e].down_mapped_ptr;
             } else if (e < lw.expert_slices.size()) {
-                step_reads++;
-                double tio0 = now_ms();
-                auto fit = prefetched_futures.find(e);
-                if (fit != prefetched_futures.end()) {
-                    scratch = fit->second.get();
+                const auto& slice = lw.expert_slices[e];
+                if (slice.gate_mapped_ptr && slice.up_mapped_ptr && slice.down_mapped_ptr && prefetched_futures.find(e) == prefetched_futures.end()) {
+                    // Zero-copy mmap fast path: admit lightweight cache entry without duplicating multi-MB weight buffers
+                    step_hits++;
+                    tier_mgr_.admit_expert(l, e, {}, {}, {});
+                    w_gate_ptr = slice.gate_mapped_ptr;
+                    w_up_ptr   = slice.up_mapped_ptr;
+                    w_down_ptr = slice.down_mapped_ptr;
                 } else {
-                    scratch = io_engine_.read_expert_sync(l, e, lw.expert_slices[e]);
-                }
-                io_wait_ms += (now_ms() - tio0);
+                    step_reads++;
+                    double tio0 = now_ms();
+                    auto fit = prefetched_futures.find(e);
+                    if (fit != prefetched_futures.end()) {
+                        scratch = fit->second.get();
+                    } else {
+                        scratch = io_engine_.read_expert_sync(l, e, slice);
+                    }
+                    io_wait_ms += (now_ms() - tio0);
 
-                // Attempt to admit to LFRU cache (respects 25% hysteresis threshold)
-                std::vector<uint8_t> cg = scratch.gate;
-                std::vector<uint8_t> cu = scratch.up;
-                std::vector<uint8_t> cd = scratch.down;
-                const ExpertCacheEntry* admitted = tier_mgr_.admit_expert(
-                    l, e, std::move(cg), std::move(cu), std::move(cd)
-                );
-                if (admitted) {
-                    w_gate_ptr = admitted->weight_gate.data();
-                    w_up_ptr   = admitted->weight_up.data();
-                    w_down_ptr = admitted->weight_down.data();
-                } else {
-                    w_gate_ptr = scratch.gate.data();
-                    w_up_ptr   = scratch.up.data();
-                    w_down_ptr = scratch.down.data();
+                    // Attempt to admit to LFRU cache (respects 25% hysteresis threshold)
+                    const ExpertCacheEntry* admitted = tier_mgr_.admit_expert(
+                        l, e, std::move(scratch.gate), std::move(scratch.up), std::move(scratch.down)
+                    );
+                    if (admitted) {
+                        w_gate_ptr = admitted->weight_gate.data();
+                        w_up_ptr   = admitted->weight_up.data();
+                        w_down_ptr = admitted->weight_down.data();
+                    } else {
+                        w_gate_ptr = slice.gate_mapped_ptr;
+                        w_up_ptr   = slice.up_mapped_ptr;
+                        w_down_ptr = slice.down_mapped_ptr;
+                    }
                 }
             }
 
@@ -616,15 +649,18 @@ std::vector<float> MoETransformerEngine::forward_token(
 
     slot.seq_pos++;
 
-    // 8. Final RMSNorm & LM Head Logit Projection
+    // 8. Final RMSNorm & LM Head Logit Projection (skipped for intermediate prefill tokens)
     double th0 = now_ms();
-    const float* onorm_w = (out_norm_ && out_norm_->type == GGMLType::F32)
-                         ? static_cast<const float*>(out_norm_->mapped_ptr) : nullptr;
-    rms_norm(x_norm.data(), x.data(), onorm_w, dim, hp_.rms_norm_eps);
+    std::vector<float> logits;
+    if (compute_logits) {
+        const float* onorm_w = (out_norm_ && out_norm_->type == GGMLType::F32)
+                             ? static_cast<const float*>(out_norm_->mapped_ptr) : nullptr;
+        rms_norm(x_norm.data(), x.data(), onorm_w, dim, hp_.rms_norm_eps);
 
-    std::vector<float> logits(hp_.vocab_size, 0.0f);
-    if (lm_head_) {
-        matmul_quant_f32(lm_head_->type, lm_head_->mapped_ptr, x_norm.data(), logits.data(), hp_.vocab_size, dim);
+        logits.assign(hp_.vocab_size, 0.0f);
+        if (lm_head_) {
+            matmul_quant_f32(lm_head_->type, lm_head_->mapped_ptr, x_norm.data(), logits.data(), hp_.vocab_size, dim);
+        }
     }
     head_ms = now_ms() - th0;
 
@@ -802,9 +838,10 @@ void MoETransformerEngine::generate_stream(
             prompt_tokens.push_back(tokenizer_.bos_id());
         }
 
-        // Prefill prompt tokens through real forward pass
+        // Prefill prompt tokens through real forward pass (only compute LM head logits on final prompt token)
         for (size_t i = 0; i < prompt_tokens.size(); ++i) {
-            logits = forward_token(prompt_tokens[i], slot_id, &last_prof);
+            const bool is_last = (i + 1 == prompt_tokens.size());
+            logits = forward_token(prompt_tokens[i], slot_id, &last_prof, is_last);
         }
     } else {
         // Continue assistant: use last known token in history for forward step
@@ -916,8 +953,9 @@ std::vector<SystemOneOptionScore> MoETransformerEngine::evaluate_system_one(
     if (tokens.empty()) tokens.push_back(tokenizer_.bos_id());
 
     std::vector<float> logits;
-    for (uint32_t tid : tokens) {
-        logits = forward_token(tid, sys1_slot, out_profile);
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        const bool is_last = (i + 1 == tokens.size());
+        logits = forward_token(tokens[i], sys1_slot, out_profile, is_last);
     }
 
     std::vector<SystemOneOptionScore> results;

@@ -45,7 +45,8 @@ struct LayerDenseWeights {
     const TensorDescriptor* ffn_norm = nullptr;
     const TensorDescriptor* router_gate = nullptr; // [n_experts, dim]
 
-    // Sparse experts on NVMe disk (per expert slice offsets)
+    // Sparse experts on NVMe disk (per expert slice offsets) or zero-copy mapped FFN
+    bool is_dense_ffn = false;
     GGMLType expert_gate_type = GGMLType::Q4_0;
     GGMLType expert_up_type   = GGMLType::Q4_0;
     GGMLType expert_down_type = GGMLType::Q4_0;
@@ -139,11 +140,12 @@ public:
     static float silu(float x) { return x / (1.0f + std::exp(-x)); }
 
     // Execute a single real forward pass for `token_id` at current position in `slot_id`
-    // Returns vocabulary logits vector [vocab_size] and records ProfileSample
+    // Returns vocabulary logits vector [vocab_size] (or empty if compute_logits == false) and records ProfileSample
     std::vector<float> forward_token(
         uint32_t token_id,
         uint32_t slot_id,
-        ProfileSample* out_profile = nullptr
+        ProfileSample* out_profile = nullptr,
+        bool compute_logits = true
     );
 
     // Sample next token ID from logits using temperature, top-K, top-P, repetition penalty

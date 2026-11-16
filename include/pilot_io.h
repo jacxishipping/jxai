@@ -16,6 +16,9 @@ struct ExpertDiskSlice {
     uint64_t up_bytes    = 0;
     uint64_t down_offset = 0;
     uint64_t down_bytes  = 0;
+    const void* gate_mapped_ptr = nullptr;
+    const void* up_mapped_ptr   = nullptr;
+    const void* down_mapped_ptr = nullptr;
 };
 
 struct StreamedExpertWeights {
