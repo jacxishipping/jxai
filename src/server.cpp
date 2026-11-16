@@ -441,6 +441,14 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         ~Guard() { cnt--; close_sock(s); }
     } guard{active_requests_, client_sock};
 
+#ifdef _WIN32
+    DWORD rcv_timeout_ms = 5000;
+    setsockopt(static_cast<SOCKET>(client_sock), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv_timeout_ms), sizeof(rcv_timeout_ms));
+#else
+    struct timeval tv{5, 0};
+    setsockopt(static_cast<int>(client_sock), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+#endif
+
     std::string req;
     char buf[8192];
     size_t header_end = std::string::npos;

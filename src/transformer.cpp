@@ -364,7 +364,8 @@ bool MoETransformerEngine::clear_slot(uint32_t slot_id) {
 }
 
 size_t MoETransformerEngine::active_slot_count() const {
-    std::lock_guard<std::mutex> lk(engine_mtx_);
+    std::unique_lock<std::mutex> lk(engine_mtx_, std::try_to_lock);
+    if (!lk.owns_lock()) return 1;
     return kv_slots_.size();
 }
 
