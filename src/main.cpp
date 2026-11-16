@@ -182,6 +182,14 @@ bool run_verification_tests() {
     assert(std::fabs(q4k_dot - q4k_q8_dot) < 0.5f);
     assert(std::fabs(q5k_dot - q5k_q8_dot) < 0.5f);
     assert(std::fabs(q6k_dot - q6k_q8_dot) < 0.5f);
+
+    std::vector<float> deq256(K256);
+    dequantize_row_q4_K(q4k_buf.data(), deq256.data(), K256);
+    assert(std::fabs(q4k_dot - vec_dot_f32(deq256.data(), y256.data(), K256)) < 1e-3f);
+    dequantize_row_q5_K(q5k_buf.data(), deq256.data(), K256);
+    assert(std::fabs(q5k_dot - vec_dot_f32(deq256.data(), y256.data(), K256)) < 1e-3f);
+    dequantize_row_q6_K(q6k_buf.data(), deq256.data(), K256);
+    assert(std::fabs(q6k_dot - vec_dot_f32(deq256.data(), y256.data(), K256)) < 1e-3f);
     std::cout << " \033[1;32mPASSED\033[0m (Ref: " << ref_dot << ", Q8: " << q8_dot << ", Q4: " << q4_dot << ", Q6_K: " << q6k_dot << ")\n";
 
     // 2. RMSNorm Math Verification
@@ -464,6 +472,7 @@ int main(int argc, char* argv[]) {
     std::string web_dir = "web/dist";
     uint32_t max_tokens = 64;
     bool enable_speculative = false;
+    float cli_temp = 0.7f;
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
@@ -472,6 +481,7 @@ int main(int argc, char* argv[]) {
         else if (arg == "--port" && i + 1 < argc) port = static_cast<uint16_t>(std::stoi(argv[++i]));
         else if (arg == "--web-dir" && i + 1 < argc) web_dir = argv[++i];
         else if (arg == "--max-tokens" && i + 1 < argc) max_tokens = static_cast<uint32_t>(std::stoul(argv[++i]));
+        else if (arg == "--temperature" && i + 1 < argc) cli_temp = std::stof(argv[++i]);
         else if (arg == "--speculative") enable_speculative = true;
     }
 
@@ -574,7 +584,7 @@ int main(int argc, char* argv[]) {
             double t0 = now_ms();
             uint32_t count = 0;
 
-            engine.generate_stream(prompt, max_tokens, 0, true, {0.7f, 40, 0.9f, 1.1f, 42},
+            engine.generate_stream(prompt, max_tokens, 0, true, {cli_temp, 40, 0.9f, 1.1f, 42},
                 [&](const std::string& piece, bool is_reasoning, uint32_t, const ProfileSample&) {
                     if (is_reasoning && !thinking) {
                         std::cout << "\033[2m[Reasoning: ";
