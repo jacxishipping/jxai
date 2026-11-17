@@ -49,6 +49,82 @@ struct block_q6_K {
     uint16_t d;           // super-block scale (FP16)
 };
 
+// Q4_1: 32 weights per block (20 bytes) — ggml block_q4_1
+struct block_q4_1 {
+    uint16_t d;       // FP16 delta scale
+    uint16_t m;       // FP16 min offset
+    uint8_t  qs[16];  // 32 x 4-bit unsigned values (offset by m, not -8)
+};
+
+// Q5_0: 32 weights per block (22 bytes) — ggml block_q5_0
+struct block_q5_0 {
+    uint16_t d;       // FP16 delta scale
+    uint8_t  qh[4];   // high 1-bit of each 5-bit value (bit j -> element j,
+                      // bit j+16 -> element j+16), as a 32-bit little-endian
+                      // word (ggml memcpy's it into a uint32_t)
+    uint8_t  qs[16];  // low 4-bits (32 nibbles, offset by -16)
+};
+
+// Q5_1: 32 weights per block (24 bytes) — ggml block_q5_1
+struct block_q5_1 {
+    uint16_t d;       // FP16 delta scale
+    uint16_t m;       // FP16 min offset
+    uint8_t  qh[4];   // high 1-bit of each 5-bit value (as in Q5_0)
+    uint8_t  qs[16];  // low 4-bits
+};
+
+// Q8_1: 32 weights per block (36 bytes) — ggml block_q8_1.
+// d/s are FP16. s is the block sum (sum(qs) * d), used by ggml's
+// dot-product kernels; it is NOT added to each dequantized value.
+// Current llama.cpp/ggml ships no dequantize_row_q8_1 at all (it is
+// commented out in ggml-quants.h) — Q8_1 is an activation format
+// upstream. The per-element value is qs * d, which is what
+// quantize_row_q8_1_ref in ggml-quants.c writes, so that is what we
+// dequantize to.
+struct block_q8_1 {
+    uint16_t d;       // FP16 delta scale
+    uint16_t s;       // FP16 block sum (auxiliary, see above)
+    int8_t   qs[32];  // 32 x 8-bit signed ints
+};
+
+// Q2_K: 256 weights per super-block (84 bytes) — ggml block_q2_K
+struct block_q2_K {
+    uint16_t d;           // super-block scale (FP16)
+    uint16_t dmin;        // super-block min scale (FP16)
+    uint8_t  scales[16];  // 16 x (4-bit scale | 4-bit min << 4)
+    uint8_t  qs[64];      // 256 x 2-bit values, strided (see dequantize)
+};
+
+// Q3_K: 256 weights per super-block (110 bytes) — ggml block_q3_K
+struct block_q3_K {
+    uint16_t d;           // super-block scale (FP16)
+    uint8_t  qs[64];      // 256 x 2-bit low parts, strided
+    uint8_t  hmask[32];   // high-bit mask: bit (elem/32) of byte (elem%32)
+    uint8_t  scales[12];  // 16 x 6-bit scales, packed (see dequantize)
+};
+
+// Q8_K: 256 weights per super-block (292 bytes) — ggml block_q8_K.
+// NOTE: d is FP32 here, unlike every other K-quant (see ggml-common.h:
+// sizeof(block_q8_K) == sizeof(float) + 256 + 16*sizeof(int16_t)) and
+// ggml-quants.c quantize_row_q8_K_ref (y[i].d = 1/iscale, no FP16
+// conversion) / dequantize_row_q8_K (x[i].d * qs, d used as float).
+struct block_q8_K {
+    float    d;           // FP32 super-block scale
+    int8_t   qs[256];     // 256 x 8-bit signed ints
+    int16_t  bsums[16];   // sub-block sums (unused by dequantization)
+};
+
+// IQ4_XS: 256 weights per super-block (136 bytes) — ggml block_iq4_xs.
+// Dequantization needs only kvalues_iq4nl (already in this repo), so
+// unlike the other IQ types it is exactly portable without ggml's IQ
+// grid tables.
+struct block_iq4_xs {
+    uint16_t d;           // FP16 super-block scale
+    uint16_t scales_h;    // high 2 bits of each 6-bit sub-block scale
+    uint8_t  scales_l[4]; // low 4 bits of each 6-bit sub-block scale
+    uint8_t  qs[128];     // 256 x 4-bit indices into kvalues_iq4nl
+};
+
 // IQ2_S: 256 weights per super-block (82 bytes)
 struct block_iq2_s {
     uint16_t d;           // super-block scale (FP16)
@@ -75,6 +151,14 @@ static_assert(sizeof(block_q5_K) == 176, "block_q5_K must be 176 bytes");
 static_assert(sizeof(block_q6_K) == 210, "block_q6_K must be 210 bytes");
 static_assert(sizeof(block_iq2_s) == 82, "block_iq2_s must be 82 bytes");
 static_assert(sizeof(block_iq3_s) == 110, "block_iq3_s must be 110 bytes");
+static_assert(sizeof(block_q4_1) == 20, "block_q4_1 must be 20 bytes");
+static_assert(sizeof(block_q5_0) == 22, "block_q5_0 must be 22 bytes");
+static_assert(sizeof(block_q5_1) == 24, "block_q5_1 must be 24 bytes");
+static_assert(sizeof(block_q8_1) == 36, "block_q8_1 must be 36 bytes");
+static_assert(sizeof(block_q2_K) == 84, "block_q2_K must be 84 bytes");
+static_assert(sizeof(block_q3_K) == 110, "block_q3_K must be 110 bytes");
+static_assert(sizeof(block_q8_K) == 292, "block_q8_K must be 292 bytes");
+static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
 
 // Non-linear 4-bit lookup table (standard llama.cpp / ggml IQ4_NL table)
 extern const int8_t kvalues_iq4nl[16];
@@ -94,6 +178,16 @@ void quantize_row_iq4_nl(const float* x, void* vy, int64_t k);
 void quantize_row_q4_K(const float* x, void* vy, int64_t k);
 void quantize_row_q5_K(const float* x, void* vy, int64_t k);
 void quantize_row_q6_K(const float* x, void* vy, int64_t k);
+// New quantizers (layouts mirror llama.cpp ggml-quants.c *_ref versions;
+// Q2_K/Q3_K use a simplified per-group scale selection instead of ggml's
+// make_qkx*_quants optimiser — see src/quant.cpp)
+void quantize_row_q4_1(const float* x, void* vy, int64_t k);
+void quantize_row_q5_0(const float* x, void* vy, int64_t k);
+void quantize_row_q5_1(const float* x, void* vy, int64_t k);
+void quantize_row_q8_1(const float* x, void* vy, int64_t k);
+void quantize_row_q2_K(const float* x, void* vy, int64_t k);
+void quantize_row_q3_K(const float* x, void* vy, int64_t k);
+void quantize_row_q8_K(const float* x, void* vy, int64_t k);
 void quantize_row_f16(const float* x, void* vy, int64_t k);
 void quantize_row_bf16(const float* x, void* vy, int64_t k);
 void quantize_row_fp8_e4m3(const float* x, void* vy, int64_t k);
@@ -107,6 +201,15 @@ void dequantize_row_q5_K(const void* vx, float* y, int64_t k);
 void dequantize_row_q6_K(const void* vx, float* y, int64_t k);
 void dequantize_row_iq2_s(const void* vx, float* y, int64_t k);
 void dequantize_row_iq3_s(const void* vx, float* y, int64_t k);
+// New dequantizers (scalar, exact ggml layouts — see src/quant.cpp)
+void dequantize_row_q4_1(const void* vx, float* y, int64_t k);
+void dequantize_row_q5_0(const void* vx, float* y, int64_t k);
+void dequantize_row_q5_1(const void* vx, float* y, int64_t k);
+void dequantize_row_q8_1(const void* vx, float* y, int64_t k);
+void dequantize_row_q2_K(const void* vx, float* y, int64_t k);
+void dequantize_row_q3_K(const void* vx, float* y, int64_t k);
+void dequantize_row_q8_K(const void* vx, float* y, int64_t k);
+void dequantize_row_iq4_xs(const void* vx, float* y, int64_t k);
 void dequantize_row_f16(const void* vx, float* y, int64_t k);
 void dequantize_row_bf16(const void* vx, float* y, int64_t k);
 void dequantize_row_fp8_e4m3(const void* vx, float* y, int64_t k);
@@ -122,6 +225,14 @@ float vec_dot_q5_K_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_q6_K_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_iq2_s_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_iq3_s_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_q4_1_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_q5_0_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_q5_1_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_q8_1_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_q2_K_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_q3_K_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_q8_K_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_iq4_xs_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_f16_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_bf16_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_fp8_f32(const void* vx, const float* y, int64_t k);

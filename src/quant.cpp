@@ -1,5 +1,8 @@
 #include "quant.h"
 #include <algorithm>
+#include <atomic>
+#include <cstdio>
+#include <limits>
 #include <thread>
 
 #if defined(__AVX2__) || defined(_M_AVX2) || defined(__x86_64__) || defined(_M_X64)
@@ -625,6 +628,496 @@ void dequantize_row_iq2_s(const void* vx, float* y, int64_t k) {
     }
 }
 
+// ============================================================================
+// New quant types: Q4_1 / Q5_0 / Q5_1 / Q8_1 / Q2_K / Q3_K / Q8_K / IQ4_XS
+// Layouts and dequantization are ported from llama.cpp ggml-quants.c
+// (Apache-2.0, https://github.com/ggml-org/llama.cpp) — the *_ref
+// quantizers and dequantize_row_* functions. Where ggml's production
+// quantizer runs an RMSE optimiser over the scales (make_qkx2_quants /
+// make_qkx3_quants / make_q3_quants), the quantizers here use a simpler
+// per-group min/max or abs-max scale selection: the block layout and the
+// dequantization path are exact, only the encoder's scale choice is
+// simpler (same trade-off as the repo's existing quantize_row_q5_K,
+// which uses unit scales). Dequantization of real GGUF files does not
+// depend on the encoder at all.
+// ============================================================================
+
+// ggml-quants.c nearest_int: round-to-nearest via the magic-number trick.
+static inline int nearest_int(float fval) {
+    float val = fval + 12582912.f;
+    int i;
+    std::memcpy(&i, &val, sizeof(int));
+    return (i & 0x007fffff) - 0x00400000;
+}
+
+void quantize_row_q4_1(const float* x, void* vy, int64_t k) {
+    // ggml-quants.c quantize_row_q4_1_ref, verbatim.
+    const int64_t nb = k / 32;
+    auto* y = static_cast<block_q4_1*>(vy);
+    for (int64_t i = 0; i < nb; ++i) {
+        float mn = std::numeric_limits<float>::max();
+        float mx = -std::numeric_limits<float>::max();
+        for (int j = 0; j < 32; ++j) {
+            const float v = x[i * 32 + j];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        const float d  = (mx - mn) / 15.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = fp32_to_fp16(d);
+        y[i].m = fp32_to_fp16(mn);
+        for (int j = 0; j < 16; ++j) {
+            const float x0 = (x[i * 32 + 0  + j] - mn) * id;
+            const float x1 = (x[i * 32 + 16 + j] - mn) * id;
+            const uint8_t xi0 = static_cast<uint8_t>(std::min(15, static_cast<int>(x0 + 0.5f)));
+            const uint8_t xi1 = static_cast<uint8_t>(std::min(15, static_cast<int>(x1 + 0.5f)));
+            y[i].qs[j] = xi0 | (xi1 << 4);
+        }
+    }
+}
+
+void dequantize_row_q4_1(const void* vx, float* y, int64_t k) {
+    // ggml-quants.c dequantize_row_q4_1, verbatim.
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q4_1*>(vx);
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d);
+        const float m = fp16_to_fp32(x[i].m);
+        for (int j = 0; j < 16; ++j) {
+            const int x0 = (x[i].qs[j] & 0x0F);
+            const int x1 = (x[i].qs[j] >> 4);
+            y[i * 32 + j]      = x0 * d + m;
+            y[i * 32 + j + 16] = x1 * d + m;
+        }
+    }
+}
+
+void quantize_row_q5_0(const float* x, void* vy, int64_t k) {
+    // ggml-quants.c quantize_row_q5_0_ref, verbatim.
+    const int64_t nb = k / 32;
+    auto* y = static_cast<block_q5_0*>(vy);
+    for (int64_t i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        float maxv = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            const float v = x[i * 32 + j];
+            if (std::fabs(v) > amax) { amax = std::fabs(v); maxv = v; }
+        }
+        const float d  = maxv / -16.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = fp32_to_fp16(d);
+        uint32_t qh = 0;
+        for (int j = 0; j < 16; ++j) {
+            const float x0 = x[i * 32 + 0  + j] * id;
+            const float x1 = x[i * 32 + 16 + j] * id;
+            const uint8_t xi0 = static_cast<uint8_t>(std::min(31, static_cast<int>(x0 + 16.5f)));
+            const uint8_t xi1 = static_cast<uint8_t>(std::min(31, static_cast<int>(x1 + 16.5f)));
+            y[i].qs[j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
+            qh |= ((xi0 & 0x10u) >> 4) << (j + 0);
+            qh |= ((xi1 & 0x10u) >> 4) << (j + 16);
+        }
+        std::memcpy(y[i].qh, &qh, sizeof(qh));
+    }
+}
+
+void dequantize_row_q5_0(const void* vx, float* y, int64_t k) {
+    // ggml-quants.c dequantize_row_q5_0, verbatim.
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q5_0*>(vx);
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d);
+        uint32_t qh;
+        std::memcpy(&qh, &x[i].qh, sizeof(qh));
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
+            const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+            const int32_t x0 = ((x[i].qs[j] & 0x0F) | xh_0) - 16;
+            const int32_t x1 = ((x[i].qs[j] >>   4) | xh_1) - 16;
+            y[i * 32 + j]      = x0 * d;
+            y[i * 32 + j + 16] = x1 * d;
+        }
+    }
+}
+
+void quantize_row_q5_1(const float* x, void* vy, int64_t k) {
+    // ggml-quants.c quantize_row_q5_1_ref, verbatim.
+    const int64_t nb = k / 32;
+    auto* y = static_cast<block_q5_1*>(vy);
+    for (int64_t i = 0; i < nb; ++i) {
+        float mn = std::numeric_limits<float>::max();
+        float mx = -std::numeric_limits<float>::max();
+        for (int j = 0; j < 32; ++j) {
+            const float v = x[i * 32 + j];
+            if (v < mn) mn = v;
+            if (v > mx) mx = v;
+        }
+        const float d  = (mx - mn) / 31.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = fp32_to_fp16(d);
+        y[i].m = fp32_to_fp16(mn);
+        uint32_t qh = 0;
+        for (int j = 0; j < 16; ++j) {
+            const float x0 = (x[i * 32 + 0  + j] - mn) * id;
+            const float x1 = (x[i * 32 + 16 + j] - mn) * id;
+            const uint8_t xi0 = static_cast<uint8_t>(x0 + 0.5f);
+            const uint8_t xi1 = static_cast<uint8_t>(x1 + 0.5f);
+            y[i].qs[j] = (xi0 & 0x0F) | ((xi1 & 0x0F) << 4);
+            qh |= ((xi0 & 0x10u) >> 4) << (j + 0);
+            qh |= ((xi1 & 0x10u) >> 4) << (j + 16);
+        }
+        std::memcpy(y[i].qh, &qh, sizeof(qh));
+    }
+}
+
+void dequantize_row_q5_1(const void* vx, float* y, int64_t k) {
+    // ggml-quants.c dequantize_row_q5_1, verbatim.
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q5_1*>(vx);
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d);
+        const float m = fp16_to_fp32(x[i].m);
+        uint32_t qh;
+        std::memcpy(&qh, &x[i].qh, sizeof(qh));
+        for (int j = 0; j < 16; ++j) {
+            const uint8_t xh_0 = ((qh >> (j +  0)) << 4) & 0x10;
+            const uint8_t xh_1 = ((qh >> (j + 12))     ) & 0x10;
+            const int x0 = (x[i].qs[j] & 0x0F) | xh_0;
+            const int x1 = (x[i].qs[j] >>   4) | xh_1;
+            y[i * 32 + j]      = x0 * d + m;
+            y[i * 32 + j + 16] = x1 * d + m;
+        }
+    }
+}
+
+void quantize_row_q8_1(const float* x, void* vy, int64_t k) {
+    // ggml-quants.c quantize_row_q8_1_ref, verbatim.
+    const int64_t nb = k / 32;
+    auto* y = static_cast<block_q8_1*>(vy);
+    for (int64_t i = 0; i < nb; ++i) {
+        float amax = 0.0f;
+        for (int j = 0; j < 32; ++j) {
+            amax = std::max(amax, std::fabs(x[i * 32 + j]));
+        }
+        const float d  = amax / 127.0f;
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = fp32_to_fp16(d);
+        int sum = 0;
+        for (int j = 0; j < 16; ++j) {
+            const float v0 = x[i * 32 + 0  + j] * id;
+            const float v1 = x[i * 32 + 16 + j] * id;
+            y[i].qs[j]      = static_cast<int8_t>(std::round(v0));
+            y[i].qs[j + 16] = static_cast<int8_t>(std::round(v1));
+            sum += y[i].qs[j];
+            sum += y[i].qs[j + 16];
+        }
+        y[i].s = fp32_to_fp16(static_cast<float>(sum) * d);
+    }
+}
+
+void dequantize_row_q8_1(const void* vx, float* y, int64_t k) {
+    // No dequantize_row_q8_1 in current ggml (commented out in
+    // ggml-quants.h); the per-element value is qs * d, exactly what
+    // quantize_row_q8_1_ref above writes. s (block sum) is auxiliary
+    // metadata for ggml dot kernels and is not added per element —
+    // adding it would break the round-trip (s is ~sum(qs)*d, not 0).
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q8_1*>(vx);
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d = fp16_to_fp32(x[i].d);
+        for (int j = 0; j < 32; ++j) {
+            y[i * 32 + j] = x[i].qs[j] * d;
+        }
+    }
+}
+
+void quantize_row_q2_K(const float* x, void* vy, int64_t k) {
+    // Scale selection: simple per-16-group min/max (ggml's production
+    // quantizer optimises the same scales with make_qkx2_quants).
+    // Packing and the final assignment are verbatim from ggml-quants.c
+    // quantize_row_q2_K_ref. Note the format cannot represent a nonzero
+    // constant 16-group (scale 0, d 0): such a group quantizes to 0,
+    // the same limitation as ggml's ref (its L is left uninitialised
+    // there); L is zero-initialised here so the result is deterministic.
+    const int64_t nb = k / 256;
+    auto* y = static_cast<block_q2_K*>(vy);
+    uint8_t L[256];
+    for (int64_t i = 0; i < nb; ++i) {
+        const float* xb = x + i * 256;
+        float scales_f[16];
+        float mins_f[16];
+        float max_scale = 0.0f;
+        float max_min = 0.0f;
+        for (int j = 0; j < 16; ++j) {
+            float mn = xb[j * 16];
+            float mx = xb[j * 16];
+            for (int l = 1; l < 16; ++l) {
+                mn = std::min(mn, xb[j * 16 + l]);
+                mx = std::max(mx, xb[j * 16 + l]);
+            }
+            // Dequantized values are dl*q - ml with dl, ml >= 0, so the
+            // representable interval is [-ml, 3*dl - ml]. A group that
+            // straddles 0 uses ml = -mn and dl = (mx-mn)/3; an all-positive
+            // group must use ml = 0 and dl = mx/3 (a range-based dl would
+            // clamp most of the group to q = 3). mins_f is therefore never
+            // negative, and both 4-bit indices are clamped to [0, 15]:
+            // a negative min index would wrap through the uint8_t cast
+            // into a large ml and shift the whole group down.
+            if (mn < 0.0f) {
+                scales_f[j] = (mx - mn) / 3.0f;
+                mins_f[j]   = -mn;
+            } else {
+                scales_f[j] = mx / 3.0f;
+                mins_f[j]   = 0.0f;
+            }
+            max_scale = std::max(max_scale, scales_f[j]);
+            max_min   = std::max(max_min, mins_f[j]);
+        }
+        std::memset(y[i].scales, 0, 16);
+        if (max_scale > 0.0f) {
+            const float iscale = 15.0f / max_scale;
+            for (int j = 0; j < 16; ++j) {
+                y[i].scales[j] = static_cast<uint8_t>(std::clamp(nearest_int(iscale * scales_f[j]), 0, 15));
+            }
+            y[i].d = fp32_to_fp16(max_scale / 15.0f);
+        } else {
+            y[i].d = fp32_to_fp16(0.0f);
+        }
+        if (max_min > 0.0f) {
+            const float iscale = 15.0f / max_min;
+            for (int j = 0; j < 16; ++j) {
+                y[i].scales[j] |= static_cast<uint8_t>(std::clamp(nearest_int(iscale * mins_f[j]), 0, 15) << 4);
+            }
+            y[i].dmin = fp32_to_fp16(max_min / 15.0f);
+        } else {
+            y[i].dmin = fp32_to_fp16(0.0f);
+        }
+        std::memset(L, 0, sizeof(L));
+        for (int j = 0; j < 16; ++j) {
+            const float d = fp16_to_fp32(y[i].d) * (y[i].scales[j] & 0xF);
+            if (!d) continue;
+            const float dm = fp16_to_fp32(y[i].dmin) * (y[i].scales[j] >> 4);
+            for (int ii = 0; ii < 16; ++ii) {
+                int l = nearest_int((xb[16 * j + ii] + dm) / d);
+                l = std::clamp(l, 0, 3);
+                L[16 * j + ii] = static_cast<uint8_t>(l);
+            }
+        }
+        for (int j = 0; j < 256; j += 128) {
+            for (int l = 0; l < 32; ++l) {
+                y[i].qs[j / 4 + l] = L[j + l] | (L[j + l + 32] << 2) | (L[j + l + 64] << 4) | (L[j + l + 96] << 6);
+            }
+        }
+    }
+}
+
+void dequantize_row_q2_K(const void* vx, float* y, int64_t k) {
+    // ggml-quants.c dequantize_row_q2_K, verbatim.
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_q2_K*>(vx);
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d   = fp16_to_fp32(x[i].d);
+        const float min = fp16_to_fp32(x[i].dmin);
+        const uint8_t* q = x[i].qs;
+        float* yp = y + i * 256;
+        int is = 0;
+        float dl, ml;
+        for (int n = 0; n < 256; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                uint8_t sc = x[i].scales[is++];
+                dl = d * (sc & 0xF); ml = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *yp++ = dl * static_cast<float>(static_cast<int8_t>((q[l] >> shift) & 3)) - ml;
+                sc = x[i].scales[is++];
+                dl = d * (sc & 0xF); ml = min * (sc >> 4);
+                for (int l = 0; l < 16; ++l) *yp++ = dl * static_cast<float>(static_cast<int8_t>((q[l + 16] >> shift) & 3)) - ml;
+                shift += 2;
+            }
+            q += 32;
+        }
+    }
+}
+
+void quantize_row_q3_K(const float* x, void* vy, int64_t k) {
+    // Scale selection: simple per-16-group abs-max/3 (positive scales;
+    // ggml's production quantizer uses make_q3_quants, which may pick
+    // negative scales). Packing, assignment, hmask and qs layout are
+    // verbatim from ggml-quants.c quantize_row_q3_K_ref.
+    const int64_t nb = k / 256;
+    auto* y = static_cast<block_q3_K*>(vy);
+    int8_t L[256];
+    float scales_f[16];
+    for (int64_t i = 0; i < nb; ++i) {
+        const float* xb = x + i * 256;
+        float max_scale = 0.0f;
+        for (int j = 0; j < 16; ++j) {
+            float a = 0.0f;
+            for (int l = 0; l < 16; ++l) a = std::max(a, std::fabs(xb[j * 16 + l]));
+            scales_f[j] = a / 3.0f;
+            max_scale = std::max(max_scale, scales_f[j]);
+        }
+        std::memset(y[i].scales, 0, 12);
+        if (max_scale > 0.0f) {
+            const float iscale = -32.0f / max_scale;
+            for (int j = 0; j < 16; ++j) {
+                int8_t l = static_cast<int8_t>(nearest_int(iscale * scales_f[j]));
+                l = std::clamp<int8_t>(l, -32, 31);
+                l = static_cast<int8_t>(l + 32);
+                if (j < 8) {
+                    y[i].scales[j] = l & 0xF;
+                } else {
+                    y[i].scales[j - 8] |= ((l & 0xF) << 4);
+                }
+                l = static_cast<int8_t>(l >> 4);
+                y[i].scales[j % 4 + 8] |= (l << (2 * (j / 4)));
+            }
+            y[i].d = fp32_to_fp16(1.0f / iscale);
+        } else {
+            y[i].d = fp32_to_fp16(0.0f);
+        }
+        std::memset(L, 0, sizeof(L));
+        int8_t sc;
+        for (int j = 0; j < 16; ++j) {
+            sc = j < 8 ? (y[i].scales[j] & 0xF) : (y[i].scales[j - 8] >> 4);
+            sc = static_cast<int8_t>((sc | (((y[i].scales[8 + j % 4] >> (2 * (j / 4))) & 3) << 4)) - 32);
+            const float d = fp16_to_fp32(y[i].d) * sc;
+            if (!d) continue;
+            for (int ii = 0; ii < 16; ++ii) {
+                int l = nearest_int(xb[16 * j + ii] / d);
+                l = std::clamp(l, -4, 3);
+                L[16 * j + ii] = static_cast<int8_t>(l + 4);
+            }
+        }
+        std::memset(y[i].hmask, 0, 32);
+        int m = 0;
+        uint8_t hm = 1;
+        for (int j = 0; j < 256; ++j) {
+            if (L[j] > 3) {
+                y[i].hmask[m] |= hm;
+                L[j] -= 4;
+            }
+            if (++m == 32) {
+                m = 0;
+                hm <<= 1;
+            }
+        }
+        for (int j = 0; j < 256; j += 128) {
+            for (int l = 0; l < 32; ++l) {
+                y[i].qs[j / 4 + l] = L[j + l] | (L[j + l + 32] << 2) | (L[j + l + 64] << 4) | (L[j + l + 96] << 6);
+            }
+        }
+    }
+}
+
+void dequantize_row_q3_K(const void* vx, float* y, int64_t k) {
+    // ggml-quants.c dequantize_row_q3_K, verbatim.
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_q3_K*>(vx);
+    const uint32_t kmask1 = 0x03030303;
+    const uint32_t kmask2 = 0x0f0f0f0f;
+    uint32_t aux[4];
+    const int8_t* scales = reinterpret_cast<const int8_t*>(aux);
+    for (int64_t i = 0; i < nb; ++i) {
+        const float d_all = fp16_to_fp32(x[i].d);
+        const uint8_t* q = x[i].qs;
+        const uint8_t* hm = x[i].hmask;
+        uint8_t m = 1;
+        std::memcpy(aux, x[i].scales, 12);
+        uint32_t tmp = aux[2];
+        aux[2] = ((aux[0] >> 4) & kmask2) | (((tmp >> 4) & kmask1) << 4);
+        aux[3] = ((aux[1] >> 4) & kmask2) | (((tmp >> 6) & kmask1) << 4);
+        aux[0] = (aux[0] & kmask2) | (((tmp >> 0) & kmask1) << 4);
+        aux[1] = (aux[1] & kmask2) | (((tmp >> 2) & kmask1) << 4);
+        int is = 0;
+        float dl;
+        float* yp = y + i * 256;
+        for (int n = 0; n < 256; n += 128) {
+            int shift = 0;
+            for (int j = 0; j < 4; ++j) {
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *yp++ = dl * static_cast<float>(static_cast<int8_t>((q[l +  0] >> shift) & 3) - ((hm[l +  0] & m) ? 0 : 4));
+                }
+                dl = d_all * (scales[is++] - 32);
+                for (int l = 0; l < 16; ++l) {
+                    *yp++ = dl * static_cast<float>(static_cast<int8_t>((q[l + 16] >> shift) & 3) - ((hm[l + 16] & m) ? 0 : 4));
+                }
+                shift += 2;
+                m <<= 1;
+            }
+            q += 32;
+        }
+    }
+}
+
+void quantize_row_q8_K(const float* x, void* vy, int64_t k) {
+    // ggml-quants.c quantize_row_q8_K_ref, verbatim. Note d is FP32.
+    const int64_t nb = k / 256;
+    auto* y = static_cast<block_q8_K*>(vy);
+    for (int64_t i = 0; i < nb; ++i) {
+        const float* xb = x + i * 256;
+        float maxv = 0.0f;
+        float amax = 0.0f;
+        for (int j = 0; j < 256; ++j) {
+            const float ax = std::fabs(xb[j]);
+            if (ax > amax) { amax = ax; maxv = xb[j]; }
+        }
+        if (!amax) {
+            y[i].d = 0.0f;
+            std::memset(y[i].qs, 0, 256);
+            std::memset(y[i].bsums, 0, sizeof(y[i].bsums));
+            continue;
+        }
+        const float iscale = -127.0f / maxv;
+        for (int j = 0; j < 256; ++j) {
+            int v = nearest_int(iscale * xb[j]);
+            y[i].qs[j] = static_cast<int8_t>(std::clamp(v, -127, 127));
+        }
+        for (int j = 0; j < 16; ++j) {
+            int sum = 0;
+            for (int ii = 0; ii < 16; ++ii) sum += y[i].qs[j * 16 + ii];
+            y[i].bsums[j] = static_cast<int16_t>(sum);
+        }
+        y[i].d = 1.0f / iscale;
+    }
+}
+
+void dequantize_row_q8_K(const void* vx, float* y, int64_t k) {
+    // ggml-quants.c dequantize_row_q8_K, verbatim (d is FP32).
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_q8_K*>(vx);
+    for (int64_t i = 0; i < nb; ++i) {
+        for (int j = 0; j < 256; ++j) {
+            y[i * 256 + j] = x[i].d * static_cast<float>(x[i].qs[j]);
+        }
+    }
+}
+
+void dequantize_row_iq4_xs(const void* vx, float* y, int64_t k) {
+    // ggml-quants.c dequantize_row_iq4_xs, verbatim. This is the one IQ
+    // type that needs no grid table — only kvalues_iq4nl, which this
+    // repo already has. (No quantizer is provided: ggml's
+    // quantize_row_iq4_xs_ref needs the full IQ4_XS encoder; the
+    // dequantizer is verified in moe_engine test with a hand-built
+    // block instead. Real IQ4_XS files dequantize through this path.)
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_iq4_xs*>(vx);
+    for (int64_t i = 0; i < nb; ++i) {
+        const uint8_t* qs = x[i].qs;
+        const float d = fp16_to_fp32(x[i].d);
+        float* yb = y + i * 256;
+        for (int ib = 0; ib < 8; ++ib) {
+            const int ls = ((x[i].scales_l[ib / 2] >> (4 * (ib % 2))) & 0xf) | (((x[i].scales_h >> (2 * ib)) & 3) << 4);
+            const float dl = d * (ls - 32);
+            for (int j = 0; j < 16; ++j) {
+                yb[j +  0] = dl * static_cast<float>(kvalues_iq4nl[qs[j] & 0xf]);
+                yb[j + 16] = dl * static_cast<float>(kvalues_iq4nl[qs[j] >>  4]);
+            }
+            yb += 32;
+            qs += 16;
+        }
+    }
+}
+
 void quantize_row_f16(const float* x, void* vy, int64_t k) {
     auto* y = static_cast<uint16_t*>(vy);
     for (int64_t i = 0; i < k; ++i) y[i] = fp32_to_fp16(x[i]);
@@ -662,6 +1155,24 @@ void dequantize_row_fp8_e4m3(const void* vx, float* y, int64_t k) {
     for (int64_t i = 0; i < k; ++i) y[i] = fp8_e4m3_to_fp32(x[i]);
 }
 
+// Warn once per unsupported type instead of silently producing zeros:
+// a model file containing such a type would otherwise generate garbage
+// with no indication of why. (Called only from the default branches.)
+static void warn_unsupported_quant_once(GGMLType type) {
+    static std::atomic<bool> warned[64];
+    const uint32_t idx = static_cast<uint32_t>(type);
+    if (idx < 64) {
+        bool expected = false;
+        if (warned[idx].compare_exchange_strong(expected, true)) {
+            std::fprintf(stderr,
+                "[jxai quant] WARNING: GGML type %s has no dequantizer — "
+                "returning zeros. IQ2_XXS/IQ2_XS/IQ3_XXS/IQ1_S/IQ1_M/IQ2_M "
+                "need llama.cpp's IQ grid tables (not ported).\n",
+                ggml_type_name(type));
+        }
+    }
+}
+
 void dequantize_row(GGMLType type, const void* vx, float* y, int64_t k) {
     switch (type) {
         case GGMLType::F32:      std::memcpy(y, vx, k * sizeof(float)); break;
@@ -669,14 +1180,31 @@ void dequantize_row(GGMLType type, const void* vx, float* y, int64_t k) {
         case GGMLType::BF16:     dequantize_row_bf16(vx, y, k); break;
         case GGMLType::FP8_E4M3: dequantize_row_fp8_e4m3(vx, y, k); break;
         case GGMLType::Q4_0:     dequantize_row_q4_0(vx, y, k); break;
+        case GGMLType::Q4_1:     dequantize_row_q4_1(vx, y, k); break;
+        case GGMLType::Q5_0:     dequantize_row_q5_0(vx, y, k); break;
+        case GGMLType::Q5_1:     dequantize_row_q5_1(vx, y, k); break;
         case GGMLType::Q8_0:     dequantize_row_q8_0(vx, y, k); break;
+        case GGMLType::Q8_1:     dequantize_row_q8_1(vx, y, k); break;
         case GGMLType::IQ4_NL:   dequantize_row_iq4_nl(vx, y, k); break;
+        case GGMLType::Q2_K:     dequantize_row_q2_K(vx, y, k); break;
+        case GGMLType::Q3_K:     dequantize_row_q3_K(vx, y, k); break;
         case GGMLType::Q4_K:     dequantize_row_q4_K(vx, y, k); break;
         case GGMLType::Q5_K:     dequantize_row_q5_K(vx, y, k); break;
         case GGMLType::Q6_K:     dequantize_row_q6_K(vx, y, k); break;
+        case GGMLType::Q8_K:     dequantize_row_q8_K(vx, y, k); break;
         case GGMLType::IQ2_S:    dequantize_row_iq2_s(vx, y, k); break;
         case GGMLType::IQ3_S:    dequantize_row_iq3_s(vx, y, k); break;
-        default:                 std::memset(y, 0, k * sizeof(float)); break;
+        case GGMLType::IQ4_XS:   dequantize_row_iq4_xs(vx, y, k); break;
+        // Still unsupported (documented, not silent): IQ2_XXS, IQ2_XS,
+        // IQ3_XXS, IQ1_S, IQ1_M, IQ2_M — their dequantizers index
+        // llama.cpp's IQ grid tables (iq2xxs_grid, iq2xs_grid,
+        // iq3xxs_grid, iq1s_grid), which are generated by ggml's
+        // iq2xs/iq3xs init code and were not available to port exactly.
+        // Also unsupported (pre-existing): I8/I16/I32/I64/F64.
+        default:
+            warn_unsupported_quant_once(type);
+            std::memset(y, 0, k * sizeof(float));
+            break;
     }
 }
 
@@ -1099,6 +1627,49 @@ float vec_dot_iq3_s_f32(const void* vx, const float* y, int64_t k) {
     return sum;
 }
 
+// New vec_dot wrappers: dequantize one block at a time, then dot — the
+// same pattern as vec_dot_iq2_s_f32 / vec_dot_q5_K_f32 above. Scalar
+// dequantization is correct first; the Q8-activation fast paths in
+// vec_dot_row_with_q8() do not apply to these types and fall through to
+// vec_dot_quant_f32() (never to a silent 0).
+template <typename BlockT, int BLCK, void (*DeqFn)(const void*, float*, int64_t)>
+static float vec_dot_deq_f32(const void* vx, const float* y, int64_t k) {
+    alignas(32) float deq[BLCK];
+    const int64_t nb = k / BLCK;
+    const auto* blocks = static_cast<const BlockT*>(vx);
+    float sum = 0.0f;
+    for (int64_t i = 0; i < nb; ++i) {
+        DeqFn(&blocks[i], deq, BLCK);
+        sum += vec_dot_f32(deq, y + i * BLCK, BLCK);
+    }
+    return sum;
+}
+
+float vec_dot_q4_1_f32(const void* vx, const float* y, int64_t k) {
+    return vec_dot_deq_f32<block_q4_1, 32, dequantize_row_q4_1>(vx, y, k);
+}
+float vec_dot_q5_0_f32(const void* vx, const float* y, int64_t k) {
+    return vec_dot_deq_f32<block_q5_0, 32, dequantize_row_q5_0>(vx, y, k);
+}
+float vec_dot_q5_1_f32(const void* vx, const float* y, int64_t k) {
+    return vec_dot_deq_f32<block_q5_1, 32, dequantize_row_q5_1>(vx, y, k);
+}
+float vec_dot_q8_1_f32(const void* vx, const float* y, int64_t k) {
+    return vec_dot_deq_f32<block_q8_1, 32, dequantize_row_q8_1>(vx, y, k);
+}
+float vec_dot_q2_K_f32(const void* vx, const float* y, int64_t k) {
+    return vec_dot_deq_f32<block_q2_K, 256, dequantize_row_q2_K>(vx, y, k);
+}
+float vec_dot_q3_K_f32(const void* vx, const float* y, int64_t k) {
+    return vec_dot_deq_f32<block_q3_K, 256, dequantize_row_q3_K>(vx, y, k);
+}
+float vec_dot_q8_K_f32(const void* vx, const float* y, int64_t k) {
+    return vec_dot_deq_f32<block_q8_K, 256, dequantize_row_q8_K>(vx, y, k);
+}
+float vec_dot_iq4_xs_f32(const void* vx, const float* y, int64_t k) {
+    return vec_dot_deq_f32<block_iq4_xs, 256, dequantize_row_iq4_xs>(vx, y, k);
+}
+
 float vec_dot_quant_f32(GGMLType type, const void* vx, const float* y, int64_t k) {
     switch (type) {
         case GGMLType::F32:      return vec_dot_f32(static_cast<const float*>(vx), y, k);
@@ -1106,14 +1677,29 @@ float vec_dot_quant_f32(GGMLType type, const void* vx, const float* y, int64_t k
         case GGMLType::BF16:     return vec_dot_bf16_f32(vx, y, k);
         case GGMLType::FP8_E4M3: return vec_dot_fp8_f32(vx, y, k);
         case GGMLType::Q4_0:     return vec_dot_q4_0_f32(vx, y, k);
+        case GGMLType::Q4_1:     return vec_dot_q4_1_f32(vx, y, k);
+        case GGMLType::Q5_0:     return vec_dot_q5_0_f32(vx, y, k);
+        case GGMLType::Q5_1:     return vec_dot_q5_1_f32(vx, y, k);
         case GGMLType::Q8_0:     return vec_dot_q8_0_f32(vx, y, k);
+        case GGMLType::Q8_1:     return vec_dot_q8_1_f32(vx, y, k);
         case GGMLType::IQ4_NL:   return vec_dot_iq4_nl_f32(vx, y, k);
+        case GGMLType::Q2_K:     return vec_dot_q2_K_f32(vx, y, k);
+        case GGMLType::Q3_K:     return vec_dot_q3_K_f32(vx, y, k);
         case GGMLType::Q4_K:     return vec_dot_q4_K_f32(vx, y, k);
         case GGMLType::Q5_K:     return vec_dot_q5_K_f32(vx, y, k);
         case GGMLType::Q6_K:     return vec_dot_q6_K_f32(vx, y, k);
+        case GGMLType::Q8_K:     return vec_dot_q8_K_f32(vx, y, k);
         case GGMLType::IQ2_S:    return vec_dot_iq2_s_f32(vx, y, k);
         case GGMLType::IQ3_S:    return vec_dot_iq3_s_f32(vx, y, k);
-        default:                 return 0.0f;
+        case GGMLType::IQ4_XS:   return vec_dot_iq4_xs_f32(vx, y, k);
+        // Still unsupported (documented, warns once via
+        // warn_unsupported_quant_once): IQ2_XXS, IQ2_XS, IQ3_XXS, IQ1_S,
+        // IQ1_M, IQ2_M — need llama.cpp IQ grid tables. Also I8/I16/I32/
+        // I64/F64 (pre-existing). vec_dot_row_with_q8() falls back here,
+        // so these types can no longer return 0 silently from matmul.
+        default:
+            warn_unsupported_quant_once(type);
+            return 0.0f;
     }
 }
 

@@ -12,6 +12,7 @@
 #include <cassert>
 #include <fstream>
 #include <numeric>
+#include <map>
 
 namespace fs = std::filesystem;
 using namespace moe;
@@ -31,9 +32,12 @@ void print_usage() {
               << "  moe_engine doctor [--quick]                      [run hardware, NVMe speed, and SIMD diagnostics]\n"
               << "  moe_engine test                                  [run 10-point rigorous verification suite]\n"
               << "  moe_engine chat   --model <file> [--prompt \"...\"] [--max-tokens 64] [--speculative]\n"
+              << "  moe_engine info <model>                        [compatibility report: arch, RoPE, tokenizer, chat template, quant types]\n"
               << "  moe_engine serve  --model <file> [--port 8000] [--web-dir web/dist]\n"
               << "  moe_engine studio [--model <file>] [--port 8000] [launch native C++ Windows desktop app]\n"
               << "  moe_engine pull   <repo|url> [--out <dir>]       [stream & verify models from Hugging Face hub]\n"
+              << "  moe_engine pull --list <repo>                  [list available .gguf files (no download)]\n"
+              << "  moe_engine convert                             [not implemented: merge/convert guidance]\n"
               << "  moe_engine forge  --out <file.gguf> [--format gguf|safetensors]\n";
 }
 
@@ -190,6 +194,79 @@ bool run_verification_tests() {
     assert(std::fabs(q5k_dot - vec_dot_f32(deq256.data(), y256.data(), K256)) < 1e-3f);
     dequantize_row_q6_K(q6k_buf.data(), deq256.data(), K256);
     assert(std::fabs(q6k_dot - vec_dot_f32(deq256.data(), y256.data(), K256)) < 1e-3f);
+
+    // 1b. New quant types (Q4_1/Q5_0/Q5_1/Q8_1/Q2_K/Q3_K/Q8_K): quantize ->
+    // dequantize -> dot must agree with the FP32 reference, using the same
+    // tolerances as the Q4_K/Q5_K/Q6_K checks above (3.0 for the coarse
+    // 2/3/4/5-bit types, 1.0 for the 8-bit types). These are explicit
+    // runtime checks (not assert()) so they also run in Release builds,
+    // where NDEBUG disables assert.
+    {
+        auto check_roundtrip = [&](const char* name, GGMLType type,
+                                   void (*qf)(const float*, void*, int64_t),
+                                   float tol) -> bool {
+            std::vector<uint8_t> qb(tensor_byte_size(type, static_cast<uint64_t>(K256)));
+            qf(x256.data(), qb.data(), K256);
+            const float dot = vec_dot_quant_f32(type, qb.data(), y256.data(), K256);
+            std::vector<float> deq(K256);
+            dequantize_row(type, qb.data(), deq.data(), K256);
+            const float dot_deq = vec_dot_f32(deq.data(), y256.data(), K256);
+            float max_err = 0.0f;
+            for (int i = 0; i < K256; ++i) {
+                max_err = std::max(max_err, std::fabs(x256[i] - deq[i]));
+            }
+            const float err = std::fabs(ref_dot256 - dot);
+            const float agree = std::fabs(dot - dot_deq);
+            std::cout << " [" << name << ": dot-err " << err
+                      << ", max-rt-err " << max_err << "]";
+            if (!(err < tol)) {
+                std::cerr << "\n[FAIL] " << name << " dot error " << err
+                          << " exceeds tolerance " << tol << "\n";
+                return false;
+            }
+            if (!(agree < 1e-3f)) {
+                std::cerr << "\n[FAIL] " << name << " vec_dot/dequant mismatch "
+                          << agree << "\n";
+                return false;
+            }
+            return true;
+        };
+        if (!check_roundtrip("Q4_1", GGMLType::Q4_1, quantize_row_q4_1, 3.0f)) return false;
+        if (!check_roundtrip("Q5_0", GGMLType::Q5_0, quantize_row_q5_0, 3.0f)) return false;
+        if (!check_roundtrip("Q5_1", GGMLType::Q5_1, quantize_row_q5_1, 3.0f)) return false;
+        if (!check_roundtrip("Q8_1", GGMLType::Q8_1, quantize_row_q8_1, 1.0f)) return false;
+        if (!check_roundtrip("Q2_K", GGMLType::Q2_K, quantize_row_q2_K, 3.0f)) return false;
+        if (!check_roundtrip("Q3_K", GGMLType::Q3_K, quantize_row_q3_K, 3.0f)) return false;
+        if (!check_roundtrip("Q8_K", GGMLType::Q8_K, quantize_row_q8_K, 1.0f)) return false;
+    }
+
+    // 1c. IQ4_XS dequantizer (no quantizer exists in this repo — ggml's
+    // encoder is not ported): verify against a hand-built block with
+    // hand-computed expected values. Block: d = 0.5 (fp16, exact),
+    // sub-block 0 scale ls = 10 | (2 << 4) = 42 -> dl = 0.5*(42-32) = 5.0,
+    // qs[0] = 0x21 -> kvalues_iq4nl[1] = -104, kvalues_iq4nl[2] = -83,
+    // so y[0] = 5*(-104) = -520 and y[16] = 5*(-83) = -415 exactly.
+    {
+        block_iq4_xs blk{};
+        blk.d = fp32_to_fp16(0.5f);
+        blk.scales_l[0] = 10;
+        blk.scales_h = 2;
+        blk.qs[0] = 0x21;
+        std::vector<float> deq(K256, 0.0f);
+        dequantize_row_iq4_xs(&blk, deq.data(), K256);
+        const float dot = vec_dot_iq4_xs_f32(&blk, y256.data(), K256);
+        const float dot_deq = vec_dot_f32(deq.data(), y256.data(), K256);
+        std::cout << " [IQ4_XS: y0 " << deq[0] << ", y16 " << deq[16] << "]";
+        if (deq[0] != -520.0f || deq[16] != -415.0f) {
+            std::cerr << "\n[FAIL] IQ4_XS dequant mismatch: y[0]=" << deq[0]
+                      << " (want -520), y[16]=" << deq[16] << " (want -415)\n";
+            return false;
+        }
+        if (!(std::fabs(dot - dot_deq) < 1e-3f)) {
+            std::cerr << "\n[FAIL] IQ4_XS vec_dot/dequant mismatch\n";
+            return false;
+        }
+    }
     std::cout << " \033[1;32mPASSED\033[0m (Ref: " << ref_dot << ", Q8: " << q8_dot << ", Q4: " << q4_dot << ", Q6_K: " << q6k_dot << ")\n";
 
     // 2. RMSNorm Math Verification
@@ -399,6 +476,110 @@ int main(int argc, char* argv[]) {
         return run_verification_tests() ? 0 : 1;
     }
 
+    if (mode == "info") {
+        std::string info_path = (argc > 2) ? argv[2] : "models/test_qwen.gguf";
+        MoETransformerEngine eng;
+        std::string err;
+        if (!eng.load_model(info_path, err)) {
+            std::cerr << "Failed to load model: " << err << "\n";
+            return 1;
+        }
+        const auto& hp = eng.hparams();
+        const auto& tok = eng.tokenizer();
+        const auto& mf = eng.model_file();
+
+        std::cout << "=== jxai model info ===\n"
+                  << "file:           " << info_path << " (" << mf.file_size() << " bytes)\n"
+                  << "format:         " << mf.format() << "\n"
+                  << "architecture:   " << hp.arch << (arch_is_known(hp.arch) ? " (known)" : " (UNKNOWN)") << "\n"
+                  << "model name:     " << hp.model_name << "\n"
+                  << "layers:         " << hp.n_layers << "\n"
+                  << "dim:            " << hp.dim << "  hidden: " << hp.hidden_dim
+                  << "  heads: " << hp.n_heads << "  kv_heads: " << hp.n_kv_heads
+                  << "  head_dim: " << hp.head_dim << "\n"
+                  << "experts:        " << hp.n_experts << " (top-" << hp.n_experts_used << ")"
+                  << "  expert_dim: " << hp.moe_expert_dim << "\n"
+                  << "context:        max_seq_len=" << hp.max_seq_len
+                  << "  kv_cache_capacity=" << hp.kv_cache_capacity << "\n"
+                  << "rope:           " << (hp.rope_neox ? "neox (rotate-half)" : "interleaved (gpt-j)")
+                  << "  freq_base=" << hp.rope_freq_base
+                  << "  dim=" << hp.rope_dim << "\n"
+                  << "rope scaling:   type='" << hp.rope_scaling_type << "'"
+                  << "  factor=" << hp.rope_scaling_factor
+                  << "  yarn_scale=" << hp.yarn_scale
+                  << "  yarn_log_multiplier=" << hp.yarn_log_multiplier
+                  << "  orig_ctx_len=" << hp.rope_orig_ctx_len << "\n"
+                  << "softcapping:    final_logit=" << hp.final_logit_softcapping
+                  << "  attn_logit=" << hp.attn_logit_softcapping << "\n"
+                  << "tokenizer:      model='" << tok.tokenizer_model() << "'"
+                  << "  vocab=" << tok.vocab_size() << "\n"
+                  << "bos:            id=" << tok.bos_id()
+                  << "  text='" << (tok.bos_id() < tok.vocab_size() ? tok.vocab()[tok.bos_id()] : "?") << "'"
+                  << "  add_bos=" << (tok.has_add_bos_token() ? (tok.add_bos_token() ? "true (gguf)" : "false (gguf)") : "unset (per-arch default)")
+                  << "\n"
+                  << "eos:            id=" << tok.eos_id()
+                  << "  text='" << (tok.eos_id() < tok.vocab_size() ? tok.vocab()[tok.eos_id()] : "?") << "'"
+                  << "  add_eos=" << (tok.has_add_eos_token() ? (tok.add_eos_token() ? "true (gguf)" : "false (gguf)") : "unset")
+                  << "\n"
+                  << "chat template:  " << eng.chat_template_source() << "\n";
+
+        auto stops = eng.stop_token_ids();
+        std::cout << "stop tokens:    ";
+        for (size_t i = 0; i < stops.size(); ++i) {
+            if (i) std::cout << ", ";
+            std::cout << stops[i];
+            if (stops[i] < tok.vocab_size()) std::cout << "('" << tok.vocab()[stops[i]] << "')";
+        }
+        std::cout << "\n";
+
+        // Quant types present in the tensors, with a dequantizer check.
+        // Dequantizers present in quant.cpp (dequantize_row) as of this
+        // build: F32 F16 BF16 FP8_E4M3 Q4_0 Q8_0 IQ4_NL Q4_K Q5_K Q6_K
+        // IQ2_S IQ3_S. Anything else is reported as a WARN below.
+        std::map<std::string, size_t> qcounts;
+        for (const auto& kv : mf.tensors()) {
+            qcounts[ggml_type_name(kv.second.type)]++;
+        }
+        std::cout << "quant types:    ";
+        bool first_q = true;
+        for (const auto& kv : qcounts) {
+            if (!first_q) std::cout << ", ";
+            first_q = false;
+            std::cout << kv.first << " x" << kv.second;
+        }
+        std::cout << "  (tensors: " << mf.tensors().size() << ")\n";
+
+        std::cout << "--- warnings ---\n";
+        bool any_warn = false;
+        if (!arch_is_known(hp.arch)) {
+            std::cout << "WARN: unknown architecture '" << hp.arch
+                      << "' — RoPE defaults to Neox and the chat template falls back to ChatML; verify output.\n";
+            any_warn = true;
+        }
+        static const char* kDequant[] = {"F32", "F16", "BF16", "FP8_E4M3", "Q4_0", "Q8_0",
+                                         "IQ4_NL", "Q4_K", "Q5_K", "Q6_K", "IQ2_S", "IQ3_S"};
+        for (const auto& kv : qcounts) {
+            bool supported = false;
+            for (const char* s : kDequant) if (kv.first == s) { supported = true; break; }
+            if (!supported) {
+                std::cout << "WARN: quant type " << kv.first << " (x" << kv.second
+                          << ") has no dequantizer in quant.cpp — those tensors cannot be executed.\n";
+                any_warn = true;
+            }
+        }
+        if (tok.chat_template().empty()) {
+            std::cout << "WARN: no tokenizer.chat_template in the GGUF — using per-arch fallback ("
+                      << eng.chat_template_source() << ").\n";
+            any_warn = true;
+        }
+        if (tok.vocab_size() == 0) {
+            std::cout << "WARN: empty tokenizer vocabulary.\n";
+            any_warn = true;
+        }
+        if (!any_warn) std::cout << "(none)\n";
+        return 0;
+    }
+
     if (mode == "inspect") {
         std::string inspect_path = (argc > 2) ? argv[2] : "models/test_qwen.gguf";
         ModelFile p;
@@ -501,9 +682,81 @@ int main(int argc, char* argv[]) {
     if (mode == "pull") {
         if (argc < 3 || std::string(argv[2]) == "--help" || std::string(argv[2]) == "-h") {
             std::cerr << "Usage: moe_engine pull <repo_or_url> [--out <dir>]\n"
+                      << "       moe_engine pull --list <repo>\n"
                       << "Examples:\n"
                       << "  moe_engine pull Qwen/Qwen2.5-0.5B-Instruct-GGUF\n"
-                      << "  moe_engine pull https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf\n";
+                      << "  moe_engine pull Qwen/Qwen2.5-0.5B-Instruct-GGUF:qwen2.5-0.5b-instruct-q4_0.gguf\n"
+                      << "  moe_engine pull --list Qwen/Qwen2.5-0.5B-Instruct-GGUF\n"
+                      << "  moe_engine pull https://huggingface.co/Qwen/Qwen2.5-0.5B-Instruct-GGUF/resolve/main/qwen2.5-0.5b-instruct-q4_0.gguf\n"
+                      << "A bare repo id is resolved via the Hugging Face API (no filename\n"
+                      << "guessing): single-file .gguf files are preferred (Q4_K_M, then Q4_0,\n"
+                      << "then Q5_K_M, ...), sharded repos download ALL parts and must be\n"
+                      << "merged before the engine can load them (see `moe_engine convert`).\n"
+                      << "Downloads resume, verify Content-Length, and validate the file\n"
+                      << "header. Gated repos need HF_TOKEN set to a token with access.\n";
+            return 0;
+        }
+        if (std::string(argv[2]) == "--list") {
+            if (argc < 4) {
+                std::cerr << "Usage: moe_engine pull --list <owner/name>\n";
+                return 1;
+            }
+            std::string repo = argv[3];
+            std::vector<HfFileInfo> gguf_files, st_files;
+            bool gated = false;
+            std::string err;
+            if (!list_hf_model_files(repo, gguf_files, st_files, gated, err)) {
+                std::cerr << "\033[1;31m[ERROR] " << err << "\033[0m\n";
+                return 1;
+            }
+            std::cout << "Hugging Face repo: " << repo
+                      << (gated ? "  [GATED — downloads need HF_TOKEN]" : "") << "\n";
+            if (gguf_files.empty()) {
+                std::cout << "No .gguf files in this repo.\n";
+            } else {
+                // The recommended pick is what a bare `pull` would download:
+                // the best-ranked single file, or the best-ranked shard group
+                // when the repo has no single-file .gguf at all.
+                const HfFileInfo* rec_single = nullptr;
+                for (const auto& f : gguf_files) {
+                    if (!f.is_shard) { rec_single = &f; break; }
+                }
+                std::string rec_group = rec_single ? "" : gguf_files.front().shard_group;
+                bool rec_label_shown = false;
+                std::cout << ".gguf files (best pick first):\n";
+                for (size_t i = 0; i < gguf_files.size(); ++i) {
+                    const auto& f = gguf_files[i];
+                    bool is_rec = rec_single ? (&f == rec_single)
+                                             : (f.is_shard && f.shard_group == rec_group);
+                    std::cout << "  " << (is_rec ? "* " : "  ") << f.filename << "  ("
+                              << std::fixed << std::setprecision(1)
+                              << (f.size / (1024.0 * 1024.0)) << " MB)";
+                    if (f.is_shard) {
+                        std::cout << "  [shard " << f.shard_index << " of " << f.shard_total
+                                  << " — group '" << f.shard_group << "']";
+                    }
+                    if (is_rec && !rec_label_shown) {
+                        std::cout << "  <-- recommended pick";
+                        rec_label_shown = true;
+                    }
+                    std::cout << "\n";
+                }
+                bool any_shard = false;
+                for (const auto& f : gguf_files) if (f.is_shard) any_shard = true;
+                if (any_shard) {
+                    std::cout << "Note: sharded files must be merged before the engine can load\n"
+                              << "them (see `moe_engine convert`). A bare `pull` prefers a\n"
+                              << "single-file .gguf when the repo has one.\n";
+                }
+            }
+            if (!st_files.empty()) {
+                std::cout << ".safetensors files:\n";
+                for (const auto& f : st_files) {
+                    std::cout << "    " << f.filename << "  ("
+                              << std::fixed << std::setprecision(1)
+                              << (f.size / (1024.0 * 1024.0)) << " MB)\n";
+                }
+            }
             return 0;
         }
         std::string target = argv[2];
@@ -517,6 +770,22 @@ int main(int argc, char* argv[]) {
             return 1;
         }
         return 0;
+    }
+
+    if (mode == "convert") {
+        // NOTE only: merging sharded GGUFs and converting SafeTensors ->
+        // GGUF need repacking logic the engine does not have yet. Point at
+        // the standard external tools instead of pretending to convert.
+        std::cout << "moe_engine convert is not implemented yet.\n\n"
+                  << "Sharded GGUF (model-00001-of-00002.gguf, ...): merge the parts\n"
+                  << "first with llama.cpp:\n"
+                  << "  gguf-split --merge <first-part.gguf> <merged.gguf>\n"
+                  << "then load the merged file with `moe_engine serve --model <merged.gguf>`.\n\n"
+                  << "SafeTensors -> GGUF: convert with llama.cpp:\n"
+                  << "  python convert_hf_to_gguf.py <hf-model-dir> --outfile <model.gguf>\n"
+                  << "Single-file SafeTensors models can also be loaded directly by the\n"
+                  << "engine when a sibling config.json is present (see ModelFile).\n";
+        return 1;
     }
 
     if (mode == "studio") {

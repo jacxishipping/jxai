@@ -111,8 +111,21 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
     has_byte_fallback_ = false;
     is_byte_level_bpe_ = false;
     is_sentencepiece_ = false;
+    chat_template_.clear();
+    tokenizer_model_.clear();
+    has_add_bos_token_ = false;
+    add_bos_token_ = false;
+    has_add_eos_token_ = false;
+    add_eos_token_ = false;
 
     const auto& meta = mf.metadata();
+    chat_template_ = mf.get_str("tokenizer.chat_template", "");
+    {
+        auto it_bos = meta.find("tokenizer.ggml.add_bos_token");
+        if (it_bos != meta.end()) { has_add_bos_token_ = true; add_bos_token_ = it_bos->second.bval; }
+        auto it_eos = meta.find("tokenizer.ggml.add_eos_token");
+        if (it_eos != meta.end()) { has_add_eos_token_ = true; add_eos_token_ = it_eos->second.bval; }
+    }
     auto it_tok = meta.find("tokenizer.ggml.tokens");
     if (it_tok != meta.end() && !it_tok->second.str_arr.empty()) {
         vocab_ = it_tok->second.str_arr;
@@ -132,6 +145,7 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
     }
 
     std::string tok_model = mf.get_str("tokenizer.ggml.model", "");
+    tokenizer_model_ = tok_model;
     if (tok_model == "gpt2") {
         is_byte_level_bpe_ = true;
     } else if (tok_model == "llama" || tok_model == "gemma" || tok_model == "gemma4") {
@@ -145,8 +159,29 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
         }
     }
 
-    // If SafeTensors or missing GGUF vocab, build default byte-level + common BPE vocab
+    // If the GGUF carries no vocab (e.g. SafeTensors models), try a sibling
+    // tokenizer.json next to the model file before falling back to a
+    // synthetic byte-level vocab (which can only produce toy output).
     if (vocab_.empty()) {
+        std::string model_path = mf.path();
+        size_t slash = model_path.find_last_of("/\\");
+        std::string dir = (slash == std::string::npos) ? "" : model_path.substr(0, slash + 1);
+        {
+            std::string tj_path = dir + "tokenizer.json";
+            std::ifstream probe(tj_path);
+            if (probe.good()) {
+                probe.close();
+                if (load_tokenizer_json(tj_path) && !vocab_.empty()) {
+                    bos_id_ = mf.get_u32("tokenizer.ggml.bos_token_id", bos_id_);
+                    eos_id_ = mf.get_u32("tokenizer.ggml.eos_token_id", eos_id_);
+                    return true;
+                }
+                // JSON load failed: fall through to the synthetic vocab below.
+                vocab_.clear();
+                token_to_id_.clear();
+                special_tokens_.clear();
+            }
+        }
         uint32_t target_vocab = 512;
         const auto* emb = mf.find_tensor("token_embd.weight");
         if (emb && emb->n_dims >= 2) {
@@ -177,6 +212,18 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
         }
     }
 
+    rebuild_token_index();
+
+    bos_id_ = mf.get_u32("tokenizer.ggml.bos_token_id", bos_id_);
+    eos_id_ = mf.get_u32("tokenizer.ggml.eos_token_id", eos_id_);
+
+    return true;
+}
+
+void Tokenizer::rebuild_token_index() {
+    token_to_id_.clear();
+    special_tokens_.clear();
+    has_byte_fallback_ = false;
     for (uint32_t i = 0; i < vocab_.size(); ++i) {
         const std::string& t = vocab_[i];
         token_to_id_[t] = i;
@@ -209,16 +256,191 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
     // Sort special tokens longest-first so greedy matching prefers longer tags
     std::sort(special_tokens_.begin(), special_tokens_.end(),
         [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
+}
 
-    bos_id_ = mf.get_u32("tokenizer.ggml.bos_token_id", bos_id_);
-    eos_id_ = mf.get_u32("tokenizer.ggml.eos_token_id", eos_id_);
+// --- Minimal JSON helpers for tokenizer.json (HF format) ---
+// Only what a tokenizer.json needs: string values with escapes, numbers,
+// and the "vocab" / "merges" / "added_tokens" structures. No full JSON lib.
+static void tj_skip_ws(const std::string& s, size_t& pos) {
+    while (pos < s.size() && (s[pos] == ' ' || s[pos] == '\t' || s[pos] == '\n' || s[pos] == '\r')) ++pos;
+}
 
+// Parse a JSON string starting at s[pos] == '"'. Advances pos past the closing quote.
+static bool tj_parse_string(const std::string& s, size_t& pos, std::string& out) {
+    if (pos >= s.size() || s[pos] != '"') return false;
+    ++pos;
+    out.clear();
+    while (pos < s.size()) {
+        char c = s[pos++];
+        if (c == '"') return true;
+        if (c == '\\' && pos < s.size()) {
+            char e = s[pos++];
+            switch (e) {
+                case 'n': out.push_back('\n'); break;
+                case 't': out.push_back('\t'); break;
+                case 'r': out.push_back('\r'); break;
+                case 'b': out.push_back('\b'); break;
+                case 'f': out.push_back('\f'); break;
+                case '/': out.push_back('/'); break;
+                case '\\': out.push_back('\\'); break;
+                case '"': out.push_back('"'); break;
+                case 'u': {
+                    if (pos + 4 > s.size()) return false;
+                    unsigned cp = 0;
+                    for (int k = 0; k < 4; ++k) {
+                        char h = s[pos++];
+                        cp <<= 4;
+                        if (h >= '0' && h <= '9') cp |= static_cast<unsigned>(h - '0');
+                        else if (h >= 'a' && h <= 'f') cp |= static_cast<unsigned>(h - 'a' + 10);
+                        else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
+                        else return false;
+                    }
+                    out += codepoint_to_utf8(cp);
+                    break;
+                }
+                default: out.push_back(e); break;
+            }
+        } else {
+            out.push_back(c);
+        }
+    }
+    return false;
+}
+
+// Find `"key"` at any depth and leave pos just past the ':' that follows it.
+static bool tj_find_key(const std::string& s, const std::string& key, size_t& pos_out) {
+    std::string pat = "\"" + key + "\"";
+    size_t p = s.find(pat);
+    if (p == std::string::npos) return false;
+    size_t colon = s.find(':', p + pat.size());
+    if (colon == std::string::npos) return false;
+    pos_out = colon + 1;
     return true;
 }
 
 bool Tokenizer::load_tokenizer_json(const std::string& json_path) {
-    std::ifstream ifs(json_path);
-    return ifs.good();
+    std::ifstream ifs(json_path, std::ios::binary);
+    if (!ifs.good()) return false;
+    std::string js((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    if (js.empty()) return false;
+
+    // Byte-level BPE when the file uses a ByteLevel pre-tokenizer / decoder.
+    if (js.find("ByteLevel") != std::string::npos) {
+        is_byte_level_bpe_ = true;
+        is_sentencepiece_ = false;
+    } else if (js.find("SentencePiece") != std::string::npos || js.find("Unigram") != std::string::npos) {
+        is_sentencepiece_ = true;
+        is_byte_level_bpe_ = false;
+    }
+    if (tokenizer_model_.empty()) {
+        // "model": {"type": "BPE" | "Unigram" | ...}
+        size_t mp = 0;
+        if (tj_find_key(js, "type", mp)) {
+            tj_skip_ws(js, mp);
+            std::string t;
+            if (tj_parse_string(js, mp, t)) tokenizer_model_ = t;
+        }
+    }
+
+    // --- "vocab": { "<token>": id, ... } ---
+    size_t vp = 0;
+    if (!tj_find_key(js, "vocab", vp)) return false;
+    tj_skip_ws(js, vp);
+    if (vp >= js.size() || js[vp] != '{') return false;
+    ++vp;
+    std::vector<std::pair<uint32_t, std::string>> by_id;
+    while (true) {
+        tj_skip_ws(js, vp);
+        if (vp >= js.size()) return false;
+        if (js[vp] == '}') { ++vp; break; }
+        std::string tok;
+        if (!tj_parse_string(js, vp, tok)) return false;
+        tj_skip_ws(js, vp);
+        if (vp >= js.size() || js[vp] != ':') return false;
+        ++vp;
+        tj_skip_ws(js, vp);
+        size_t num_start = vp;
+        if (vp < js.size() && (js[vp] == '-' || js[vp] == '+')) ++vp;
+        while (vp < js.size() && js[vp] >= '0' && js[vp] <= '9') ++vp;
+        if (num_start == vp) return false;
+        uint32_t id = static_cast<uint32_t>(std::stoul(js.substr(num_start, vp - num_start)));
+        by_id.emplace_back(id, tok);
+        tj_skip_ws(js, vp);
+        if (vp < js.size() && js[vp] == ',') { ++vp; continue; }
+        if (vp < js.size() && js[vp] == '}') { ++vp; break; }
+    }
+    if (by_id.empty()) return false;
+    uint32_t max_id = 0;
+    for (const auto& p : by_id) max_id = std::max(max_id, p.first);
+    vocab_.assign(max_id + 1, "<unk>");
+    for (const auto& p : by_id) vocab_[p.first] = p.second;
+
+    // --- "merges": ["a b", ...] ---
+    size_t mg = 0;
+    if (tj_find_key(js, "merges", mg)) {
+        tj_skip_ws(js, mg);
+        if (mg < js.size() && js[mg] == '[') {
+            ++mg;
+            merge_ranks_.clear();
+            int32_t rank = 0;
+            while (true) {
+                tj_skip_ws(js, mg);
+                if (mg >= js.size()) break;
+                if (js[mg] == ']') { ++mg; break; }
+                std::string m;
+                if (!tj_parse_string(js, mg, m)) break;
+                merge_ranks_[m] = rank++;
+                tj_skip_ws(js, mg);
+                if (mg < js.size() && js[mg] == ',') { ++mg; continue; }
+                if (mg < js.size() && js[mg] == ']') { ++mg; break; }
+            }
+        }
+    }
+
+    // --- "added_tokens": [{"id": n, "content": "...", "special": true}, ...] ---
+    size_t ap = 0;
+    if (tj_find_key(js, "added_tokens", ap)) {
+        tj_skip_ws(js, ap);
+        if (ap < js.size() && js[ap] == '[') {
+            ++ap;
+            while (true) {
+                tj_skip_ws(js, ap);
+                if (ap >= js.size()) break;
+                if (js[ap] == ']') { ++ap; break; }
+                if (js[ap] != '{') break;
+                // Scan one object for "id" and "content".
+                size_t obj_end = js.find('}', ap);
+                if (obj_end == std::string::npos) break;
+                std::string obj = js.substr(ap, obj_end - ap + 1);
+                size_t ip = 0;
+                uint32_t id = 0;
+                std::string content;
+                bool have_id = false, have_content = false;
+                if (tj_find_key(obj, "id", ip)) {
+                    tj_skip_ws(obj, ip);
+                    size_t ns = ip;
+                    while (ip < obj.size() && obj[ip] >= '0' && obj[ip] <= '9') ++ip;
+                    if (ip > ns) { id = static_cast<uint32_t>(std::stoul(obj.substr(ns, ip - ns))); have_id = true; }
+                }
+                size_t cp = 0;
+                if (tj_find_key(obj, "content", cp)) {
+                    tj_skip_ws(obj, cp);
+                    if (tj_parse_string(obj, cp, content)) have_content = true;
+                }
+                if (have_id && have_content) {
+                    if (id >= vocab_.size()) vocab_.resize(id + 1, "<unk>");
+                    vocab_[id] = content;
+                }
+                ap = obj_end + 1;
+                tj_skip_ws(js, ap);
+                if (ap < js.size() && js[ap] == ',') { ++ap; continue; }
+            }
+        }
+    }
+
+    scores_.assign(vocab_.size(), 0.0f);
+    rebuild_token_index();
+    return !vocab_.empty();
 }
 
 int32_t Tokenizer::token_to_id(const std::string& tok) const {

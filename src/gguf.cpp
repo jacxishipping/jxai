@@ -1,5 +1,7 @@
 #include "gguf.h"
 #include <algorithm>
+#include <filesystem>
+#include <fstream>
 
 namespace moe {
 
@@ -34,6 +36,14 @@ void ModelFile::close() {
     metadata_.clear();
     tensors_.clear();
     tensor_order_.clear();
+    alias_.clear();
+    config_loaded_ = false;
+    detected_arch_.clear();
+    config_path_.clear();
+    tokenizer_path_.clear();
+    st_moe_unsupported_ = false;
+    st_untranslated_.clear();
+    st_unknown_dtypes_.clear();
     file_size_ = 0;
 }
 
@@ -105,7 +115,12 @@ bool ModelFile::open(const std::string& path, std::string& err_msg) {
         return parse_gguf(err_msg);
     } else {
         format_ = "SafeTensors";
-        return parse_safetensors(err_msg);
+        if (!parse_safetensors(err_msg)) return false;
+        // Best-effort only: a missing/unparseable config.json must not fail
+        // the open — the engine then falls back to its previous defaults
+        // (and the caller can check config_loaded() / detected_arch()).
+        load_safetensors_config();
+        return true;
     }
 }
 
@@ -141,6 +156,165 @@ bool is_expert_tensor_name(const std::string& name) {
            name.find("ffn_up_exps")   != std::string::npos ||
            name.find("ffn_down_exps") != std::string::npos ||
            name.find(".experts.")     != std::string::npos;
+}
+
+// ---------------------------------------------------------------------------
+// SafeTensors helpers: minimal flat-JSON field extraction (no JSON library),
+// HF architecture mapping, and HF -> GGUF tensor-name translation.
+// ---------------------------------------------------------------------------
+
+// First string value for a flat JSON key, e.g. "torch_dtype": "bfloat16".
+bool cfg_get_string(const std::string& json, const std::string& key, std::string& out) {
+    std::string pat = "\"" + key + "\"";
+    size_t k = json.find(pat);
+    if (k == std::string::npos) return false;
+    size_t colon = json.find(':', k + pat.size());
+    if (colon == std::string::npos) return false;
+    size_t q1 = json.find('"', colon + 1);
+    if (q1 == std::string::npos) return false;
+    size_t i = q1 + 1;
+    out.clear();
+    while (i < json.size() && json[i] != '"') {
+        if (json[i] == '\\' && i + 1 < json.size()) ++i;
+        out.push_back(json[i++]);
+    }
+    return i < json.size();
+}
+
+bool cfg_get_number(const std::string& json, const std::string& key, double& out) {
+    std::string pat = "\"" + key + "\"";
+    size_t k = json.find(pat);
+    if (k == std::string::npos) return false;
+    size_t colon = json.find(':', k + pat.size());
+    if (colon == std::string::npos) return false;
+    size_t i = colon + 1;
+    while (i < json.size() && (json[i] == ' ' || json[i] == '\t')) ++i;
+    size_t start = i;
+    while (i < json.size() &&
+           (std::isdigit(static_cast<unsigned char>(json[i])) || json[i] == '-' ||
+            json[i] == '+' || json[i] == '.' || json[i] == 'e' || json[i] == 'E')) ++i;
+    if (i == start) return false;
+    try { out = std::stod(json.substr(start, i - start)); } catch (...) { return false; }
+    return true;
+}
+
+bool cfg_get_bool(const std::string& json, const std::string& key, bool& out) {
+    std::string pat = "\"" + key + "\"";
+    size_t k = json.find(pat);
+    if (k == std::string::npos) return false;
+    size_t colon = json.find(':', k + pat.size());
+    if (colon == std::string::npos) return false;
+    size_t i = colon + 1;
+    while (i < json.size() && (json[i] == ' ' || json[i] == '\t')) ++i;
+    std::string rest = json.substr(i, 5);
+    if (rest.rfind("true", 0) == 0) { out = true; return true; }
+    if (rest.rfind("false", 0) == 0) { out = false; return true; }
+    return false;
+}
+
+// First string element of an array value, e.g. "architectures": ["Qwen2..."].
+bool cfg_get_first_array_string(const std::string& json, const std::string& key, std::string& out) {
+    std::string pat = "\"" + key + "\"";
+    size_t k = json.find(pat);
+    if (k == std::string::npos) return false;
+    size_t br = json.find('[', k + pat.size());
+    if (br == std::string::npos) return false;
+    size_t q1 = json.find('"', br + 1);
+    if (q1 == std::string::npos) return false;
+    size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return false;
+    out = json.substr(q1 + 1, q2 - q1 - 1);
+    return true;
+}
+
+// HF transformers class name -> GGUF architecture string used by the engine
+// (general.architecture, and the "<arch>.*" metadata prefix).
+std::string hf_arch_to_gguf(const std::string& hf_class) {
+    static const std::pair<const char*, const char*> kArch[] = {
+        {"Qwen2ForCausalLM", "qwen2"},   {"Qwen2MoeForCausalLM", "qwen2moe"},
+        {"Qwen3ForCausalLM", "qwen3"},   {"Qwen3MoeForCausalLM", "qwen3moe"},
+        {"LlamaForCausalLM", "llama"},   {"MistralForCausalLM", "mistral"},
+        {"MixtralForCausalLM", "mixtral"},
+        {"GemmaForCausalLM", "gemma"},   {"Gemma2ForCausalLM", "gemma2"},
+        {"Gemma3ForCausalLM", "gemma3"},
+        {"PhiForCausalLM", "phi"},       {"Phi3ForCausalLM", "phi3"},
+        {"Phi3SmallForCausalLM", "phi3"},
+        {"DeepseekForCausalLM", "deepseek"},
+        {"DeepseekV2ForCausalLM", "deepseek2"}, {"DeepseekV3ForCausalLM", "deepseek2"},
+        {"FalconForCausalLM", "falcon"}, {"GPTNeoXForCausalLM", "gptneox"},
+        {"GPTJForCausalLM", "gptj"},     {"OlmoForCausalLM", "olmo"},
+        {"OlmoeForCausalLM", "olmoe"},   {"ChatGLMForCausalLM", "glm"},
+        {"GLMForCausalLM", "glm"},       {"InternLM2ForCausalLM", "internlm2"},
+        {"StableLmForCausalLM", "stablelm"},
+        {"CohereForCausalLM", "cohere"}, {"DbrxForCausalLM", "dbrx"},
+    };
+    for (const auto& [hf, gguf] : kArch) {
+        if (hf_class == hf) return gguf;
+    }
+    return "";
+}
+
+bool is_known_gguf_arch(const std::string& arch) {
+    static const char* kKnown[] = {
+        "qwen2", "qwen2moe", "qwen3", "qwen3moe", "llama", "mistral", "mixtral",
+        "gemma", "gemma2", "gemma3", "gemma4", "phi", "phi3", "deepseek",
+        "deepseek2", "falcon", "gptneox", "gptj", "olmo", "olmoe", "glm",
+        "internlm2", "stablelm", "cohere", "dbrx",
+    };
+    for (const char* k : kKnown) if (arch == k) return true;
+    return false;
+}
+
+std::vector<std::string> split_dots(const std::string& s) {
+    std::vector<std::string> parts;
+    size_t start = 0;
+    while (true) {
+        size_t dot = s.find('.', start);
+        if (dot == std::string::npos) { parts.push_back(s.substr(start)); break; }
+        parts.push_back(s.substr(start, dot - start));
+        start = dot + 1;
+    }
+    return parts;
+}
+
+// Translate one HF (transformers) tensor name to its GGUF equivalent.
+// Returns "" when there is no translation (unknown pattern, MoE experts,
+// fused projections). The caller records those in st_untranslated_.
+std::string translate_hf_tensor_name(const std::string& hf_name) {
+    std::vector<std::string> p = split_dots(hf_name);
+    if (!p.empty() && p[0] == "model") p.erase(p.begin());
+    if (p.size() == 2 && p[0] == "embed_tokens" && p[1] == "weight") return "token_embd.weight";
+    if (p.size() == 2 && p[0] == "norm" && p[1] == "weight") return "output_norm.weight";
+    if (p.size() == 2 && p[0] == "lm_head" && p[1] == "weight") return "output.weight";
+    if (p.size() < 4 || p[0] != "layers") return "";
+    const std::string& layer = p[1];
+    const std::string blk = "blk." + layer + ".";
+    if (p[2] == "input_layernorm" && p[3] == "weight") return blk + "attn_norm.weight";
+    if (p[2] == "post_attention_layernorm" && p[3] == "weight") return blk + "ffn_norm.weight";
+    if (p[2] == "self_attn" && p.size() >= 4) {
+        std::string suffix = (p.size() >= 5) ? p[4] : "weight"; // "weight" or "bias"
+        if (suffix != "weight" && suffix != "bias") return "";
+        if (p[3] == "q_proj") return blk + "attn_q." + suffix;
+        if (p[3] == "k_proj") return blk + "attn_k." + suffix;
+        if (p[3] == "v_proj") return blk + "attn_v." + suffix;
+        if (p[3] == "o_proj") return blk + "attn_output." + suffix;
+        if (p[3] == "q_norm") return blk + "attn_q_norm.weight";
+        if (p[3] == "k_norm") return blk + "attn_k_norm.weight";
+        return ""; // qkv_proj (fused) and anything else: no translation
+    }
+    if (p[2] == "mlp" && p.size() >= 4) {
+        if (p[3] == "gate_proj" && p.size() >= 5 && p[4] == "weight") return blk + "ffn_gate.weight";
+        if (p[3] == "up_proj" && p.size() >= 5 && p[4] == "weight") return blk + "ffn_up.weight";
+        if (p[3] == "down_proj" && p.size() >= 5 && p[4] == "weight") return blk + "ffn_down.weight";
+        // Qwen2.5-MoE / DeepSeek shared expert (dense tensors, translatable).
+        if (p[3] == "shared_expert" && p.size() >= 6 && p[5] == "weight") {
+            if (p[4] == "gate_proj") return blk + "ffn_gate_shexp.weight";
+            if (p[4] == "up_proj") return blk + "ffn_up_shexp.weight";
+            if (p[4] == "down_proj") return blk + "ffn_down_shexp.weight";
+        }
+        return ""; // routed experts ("mlp.experts.<i>.*") and the rest
+    }
+    return "";
 }
 
 bool read_gguf_value(BinaryCursor& cur, GGUFValueType vtype, GGUFValue& val) {
@@ -383,29 +557,79 @@ bool ModelFile::parse_safetensors(std::string& err_msg) {
         }
         std::string obj = json.substr(obj_start, pos - obj_start);
 
-        if (key == "__metadata__") continue;
+        if (key == "__metadata__") {
+            // Previously ignored entirely. Store string pairs as metadata
+            // (usually just {"format": "pt"}); the engine does not read them,
+            // but they are now visible via metadata() instead of dropped.
+            size_t scan = 0;
+            while (scan < obj.size()) {
+                size_t k1 = obj.find('"', scan);
+                if (k1 == std::string::npos) break;
+                size_t k2 = obj.find('"', k1 + 1);
+                if (k2 == std::string::npos) break;
+                std::string mk = obj.substr(k1 + 1, k2 - k1 - 1);
+                size_t colon = obj.find(':', k2 + 1);
+                if (colon == std::string::npos) break;
+                size_t v1 = obj.find('"', colon + 1);
+                if (v1 == std::string::npos) break;
+                size_t v2 = obj.find('"', v1 + 1);
+                if (v2 == std::string::npos) break;
+                GGUFValue mv;
+                mv.type = GGUFValueType::STRING;
+                mv.str = obj.substr(v1 + 1, v2 - v1 - 1);
+                metadata_["safetensors.metadata." + mk] = std::move(mv);
+                scan = v2 + 1;
+            }
+            continue;
+        }
 
         TensorDescriptor td;
         td.name = key;
         td.is_sparse_expert = is_expert_tensor_name(td.name);
 
-        // Extract dtype
+        // Extract dtype. Unknown dtypes keep the previous F32 default but
+        // are recorded (and warned about once) instead of silently
+        // misinterpreting the bytes.
         size_t dt_pos = obj.find("\"dtype\"");
         if (dt_pos != std::string::npos) {
             size_t q1 = obj.find('"', dt_pos + 7);
             size_t q2 = (q1 != std::string::npos) ? obj.find('"', q1 + 1) : std::string::npos;
             if (q1 != std::string::npos && q2 != std::string::npos) {
                 std::string dt = obj.substr(q1 + 1, q2 - q1 - 1);
-                if (dt == "F32") td.type = GGMLType::F32;
-                else if (dt == "F16") td.type = GGMLType::F16;
-                else if (dt == "BF16") td.type = GGMLType::BF16;
-                else if (dt == "F8_E4M3") td.type = GGMLType::FP8_E4M3;
-                else if (dt == "Q4_0") td.type = GGMLType::Q4_0;
-                else if (dt == "Q8_0") td.type = GGMLType::Q8_0;
+                static const std::pair<const char*, GGMLType> kDtypes[] = {
+                    {"F32", GGMLType::F32},     {"F16", GGMLType::F16},
+                    {"BF16", GGMLType::BF16},   {"F64", GGMLType::F64},
+                    {"I8", GGMLType::I8},       {"I16", GGMLType::I16},
+                    {"I32", GGMLType::I32},     {"I64", GGMLType::I64},
+                    {"F8_E4M3", GGMLType::FP8_E4M3},
+                    {"Q4_0", GGMLType::Q4_0},   {"Q8_0", GGMLType::Q8_0},
+                    {"Q4_K", GGMLType::Q4_K},   {"Q5_K", GGMLType::Q5_K},
+                    {"Q6_K", GGMLType::Q6_K},   {"Q8_K", GGMLType::Q8_K},
+                    {"IQ4_NL", GGMLType::IQ4_NL},
+                };
+                bool known = false;
+                for (const auto& [name, type] : kDtypes) {
+                    if (dt == name) { td.type = type; known = true; break; }
+                }
+                if (!known &&
+                    std::find(st_unknown_dtypes_.begin(), st_unknown_dtypes_.end(), dt) ==
+                        st_unknown_dtypes_.end()) {
+                    st_unknown_dtypes_.push_back(dt);
+                    std::cerr << "[SAFETENSORS] WARNING: unknown dtype '" << dt
+                              << "' for tensor '" << key << "' — treating as F32.\n";
+                }
             }
         }
 
-        // Extract shape
+        // Extract shape. SafeTensors shapes are PyTorch order [out, in],
+        // but this engine's GGUF convention is dims = [in, out]
+        // (dims[0] = input cols, dims[1] = output rows — see bind_tensors(),
+        // which reads q_dim from dims[1] and dim/vocab from the embed
+        // tensor's dims[0]/dims[1], and model_forge.cpp, which writes
+        // token_embd as {dim, vocab_size}). The ST bytes themselves are
+        // already row-major [out][in], which is exactly the layout
+        // matmul_quant_f32 expects (one output row per row of data), so
+        // only the dims are reversed — never the data.
         size_t sh_pos = obj.find("\"shape\"");
         if (sh_pos != std::string::npos) {
             size_t b1 = obj.find('[', sh_pos);
@@ -421,6 +645,7 @@ bool ModelFile::parse_safetensors(std::string& err_msg) {
                     }
                 }
                 td.n_dims = d;
+                if (td.n_dims == 2) std::swap(td.dims[0], td.dims[1]);
             }
         }
 
@@ -445,6 +670,22 @@ bool ModelFile::parse_safetensors(std::string& err_msg) {
             }
         }
 
+        // HF -> GGUF name translation. Routed MoE expert tensors and fused
+        // projections have no translation: the engine expects packed 3D
+        // expert tensors / separate Q,K,V, so faking an alias would load
+        // garbage. They stay under their original names and are flagged.
+        if (td.name.find(".experts.") != std::string::npos) {
+            st_moe_unsupported_ = true;
+            st_untranslated_.push_back(td.name);
+        } else if (td.name.find("qkv_proj") != std::string::npos) {
+            st_untranslated_.push_back(td.name);
+        } else {
+            std::string gguf_name = translate_hf_tensor_name(td.name);
+            if (!gguf_name.empty() && gguf_name != td.name) {
+                alias_[gguf_name] = td.name;
+            }
+        }
+
         tensor_order_.push_back(td.name);
         tensors_[td.name] = std::move(td);
     }
@@ -452,9 +693,141 @@ bool ModelFile::parse_safetensors(std::string& err_msg) {
     return !tensors_.empty();
 }
 
+// Load a sibling config.json (and note a sibling tokenizer.json) for a
+// SafeTensors model. Best-effort: returns false when no usable config was
+// found, and open() treats that as "load without config", not an error.
+bool ModelFile::load_safetensors_config() {
+    namespace fs = std::filesystem;
+    fs::path dir = fs::path(path_).parent_path();
+    std::error_code ec;
+
+    fs::path tok_path = dir / "tokenizer.json";
+    if (fs::exists(tok_path, ec) && !ec) {
+        tokenizer_path_ = tok_path.string();
+        std::cout << "[SAFETENSORS] tokenizer.json found: " << tokenizer_path_
+                  << " (parsing it belongs to the tokenizer layer).\n";
+    }
+
+    fs::path cfg_path = dir / "config.json";
+    if (!fs::exists(cfg_path, ec) || ec) return false;
+    std::ifstream in(cfg_path);
+    if (!in) return false;
+    std::string json((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    if (json.empty()) return false;
+
+    std::string arch_class, model_type;
+    cfg_get_first_array_string(json, "architectures", arch_class);
+    cfg_get_string(json, "model_type", model_type);
+
+    std::string arch = hf_arch_to_gguf(arch_class);
+    if (arch.empty() && is_known_gguf_arch(model_type)) arch = model_type;
+    if (arch.empty()) {
+        std::cout << "[SAFETENSORS] WARNING: config.json architecture '" << arch_class
+                  << "' (model_type '" << model_type << "') is not mapped — "
+                  << "no hparams were loaded; the engine will use its defaults.\n";
+        return false;
+    }
+
+    double hidden = 0, intermediate = 0, layers = 0, heads = 0, kv_heads = 0;
+    double ctx = 0, vocab = 0, eps = 0, rope_theta = 0;
+    bool have_hidden = cfg_get_number(json, "hidden_size", hidden);
+    bool have_layers = cfg_get_number(json, "num_hidden_layers", layers);
+    if (!have_hidden || hidden <= 0 || !have_layers || layers <= 0) {
+        std::cout << "[SAFETENSORS] WARNING: config.json for '" << arch
+                  << "' has no usable hidden_size/num_hidden_layers — no hparams loaded.\n";
+        return false;
+    }
+
+    auto set_u32 = [&](const std::string& k, uint32_t v) {
+        GGUFValue val; val.type = GGUFValueType::UINT32; val.u64 = v; val.i64 = v;
+        metadata_[k] = std::move(val);
+    };
+    auto set_f32 = [&](const std::string& k, float v) {
+        GGUFValue val; val.type = GGUFValueType::FLOAT32; val.f64 = v;
+        metadata_[k] = std::move(val);
+    };
+    auto set_str = [&](const std::string& k, const std::string& v) {
+        GGUFValue val; val.type = GGUFValueType::STRING; val.str = v;
+        metadata_[k] = std::move(val);
+    };
+    auto set_bool = [&](const std::string& k, bool v) {
+        GGUFValue val; val.type = GGUFValueType::BOOL; val.bval = v; val.u64 = v ? 1 : 0;
+        metadata_[k] = std::move(val);
+    };
+
+    set_str("general.architecture", arch);
+    set_str("general.name", arch_class.empty() ? model_type : arch_class);
+    set_u32(arch + ".embedding_length", static_cast<uint32_t>(hidden));
+    if (cfg_get_number(json, "intermediate_size", intermediate) && intermediate > 0) {
+        set_u32(arch + ".feed_forward_length", static_cast<uint32_t>(intermediate));
+    }
+    set_u32(arch + ".block_count", static_cast<uint32_t>(layers));
+    if (cfg_get_number(json, "num_attention_heads", heads) && heads > 0) {
+        set_u32(arch + ".attention.head_count", static_cast<uint32_t>(heads));
+    }
+    if (cfg_get_number(json, "num_key_value_heads", kv_heads) && kv_heads > 0) {
+        set_u32(arch + ".attention.head_count_kv", static_cast<uint32_t>(kv_heads));
+    } else if (heads > 0) {
+        set_u32(arch + ".attention.head_count_kv", static_cast<uint32_t>(heads));
+    }
+    if (cfg_get_number(json, "max_position_embeddings", ctx) && ctx > 0) {
+        set_u32(arch + ".context_length", static_cast<uint32_t>(ctx));
+    }
+    if (cfg_get_number(json, "vocab_size", vocab) && vocab > 0) {
+        set_u32(arch + ".vocab_size", static_cast<uint32_t>(vocab));
+    }
+    if (cfg_get_number(json, "rms_norm_eps", eps) && eps > 0) {
+        set_f32(arch + ".attention.layer_norm_rms_epsilon", static_cast<float>(eps));
+    }
+    if (cfg_get_number(json, "rope_theta", rope_theta) && rope_theta > 0) {
+        set_f32(arch + ".rope.freq_base", static_cast<float>(rope_theta));
+    }
+    double v = 0;
+    if (cfg_get_number(json, "head_dim", v) && v > 0) {
+        set_u32(arch + ".attention.key_length", static_cast<uint32_t>(v));
+    }
+    if (cfg_get_number(json, "sliding_window", v) && v > 0) {
+        set_u32(arch + ".attention.sliding_window", static_cast<uint32_t>(v));
+    }
+    if (cfg_get_number(json, "num_experts", v) && v > 0) {
+        set_u32(arch + ".expert_count", static_cast<uint32_t>(v));
+    }
+    if (cfg_get_number(json, "num_experts_per_tok", v) && v > 0) {
+        set_u32(arch + ".expert_used_count", static_cast<uint32_t>(v));
+    }
+    bool b = false;
+    if (cfg_get_bool(json, "tie_word_embeddings", b)) {
+        set_bool(arch + ".tie_word_embeddings", b);
+    }
+    std::string dtype;
+    if (cfg_get_string(json, "torch_dtype", dtype)) {
+        set_str("general.torch_dtype", dtype);
+    }
+
+    detected_arch_ = arch;
+    config_path_ = cfg_path.string();
+    config_loaded_ = true;
+    std::cout << "[SAFETENSORS] config.json loaded: arch=" << arch
+              << " layers=" << static_cast<uint32_t>(layers)
+              << " hidden=" << static_cast<uint32_t>(hidden)
+              << " heads=" << static_cast<uint32_t>(heads)
+              << " kv_heads=" << static_cast<uint32_t>(kv_heads > 0 ? kv_heads : heads)
+              << " (" << config_path_ << ")\n";
+    return true;
+}
+
 const TensorDescriptor* ModelFile::find_tensor(const std::string& name) const {
     auto it = tensors_.find(name);
-    return (it != tensors_.end()) ? &it->second : nullptr;
+    if (it != tensors_.end()) return &it->second;
+    // SafeTensors: try the HF -> GGUF alias table (e.g. "blk.0.attn_q.weight"
+    // resolves "model.layers.0.self_attn.q_proj.weight"). The alias map is
+    // empty for GGUF files, so their lookup behaviour is unchanged.
+    auto alias = alias_.find(name);
+    if (alias != alias_.end()) {
+        auto jt = tensors_.find(alias->second);
+        if (jt != tensors_.end()) return &jt->second;
+    }
+    return nullptr;
 }
 
 uint32_t ModelFile::get_u32(const std::string& key, uint32_t def) const {

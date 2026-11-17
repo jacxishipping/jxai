@@ -3,6 +3,7 @@
 #include <cmath>
 #include <numeric>
 #include <random>
+#include <thread>
 
 namespace moe {
 
@@ -133,6 +134,696 @@ void MoETransformerEngine::apply_rope(
     }
 }
 
+bool arch_uses_neox_rope(const std::string& arch) {
+    // Empirical per-arch RoPE convention for THIS engine — verified by
+    // direct A/B on real models (2026-11-17), do NOT "fix" this to match
+    // llama.cpp's Neox-everywhere assumption:
+    //   Qwen2.5-0.5B-Instruct Q4_0 + Neox     -> "The answer to 2+2 is 4."
+    //   Qwen2.5-0.5B-Instruct Q4_0 + interleaved -> garbage ("I'm not sure
+    //     what you're 100% of the 19756348593478659")
+    //   Llama-3.2-1B-Instruct Q4_K_M + interleaved -> "The answer to 2+2
+    //     is 4. Would you like to know more..."
+    //   Llama-3.2-1B-Instruct Q4_K_M + Neox -> garbage ("`` `` and and the
+    //     ` \"System (in to to (")
+    // The effective convention depends on how each family's GGUF weights
+    // are laid out (llama.cpp's converter permutes Q/K weights for some
+    // families), so it is arch-specific here. Any arch not in the Neox
+    // list below is UNVERIFIED in this engine — test it against a real
+    // model before moving it, and never default the whole table to Neox.
+    return (arch == "qwen2" || arch == "qwen2moe" || arch == "olmoe" ||
+            arch == "phi" || arch == "deepseek" || arch == "deepseek2" ||
+            arch == "glm" || arch == "gptneox" ||
+            arch == "gemma" || arch == "gemma2" || arch == "gemma3" || arch == "gemma4");
+}
+
+bool arch_is_known(const std::string& arch) {
+    static const char* kKnown[] = {
+        "llama", "llama3", "llama4", "qwen2", "qwen2moe", "qwen3", "qwen3moe",
+        "mistral", "mixtral", "gemma", "gemma2", "gemma3", "gemma4",
+        "phi", "phi3", "phi4", "deepseek", "deepseek2", "olmoe", "glm",
+        "gptneox", "gpt2", "gptj", "smollm", "stablelm", "starcoder2",
+        "exaone", "command-r", "falcon", "mamba", "bert", "nomic-bert"
+    };
+    for (const char* k : kKnown) if (arch == k) return true;
+    return false;
+}
+
+bool should_add_bos(const std::string& arch, const Tokenizer& tok) {
+    if (tok.has_add_bos_token()) return tok.add_bos_token();
+    // GGUF carries no add_bos_token key: per-architecture defaults.
+    if (arch == "qwen2" || arch == "qwen2moe" || arch == "qwen3" || arch == "qwen3moe" ||
+        arch == "deepseek" || arch == "deepseek2" || arch == "olmoe" ||
+        arch == "gpt2" || arch == "gptj" || arch == "gpt-j" || arch == "gptneox" || arch == "glm") {
+        return false;
+    }
+    return true; // Llama, Gemma, Mistral, Phi, SmolLM, StableLM, unknown: BOS
+}
+
+namespace {
+
+// --- Minimal Jinja subset for GGUF tokenizer.chat_template ---
+static std::string tj_trim(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    if (b == std::string::npos) return "";
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return s.substr(b, e - b + 1);
+}
+
+// Unquote a Jinja string literal ('...' or "..."), honouring \n \t \\ \' \".
+static std::string jinja_unquote(const std::string& s) {
+    std::string t = tj_trim(s);
+    if (t.size() >= 2 && ((t.front() == '\'' && t.back() == '\'') ||
+                          (t.front() == '"' && t.back() == '"'))) {
+        std::string out;
+        for (size_t i = 1; i + 1 < t.size(); ++i) {
+            char c = t[i];
+            if (c == '\\' && i + 2 < t.size()) {
+                char n = t[++i];
+                if (n == 'n') out.push_back('\n');
+                else if (n == 't') out.push_back('\t');
+                else if (n == 'r') out.push_back('\r');
+                else out.push_back(n);
+            } else {
+                out.push_back(c);
+            }
+        }
+        return out;
+    }
+    return t;
+}
+
+static std::string jinja_token_text(const Tokenizer& tok, uint32_t id) {
+    if (id < tok.vocab().size()) return tok.vocab()[id];
+    return "";
+}
+
+// Split an expression on top-level '+' (outside string literals).
+static std::vector<std::string> jinja_split_plus(const std::string& expr) {
+    std::vector<std::string> parts;
+    std::string cur;
+    char quote = 0;
+    for (size_t i = 0; i < expr.size(); ++i) {
+        char c = expr[i];
+        if (quote) {
+            cur.push_back(c);
+            if (c == '\\' && i + 1 < expr.size()) cur.push_back(expr[++i]);
+            else if (c == quote) quote = 0;
+        } else if (c == '\'' || c == '"') {
+            quote = c;
+            cur.push_back(c);
+        } else if (c == '+') {
+            parts.push_back(cur);
+            cur.clear();
+        } else {
+            cur.push_back(c);
+        }
+    }
+    parts.push_back(cur);
+    return parts;
+}
+
+static std::string jinja_field(const ChatMessage* msg, const std::string& term) {
+    if (!msg) return "";
+    if (term == "message['role']" || term == "message[\"role\"]" || term == "message.role" || term == "role") return msg->role;
+    if (term == "message['content']" || term == "message[\"content\"]" || term == "message.content" || term == "content") return msg->content;
+    return "";
+}
+
+// Evaluate a {{ ... }} expression: string literals and message fields joined
+// by '+', with an optional `| trim` filter. Unknown variables yield "".
+static std::string eval_jinja_expr(const std::string& expr, const ChatMessage* msg,
+                                   bool /*add_gen*/, const Tokenizer& tok) {
+    std::string out;
+    for (const auto& raw_term : jinja_split_plus(expr)) {
+        std::string term = tj_trim(raw_term);
+        bool do_trim = false;
+        // A Jinja filter '|' must be OUTSIDE string literals: '<|im_start|>'
+        // and friends contain '|' characters that are literal text, not
+        // filters. (This was truncating every ChatML marker to "'<" .)
+        size_t pipe = std::string::npos;
+        {
+            char quote = 0;
+            for (size_t i = 0; i < term.size(); ++i) {
+                char c = term[i];
+                if (quote) {
+                    if (c == '\\' && i + 1 < term.size()) ++i;
+                    else if (c == quote) quote = 0;
+                } else if (c == '\'' || c == '"') {
+                    quote = c;
+                } else if (c == '|') {
+                    pipe = i;
+                    break;
+                }
+            }
+        }
+        if (pipe != std::string::npos) {
+            if (term.substr(pipe).find("trim") != std::string::npos) do_trim = true;
+            term = tj_trim(term.substr(0, pipe));
+        }
+        std::string val;
+        if (!term.empty() && (term.front() == '\'' || term.front() == '"')) {
+            val = jinja_unquote(term);
+        } else if (term == "bos_token") {
+            val = jinja_token_text(tok, tok.bos_id());
+        } else if (term == "eos_token") {
+            val = jinja_token_text(tok, tok.eos_id());
+        } else if (term == "add_generation_prompt") {
+            val = "";
+        } else {
+            val = jinja_field(msg, term);
+        }
+        if (do_trim) val = tj_trim(val);
+        out += val;
+    }
+    return out;
+}
+
+// Evaluate a messages[...] index expression: a plain integer, or
+// loop.index / loop.index0 with +/- arithmetic (e.g. loop.index0 - 1).
+static int eval_jinja_index_expr(const std::string& raw, int loop_idx) {
+    std::string s = tj_trim(raw);
+    auto replace_all = [](std::string& str, const std::string& from, const std::string& to) {
+        size_t p = 0;
+        while ((p = str.find(from, p)) != std::string::npos) {
+            str.replace(p, from.size(), to);
+            p += to.size();
+        }
+    };
+    // loop.index0 first (it contains "loop.index" as a prefix).
+    replace_all(s, "loop.index0", std::to_string(loop_idx));
+    replace_all(s, "loop.index", std::to_string(loop_idx + 1));
+    // Evaluate a sum of integers joined by + / -.
+    int total = 0;
+    int sign = 1;
+    size_t i = 0;
+    bool any = false;
+    while (i < s.size()) {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t')) ++i;
+        if (i >= s.size()) break;
+        if (s[i] == '+') { sign = 1; ++i; continue; }
+        if (s[i] == '-') { sign = -1; ++i; continue; }
+        if (s[i] < '0' || s[i] > '9') return -1;
+        size_t j = i;
+        while (j < s.size() && s[j] >= '0' && s[j] <= '9') ++j;
+        int v = 0;
+        try { v = std::stoi(s.substr(i, j - i)); } catch (...) { return -1; }
+        total += sign * v;
+        sign = 1;
+        any = true;
+        i = j;
+    }
+    return any ? total : -1;
+}
+
+// Evaluate one Jinja condition atom (no and/or at this level; `not` and
+// parentheses are handled here per-atom).
+static bool eval_jinja_atom(const std::string& raw, const ChatMessage* msg, bool add_gen,
+                            const std::vector<ChatMessage>& msgs, int loop_idx, int loop_total) {
+    std::string c = tj_trim(raw);
+    // Strip grouping parentheses left by splitting "(a) or (b)" style conds.
+    while (!c.empty() && c.front() == '(') c = tj_trim(c.substr(1));
+    while (!c.empty() && c.back() == ')') c = tj_trim(c.substr(0, c.size() - 1));
+    if (c.rfind("not ", 0) == 0) {
+        return !eval_jinja_atom(c.substr(4), msg, add_gen, msgs, loop_idx, loop_total);
+    }
+    // `X is defined` / `X is not defined`: only add_generation_prompt,
+    // loop.*, message and messages are defined in our renderer.
+    if (c.find(" is defined") != std::string::npos) {
+        bool neg = (c.find(" is not defined") != std::string::npos);
+        std::string var = tj_trim(c.substr(0, c.find(" is ")));
+        bool defined = (var == "add_generation_prompt" || var == "message" ||
+                        var == "messages" || var.rfind("loop.", 0) == 0 ||
+                        var.rfind("message.", 0) == 0 || var.rfind("message[", 0) == 0);
+        return neg ? !defined : defined;
+    }
+    if (c == "add_generation_prompt") return add_gen;
+    if (c == "loop.first") return loop_idx == 0;
+    if (c == "loop.last") return loop_total > 0 && loop_idx == loop_total - 1;
+    if (c == "messages") return !msgs.empty();
+    if (c == "message") return msg != nullptr;
+    if (c == "message['content']" || c == "message[\"content\"]" || c == "message.content") {
+        return msg && !msg->content.empty();
+    }
+    // messages[EXPR]['role'|'content'] == 'v' / != 'v'  (EXPR may use loop.index0)
+    if (c.rfind("messages[", 0) == 0) {
+        size_t close = c.find(']');
+        if (close != std::string::npos) {
+            int idx = eval_jinja_index_expr(c.substr(9, close - 9), loop_idx);
+            std::string rest = tj_trim(c.substr(close + 1));
+            std::string field;
+            if (rest.rfind("['role']", 0) == 0 || rest.rfind("[\"role\"]", 0) == 0 || rest.rfind(".role", 0) == 0) {
+                field = (idx >= 0 && idx < static_cast<int>(msgs.size())) ? msgs[static_cast<size_t>(idx)].role : "";
+            } else if (rest.rfind("['content']", 0) == 0 || rest.rfind("[\"content\"]", 0) == 0 || rest.rfind(".content", 0) == 0) {
+                field = (idx >= 0 && idx < static_cast<int>(msgs.size())) ? msgs[static_cast<size_t>(idx)].content : "";
+            } else {
+                return false;
+            }
+            if (rest.find("!=") != std::string::npos) {
+                return field != jinja_unquote(rest.substr(rest.find("!=") + 2));
+            }
+            if (rest.find("==") != std::string::npos) {
+                return field == jinja_unquote(rest.substr(rest.find("==") + 2));
+            }
+            return !field.empty();
+        }
+        return false;
+    }
+    // message['role'] in ['a', 'b'] / not in [...]
+    {
+        size_t in_pos = c.find(" in ");
+        size_t not_in = c.find(" not in ");
+        if (in_pos != std::string::npos || not_in != std::string::npos) {
+            bool neg = (not_in != std::string::npos);
+            size_t op = neg ? not_in : in_pos;
+            std::string lhs = jinja_field(msg, tj_trim(c.substr(0, op)));
+            std::string list = c.substr(op + (neg ? 8 : 4));
+            bool found = false;
+            size_t lb = list.find('['), rb = list.rfind(']');
+            if (lb != std::string::npos && rb != std::string::npos && rb > lb) {
+                std::string inner = list.substr(lb + 1, rb - lb - 1);
+                size_t p = 0;
+                while (p < inner.size()) {
+                    size_t comma = inner.find(',', p);
+                    std::string item = jinja_unquote(tj_trim(inner.substr(p, comma == std::string::npos ? std::string::npos : comma - p)));
+                    if (item == lhs) { found = true; break; }
+                    if (comma == std::string::npos) break;
+                    p = comma + 1;
+                }
+            }
+            return neg ? !found : found;
+        }
+    }
+    // message['role'] == 'v' / != 'v'
+    {
+        size_t ne = c.find("!=");
+        size_t eq = c.find("==");
+        if (ne != std::string::npos) {
+            return jinja_field(msg, tj_trim(c.substr(0, ne))) != jinja_unquote(c.substr(ne + 2));
+        }
+        if (eq != std::string::npos) {
+            return jinja_field(msg, tj_trim(c.substr(0, eq))) == jinja_unquote(c.substr(eq + 2));
+        }
+    }
+    // loop.index == 1 / loop.index0 == 0
+    if (c.rfind("loop.index", 0) == 0) {
+        size_t eq = c.find("==");
+        if (eq != std::string::npos) {
+            int want = 0;
+            try { want = std::stoi(c.substr(eq + 2)); } catch (...) {}
+            int idx = (c.find("loop.index0") == 0) ? loop_idx : loop_idx + 1;
+            return idx == want;
+        }
+        return false;
+    }
+    // Unknown / undefined variable: falsy in Jinja (e.g. `tools` when no tools
+    // were passed). Never silently render a branch we cannot evaluate.
+    return false;
+}
+
+static bool eval_jinja_cond(const std::string& cond, const ChatMessage* msg, bool add_gen,
+                            const std::vector<ChatMessage>& msgs, int loop_idx, int loop_total) {
+    // `not` is handled per-atom (Jinja: `not A and B` == `(not A) and B`).
+    // Split on top-level " or " first (lower precedence), then " and ".
+    std::string c = tj_trim(cond);
+    // Strip one layer of grouping parens around the whole condition.
+    while (c.size() >= 2 && c.front() == '(' && c.back() == ')') {
+        c = tj_trim(c.substr(1, c.size() - 2));
+    }
+    bool result = false;
+    size_t start = 0;
+    bool first_or = true;
+    while (true) {
+        size_t or_pos = c.find(" or ", start);
+        std::string or_part = (or_pos == std::string::npos) ? c.substr(start) : c.substr(start, or_pos - start);
+        bool and_result = true;
+        size_t astart = 0;
+        while (true) {
+            size_t and_pos = or_part.find(" and ", astart);
+            std::string atom = (and_pos == std::string::npos) ? or_part.substr(astart) : or_part.substr(astart, and_pos - astart);
+            if (!eval_jinja_atom(atom, msg, add_gen, msgs, loop_idx, loop_total)) { and_result = false; break; }
+            if (and_pos == std::string::npos) break;
+            astart = and_pos + 5;
+        }
+        if (first_or) { result = and_result; first_or = false; }
+        else result = result || and_result;
+        if (or_pos == std::string::npos) break;
+        start = or_pos + 4;
+    }
+    return result;
+}
+
+// Find a {% ... %} or {{ ... }} tag starting at or after `from`. Returns
+// false when none. `is_var` distinguishes {{ }} from {% %}; content is the
+// tag body with optional '-' whitespace markers stripped.
+struct JinjaTag {
+    size_t start = 0;
+    size_t end = 0; // one past %}
+    bool is_var = false;
+    std::string content;
+    // Jinja whitespace control: {%- / -%} strip adjacent whitespace.
+    // Real chat templates rely on this heavily; without it the rendered
+    // prompt is full of stray blank lines and spaces (which measurably
+    // changes what a small model generates).
+    bool trim_before = false;
+    bool trim_after = false;
+};
+
+static bool find_jinja_tag(const std::string& s, size_t from, bool is_var, JinjaTag& tag) {
+    std::string open = is_var ? "{{" : "{%";
+    size_t st = s.find(open, from);
+    if (st == std::string::npos) return false;
+    std::string close = is_var ? "}}" : "%}";
+    size_t en = s.find(close, st + 2);
+    if (en == std::string::npos) return false;
+    tag.start = st;
+    tag.end = en + 2;
+    tag.is_var = is_var;
+    tag.trim_before = false;
+    tag.trim_after = false;
+    tag.content = tj_trim(s.substr(st + 2, en - (st + 2)));
+    if (!tag.content.empty() && tag.content.front() == '-') {
+        tag.trim_before = true;
+        tag.content = tj_trim(tag.content.substr(1));
+    }
+    if (!tag.content.empty() && tag.content.back() == '-') {
+        tag.trim_after = true;
+        tag.content = tj_trim(tag.content.substr(0, tag.content.size() - 1));
+    }
+    return true;
+}
+
+static std::string jinja_rstrip_ws(const std::string& s) {
+    size_t e = s.find_last_not_of(" \t\r\n");
+    return (e == std::string::npos) ? "" : s.substr(0, e + 1);
+}
+
+static std::string jinja_lstrip_ws(const std::string& s) {
+    size_t b = s.find_first_not_of(" \t\r\n");
+    return (b == std::string::npos) ? "" : s.substr(b);
+}
+
+// Plain {{ expr }} substitution (no {% %} statement handling), honouring
+// {{- / -}} whitespace control.
+static std::string render_jinja_vars(const std::string& seg, const ChatMessage* msg, bool add_gen,
+                                     const Tokenizer& tok) {
+    std::string out;
+    size_t pos = 0;
+    bool skip_leading_ws = false;
+    JinjaTag vt;
+    while (find_jinja_tag(seg, pos, true, vt)) {
+        std::string lit = seg.substr(pos, vt.start - pos);
+        if (skip_leading_ws) lit = jinja_lstrip_ws(lit);
+        if (vt.trim_before) lit = jinja_rstrip_ws(lit);
+        out += lit;
+        out += eval_jinja_expr(vt.content, msg, add_gen, tok);
+        skip_leading_ws = vt.trim_after;
+        pos = vt.end;
+    }
+    std::string tail = seg.substr(pos);
+    if (skip_leading_ws) tail = jinja_lstrip_ws(tail);
+    out += tail;
+    return out;
+}
+
+// Render a template segment: handles {% if/elif/else/endif %},
+// {% for x in y %}/{% endfor %} and {% set ... %} (recursively, with
+// nesting-aware matching). `msg` is the current loop message (or nullptr).
+// For-loops over anything other than `messages` (tools, tool_calls) render
+// zero iterations: this renderer is never passed tools.
+static std::string render_jinja_segment(const std::string& seg, const ChatMessage* msg, bool add_gen,
+                                        const Tokenizer& tok, const std::vector<ChatMessage>& msgs,
+                                        int loop_idx, int loop_total) {
+    // Find the first {% if %}, {% for %} or {% set %} statement tag.
+    JinjaTag if_tag;
+    size_t search = 0;
+    bool have_stmt = false;
+    while (find_jinja_tag(seg, search, false, if_tag)) {
+        if (if_tag.content.rfind("if ", 0) == 0 ||
+            if_tag.content.rfind("for ", 0) == 0 ||
+            if_tag.content.rfind("set ", 0) == 0) {
+            have_stmt = true;
+            break;
+        }
+        search = if_tag.end;
+    }
+    if (!have_stmt) {
+        return render_jinja_vars(seg, msg, add_gen, tok);
+    }
+
+    // {% set ... %}: assignments are not tracked (tool_call rebinding etc.
+    // only matters inside tool loops, which render zero iterations here).
+    // Drop the tag and render the rest.
+    if (if_tag.content.rfind("set ", 0) == 0) {
+        std::string before = seg.substr(0, if_tag.start);
+        if (if_tag.trim_before) before = jinja_rstrip_ws(before);
+        std::string rest = seg.substr(if_tag.end);
+        if (if_tag.trim_after) rest = jinja_lstrip_ws(rest);
+        return render_jinja_vars(before, msg, add_gen, tok) +
+               render_jinja_segment(rest, msg, add_gen, tok, msgs, loop_idx, loop_total);
+    }
+
+    // {% for VAR in ITER %} ... {% endfor %}
+    if (if_tag.content.rfind("for ", 0) == 0) {
+        std::string decl = tj_trim(if_tag.content.substr(4));
+        size_t in_pos = decl.find(" in ");
+        std::string iter = (in_pos == std::string::npos) ? "" : tj_trim(decl.substr(in_pos + 4));
+        // Find the matching {% endfor %} with nesting-aware depth counting.
+        int depth = 1;
+        size_t pos = if_tag.end;
+        size_t end_start = std::string::npos, end_end = std::string::npos;
+        JinjaTag t;
+        JinjaTag end_tag;
+        while (find_jinja_tag(seg, pos, false, t)) {
+            if (t.content.rfind("for ", 0) == 0) {
+                ++depth;
+            } else if (t.content == "endfor") {
+                --depth;
+                if (depth == 0) { end_start = t.start; end_end = t.end; end_tag = t; break; }
+            }
+            pos = t.end;
+        }
+        std::string before = seg.substr(0, if_tag.start);
+        if (if_tag.trim_before) before = jinja_rstrip_ws(before);
+        before = render_jinja_vars(before, msg, add_gen, tok);
+        std::string after;
+        std::string loop_out;
+        if (end_start == std::string::npos) {
+            // Unbalanced template: treat the rest as literal text.
+            std::string rest = seg.substr(if_tag.end);
+            if (if_tag.trim_after) rest = jinja_lstrip_ws(rest);
+            after = render_jinja_vars(rest, msg, add_gen, tok);
+            return before + after;
+        }
+        {
+            std::string rest = seg.substr(end_end);
+            if (end_tag.trim_after) rest = jinja_lstrip_ws(rest);
+            after = render_jinja_segment(rest, msg, add_gen, tok, msgs, loop_idx, loop_total);
+        }
+        if (iter == "messages") {
+            std::string body = seg.substr(if_tag.end, end_start - if_tag.end);
+            if (if_tag.trim_after) body = jinja_lstrip_ws(body);
+            if (end_tag.trim_before) body = jinja_rstrip_ws(body);
+            for (size_t i = 0; i < msgs.size(); ++i) {
+                loop_out += render_jinja_segment(body, &msgs[i], add_gen, tok, msgs,
+                                                 static_cast<int>(i), static_cast<int>(msgs.size()));
+            }
+        }
+        // Any other iterable (tools, message.tool_calls) is empty here.
+        return before + loop_out + after;
+    }
+
+    if (if_tag.content.rfind("if ", 0) == 0) {
+        // Find matching {% endif %} accounting for nesting, and collect the
+        // top-level {% elif %}/{% else %} branch ranges.
+        struct Branch {
+            std::string cond;
+            bool is_else = false;
+            size_t body_start = 0;
+            size_t body_end = 0;
+            bool trim_after_open = false;  // opening tag had -%}
+            bool trim_before_close = false; // closing tag had {%- 
+        };
+        std::vector<Branch> branches;
+        branches.push_back({if_tag.content.substr(3), false, if_tag.end, std::string::npos,
+                            if_tag.trim_after, false});
+        int depth = 1;
+        size_t pos = if_tag.end;
+        size_t endif_start = std::string::npos, endif_end = std::string::npos;
+        JinjaTag t;
+        JinjaTag endif_tag;
+        while (find_jinja_tag(seg, pos, false, t)) {
+            if (t.content.rfind("if ", 0) == 0) {
+                ++depth;
+            } else if (t.content == "endif") {
+                --depth;
+                if (depth == 0) {
+                    branches.back().body_end = t.start;
+                    branches.back().trim_before_close = t.trim_before;
+                    endif_start = t.start; endif_end = t.end; endif_tag = t;
+                    break;
+                }
+            } else if (depth == 1 && t.content.rfind("elif ", 0) == 0) {
+                branches.back().body_end = t.start;
+                branches.back().trim_before_close = t.trim_before;
+                branches.push_back({t.content.substr(5), false, t.end, std::string::npos,
+                                    t.trim_after, false});
+            } else if (depth == 1 && t.content == "else") {
+                branches.back().body_end = t.start;
+                branches.back().trim_before_close = t.trim_before;
+                branches.push_back({"", true, t.end, std::string::npos,
+                                    t.trim_after, false});
+            }
+            pos = t.end;
+        }
+        if (endif_start == std::string::npos) {
+            // Unbalanced template: drop the if-tag and render the rest.
+            return render_jinja_segment(seg.substr(0, if_tag.start) + seg.substr(if_tag.end),
+                                        msg, add_gen, tok, msgs, loop_idx, loop_total);
+        }
+        // Evaluate branches in order; the first true one wins, "else" always wins.
+        std::string chosen;
+        bool have_choice = false;
+        for (const auto& b : branches) {
+            bool take = b.is_else ||
+                        eval_jinja_cond(b.cond, msg, add_gen, msgs, loop_idx, loop_total);
+            if (take) {
+                std::string body = seg.substr(b.body_start, b.body_end - b.body_start);
+                if (b.trim_after_open) body = jinja_lstrip_ws(body);
+                if (b.trim_before_close) body = jinja_rstrip_ws(body);
+                chosen = render_jinja_segment(body, msg, add_gen, tok, msgs, loop_idx, loop_total);
+                have_choice = true;
+                break;
+            }
+        }
+        std::string before = seg.substr(0, if_tag.start);
+        if (if_tag.trim_before) before = jinja_rstrip_ws(before);
+        before = render_jinja_segment(before, msg, add_gen, tok, msgs, loop_idx, loop_total);
+        std::string after = seg.substr(endif_end);
+        if (endif_tag.trim_after) after = jinja_lstrip_ws(after);
+        after = render_jinja_segment(after, msg, add_gen, tok, msgs, loop_idx, loop_total);
+        return before + (have_choice ? chosen : "") + after;
+    }
+
+    // Unreachable: have_stmt guarantees if/for/set, all handled above.
+    return render_jinja_vars(seg, msg, add_gen, tok);
+}
+
+static std::string render_chat_template_jinja(const std::string& tmpl,
+                                              const std::vector<ChatMessage>& msgs,
+                                              bool add_gen, const Tokenizer& tok) {
+    // The unified recursive renderer handles the whole template: the
+    // leading {% if tools %}...{% else %}...{% endif %}, the
+    // {% for message in messages %} loop (with its nested tool_call loop,
+    // which renders zero iterations — no tools are ever passed), and the
+    // trailing {% if add_generation_prompt %}.
+    return render_jinja_segment(tmpl, nullptr, add_gen, tok, msgs, -1,
+                                static_cast<int>(msgs.size()));
+}
+
+} // namespace
+
+std::string format_chat_messages(
+    const std::vector<ChatMessage>& msgs,
+    const std::string& arch,
+    const std::string& chat_template,
+    const Tokenizer& tok,
+    bool add_generation_prompt,
+    std::string* source_out
+) {
+    if (!chat_template.empty()) {
+        if (source_out) *source_out = "gguf-chat-template";
+        return render_chat_template_jinja(chat_template, msgs, add_generation_prompt, tok);
+    }
+
+    // --- Per-architecture fallback templates (no chat_template in the GGUF) ---
+    std::string name;
+    std::ostringstream out;
+    auto is_llama = (arch == "llama" || arch == "llama3" || arch == "llama4");
+    auto is_gemma = (arch == "gemma" || arch == "gemma2" || arch == "gemma3" || arch == "gemma4");
+    auto is_mistral = (arch == "mistral" || arch == "mixtral");
+    auto is_phi = (arch == "phi" || arch == "phi3" || arch == "phi4");
+
+    if (is_llama) {
+        name = "llama3";
+        for (const auto& m : msgs) {
+            out << "<|start_header_id|>" << m.role << "<|end_header_id|>\n\n"
+                << m.content << "<|eot_id|>";
+        }
+        if (add_generation_prompt) out << "<|start_header_id|>assistant<|end_header_id|>\n\n";
+    } else if (is_mistral) {
+        name = "mistral";
+        std::string sys;
+        for (const auto& m : msgs) {
+            if (m.role == "system") { sys = m.content; continue; }
+            if (m.role == "user") {
+                out << "[INST] ";
+                if (!sys.empty()) out << "<<SYS>>\n" << sys << "\n<</SYS>>\n\n";
+                sys.clear();
+                out << m.content << " [/INST]";
+            } else if (m.role == "assistant") {
+                out << " " << m.content << "</s>";
+            } else {
+                out << "[INST] " << m.content << " [/INST]";
+            }
+        }
+        // Generation prompt is the trailing [/INST] when the last turn is a
+        // user turn; nothing extra is needed.
+    } else if (is_gemma) {
+        name = "gemma";
+        for (const auto& m : msgs) {
+            std::string role = (m.role == "assistant") ? "model" : m.role;
+            out << "<start_of_turn>" << role << "\n" << m.content << "<end_of_turn>\n";
+        }
+        if (add_generation_prompt) out << "<start_of_turn>model\n";
+    } else if (is_phi) {
+        name = (arch == "phi") ? "phi" : "phi3";
+        if (arch == "phi") {
+            for (const auto& m : msgs) {
+                if (m.role == "user") out << "<|user|>\n" << m.content << "\n";
+                else if (m.role == "assistant") out << "<|assistant|>\n" << m.content << "\n";
+                else out << "<|user|>\n" << m.content << "\n";
+            }
+            if (add_generation_prompt) out << "<|assistant|>\n";
+        } else {
+            for (const auto& m : msgs) {
+                if (m.role == "system") out << "<|system|>\n" << m.content << "<|end|>\n";
+                else if (m.role == "user") out << "<|user|>\n" << m.content << "<|end|>\n";
+                else if (m.role == "assistant") out << "<|assistant|>\n" << m.content << "<|end|>\n";
+                else out << "<|user|>\n" << m.content << "<|end|>\n";
+            }
+            if (add_generation_prompt) out << "<|assistant|>\n";
+        }
+    } else {
+        // ChatML: Qwen2/3, DeepSeek, OLMoE, SmolLM, GPT-2 family, and the
+        // default for any unknown architecture.
+        name = "chatml";
+        for (const auto& m : msgs) {
+            out << "<|im_start|>" << m.role << "\n" << m.content << "<|im_end|>\n";
+        }
+        if (add_generation_prompt) out << "<|im_start|>assistant\n";
+    }
+
+    if (source_out) *source_out = "fallback:" + name;
+    return out.str();
+}
+
+std::string wrap_raw_prompt_for_chat(
+    const std::string& prompt,
+    const std::string& arch,
+    const std::string& chat_template,
+    const Tokenizer& tok
+) {
+    static const char* kMarkers[] = {
+        "<|im_start|>", "<|user|>", "<|system|>", "<|turn>",
+        "<|start_header_id|>", "[INST]", "<start_of_turn>",
+        "<|begin_of_text|>", "<|assistant|>"
+    };
+    for (const char* m : kMarkers) {
+        if (prompt.find(m) != std::string::npos) return prompt;
+    }
+    return format_chat_messages({{"user", prompt}}, arch, chat_template, tok, true, nullptr);
+}
+
 void MoETransformerEngine::softmax(float* x, int64_t size) {
     if (size <= 0) return;
     float max_val = x[0];
@@ -202,7 +893,8 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
     hp_.n_experts      = model_file_.get_u32(pfx + ".expert_count", 8);
     hp_.n_experts_used = model_file_.get_u32(pfx + ".expert_used_count", 2);
     hp_.max_seq_len    = model_file_.get_u32(pfx + ".context_length", 2048);
-    hp_.kv_cache_capacity = std::min<uint32_t>(hp_.max_seq_len, 4096);
+    // kv_cache_capacity is computed below, once kv_dim is final (it needs a
+    // RAM guard; see after rope_dim).
     hp_.rms_norm_eps   = model_file_.get_f32(pfx + ".attention.layer_norm_rms_epsilon", 1e-5f);
     hp_.rope_freq_base = model_file_.get_f32(pfx + ".rope.freq_base", 10000.0f);
     hp_.rope_freq_base_swa = model_file_.get_f32(pfx + ".rope.freq_base_swa", hp_.rope_freq_base);
@@ -211,6 +903,19 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
     hp_.ple_dim        = model_file_.get_u32(pfx + ".embedding_length_per_layer_input", 0);
     hp_.rope_dim_swa   = model_file_.get_u32(pfx + ".rope.dimension_count_swa", 0);
     hp_.final_logit_softcapping = model_file_.get_f32(pfx + ".final_logit_softcapping", 0.0f);
+    hp_.attn_logit_softcapping = model_file_.get_f32(pfx + ".attn_logit_softcapping", 0.0f);
+    // RoPE scaling (GGUF: <arch>.rope.scaling.*). Only "yarn" sets yarn_scale;
+    // "linear"/"none"/absent leave it at 1.0 (apply_rope divides pos by it).
+    hp_.rope_scaling_type = model_file_.get_str(pfx + ".rope.scaling.type", "");
+    hp_.rope_scaling_factor = model_file_.get_f32(pfx + ".rope.scaling.factor", 1.0f);
+    hp_.yarn_log_multiplier = model_file_.get_f32(pfx + ".rope.scaling.yarn_log_multiplier", 0.0f);
+    hp_.rope_orig_ctx_len = model_file_.get_u32(pfx + ".rope.scaling.original_context_length", 0);
+    if (hp_.rope_scaling_type == "yarn" && hp_.rope_scaling_factor > 0.0f) {
+        hp_.yarn_scale = hp_.rope_scaling_factor;
+    } else {
+        hp_.yarn_scale = 1.0f;
+    }
+    hp_.rope_neox = arch_uses_neox_rope(hp_.arch);
 
     bool is_gemma_family = (hp_.arch == "gemma" || hp_.arch == "gemma2" || hp_.arch == "gemma3" || hp_.arch == "gemma4");
     hp_.use_gelu = is_gemma_family;
@@ -246,6 +951,25 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
         }
     }
     hp_.rope_dim = model_file_.get_u32(pfx + ".rope.dimension_count", hp_.head_dim);
+
+    // KV cache capacity: up to min(max_seq_len, 32768), but never let the
+    // FP16 K+V cache (n_layers * capacity * kv_dim * 2 arrays * 2 bytes)
+    // exceed 25% of available RAM. Halve until it fits (floor 256 tokens).
+    {
+        uint32_t cap = std::min<uint32_t>(hp_.max_seq_len, 32768);
+        if (cap == 0) cap = 2048;
+        uint64_t avail = hw_.avail_ram_bytes;
+        if (avail > 0 && hp_.n_layers > 0 && hp_.kv_dim > 0) {
+            uint64_t budget = avail / 4;
+            while (cap > 256) {
+                uint64_t est = static_cast<uint64_t>(hp_.n_layers) * cap *
+                               static_cast<uint64_t>(hp_.kv_dim) * 2ull * 2ull;
+                if (est <= budget) break;
+                cap /= 2;
+            }
+        }
+        hp_.kv_cache_capacity = cap;
+    }
 
     out_norm_ = model_file_.find_tensor("output_norm.weight");
     lm_head_  = model_file_.find_tensor("output.weight");
@@ -613,10 +1337,9 @@ std::vector<float> MoETransformerEngine::forward_token(
 
         // 4. Rotary Position Embeddings (RoPE / YaRN) & KV-Cache Append
         double ta0 = now_ms();
-        bool is_neox = (hp_.arch == "qwen2" || hp_.arch == "qwen2moe" || hp_.arch == "olmoe" ||
-                        hp_.arch == "phi" || hp_.arch == "deepseek" || hp_.arch == "deepseek2" ||
-                        hp_.arch == "glm" || hp_.arch == "gptneox" ||
-                        hp_.arch == "gemma" || hp_.arch == "gemma2" || hp_.arch == "gemma3" || hp_.arch == "gemma4");
+        // Neox is the default for modern LLMs (see arch_uses_neox_rope);
+        // only GPT-2 / GPT-J use interleaved RoPE.
+        bool is_neox = hp_.rope_neox;
         const float* rf_ptr = (!lw.is_swa && rope_freqs_ && rope_freqs_->type == GGMLType::F32 &&
                                rope_freqs_->dims[0] >= lw.rope_dim / 2)
                             ? static_cast<const float*>(rope_freqs_->mapped_ptr) : nullptr;
@@ -660,6 +1383,15 @@ std::vector<float> MoETransformerEngine::forward_token(
                     dot += q_head[d] * fp16_to_fp32(k_t[d]);
                 }
                 scores[t - t_start_win] = dot * scale;
+            }
+            // Gemma2/3 attention logit softcapping (same tanh form as the
+            // final-logit softcap, applied before softmax, only when > 0).
+            if (hp_.attn_logit_softcapping > 0.0f) {
+                const float cap = hp_.attn_logit_softcapping;
+                const float inv_cap = 1.0f / cap;
+                for (uint32_t s = 0; s < win_len; ++s) {
+                    scores[s] = cap * std::tanh(scores[s] * inv_cap);
+                }
             }
             softmax(scores.data(), win_len);
 
@@ -926,6 +1658,59 @@ std::vector<float> MoETransformerEngine::forward_token(
     return logits;
 }
 
+namespace {
+// Sampler RNG: thread-local, (re)seeded once per generate_stream() call.
+// An explicit non-zero seed reproduces the same output every run; seed 0
+// draws fresh entropy (random_device + time) per generation.
+thread_local std::mt19937_64 g_sampler_rng;
+thread_local bool g_sampler_seeded = false;
+} // namespace
+
+static void reseed_sampler_for_generation(uint64_t seed) {
+    if (seed != 0) {
+        g_sampler_rng.seed(seed);
+    } else {
+        std::random_device rd;
+        uint64_t s = (static_cast<uint64_t>(rd()) << 32) ^ static_cast<uint64_t>(rd());
+        s ^= static_cast<uint64_t>(now_us());
+        s ^= static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+        g_sampler_rng.seed(s);
+    }
+    g_sampler_seeded = true;
+}
+
+std::vector<uint32_t> MoETransformerEngine::stop_token_ids() const {
+    std::vector<uint32_t> ids;
+    auto add = [&ids](int32_t id) {
+        if (id < 0) return;
+        uint32_t u = static_cast<uint32_t>(id);
+        if (std::find(ids.begin(), ids.end(), u) == ids.end()) ids.push_back(u);
+    };
+    add(static_cast<int32_t>(tokenizer_.eos_id()));
+    add(static_cast<int32_t>(tokenizer_.im_end_id()));
+    // Generic stop markers resolved against THIS model's vocab. A marker
+    // only stops generation when it is a real token in the vocabulary, so
+    // no vendor-specific ID is ever hardcoded.
+    static const char* kStopMarkers[] = {
+        "<|end_of_text|>", "<|im_end|>", "<|end_of_turn|>", "<|eot_id|>",
+        "</s>", "<|endoftext|>", "<eos>", "<|end|>"
+    };
+    for (const char* m : kStopMarkers) add(tokenizer_.token_to_id(m));
+    return ids;
+}
+
+bool MoETransformerEngine::is_stop_token(uint32_t id) const {
+    const auto ids = stop_token_ids();
+    return std::find(ids.begin(), ids.end(), id) != ids.end();
+}
+
+std::string MoETransformerEngine::chat_template_source() const {
+    if (!tokenizer_.chat_template().empty()) return "gguf-chat-template";
+    std::string src;
+    format_chat_messages({}, hp_.arch, "", tokenizer_, true, &src);
+    return src; // "fallback:<name>"
+}
+
 uint32_t MoETransformerEngine::sample_next_token(
     const std::vector<float>& logits,
     const std::vector<uint32_t>& history,
@@ -990,13 +1775,15 @@ uint32_t MoETransformerEngine::sample_next_token(
         cands.resize(std::max<size_t>(1, cutoff));
     }
 
-    // Renormalize & sample
+    // Renormalize & sample. The RNG is seeded per generation (see
+    // reseed_sampler_for_generation); a direct call without a generation
+    // lazily seeds from cfg.seed (or fresh entropy when seed is 0).
     float norm_sum = 0.0f;
     for (const auto& c : cands) norm_sum += c.val;
 
-    thread_local std::mt19937_64 rng(42);
+    if (!g_sampler_seeded) reseed_sampler_for_generation(cfg.seed);
     std::uniform_real_distribution<float> dist(0.0f, norm_sum);
-    float r = dist(rng);
+    float r = dist(g_sampler_rng);
     float acc = 0.0f;
     for (const auto& c : cands) {
         acc += c.val;
@@ -1034,7 +1821,7 @@ std::vector<uint32_t> MoETransformerEngine::verify_speculative_batch(
             hist = get_or_create_slot(slot_id).token_history;
         }
         uint32_t target_next = sample_next_token(logits, hist, sampler_cfg);
-        if (target_next == tokenizer_.eos_id() || target_next == tokenizer_.im_end_id()) {
+        if (is_stop_token(target_next)) {
             break;
         }
         if (i + 1 < draft_tokens.size() && target_next != draft_tokens[i + 1]) {
@@ -1061,6 +1848,10 @@ void MoETransformerEngine::generate_stream(
     std::vector<float> logits;
     ProfileSample last_prof;
 
+    // (Re)seed the sampler for this generation: an explicit non-zero seed
+    // is deterministic, seed 0 draws fresh entropy.
+    reseed_sampler_for_generation(sampler_cfg.seed);
+
     bool has_existing_context = false;
     {
         std::lock_guard<std::mutex> lk(engine_mtx_);
@@ -1068,21 +1859,20 @@ void MoETransformerEngine::generate_stream(
     }
 
     if (!continue_assistant || !has_existing_context) {
-        std::string prompt_to_encode = prompt;
-        if (prompt_to_encode.find("<|im_start|>") == std::string::npos &&
-            prompt_to_encode.find("<|user|>") == std::string::npos &&
-            prompt_to_encode.find("<|system|>") == std::string::npos &&
-            prompt_to_encode.find("<|turn>") == std::string::npos) {
-            if (hp_.arch == "gemma4" || tokenizer_.token_to_id("<|turn>") >= 0) {
-                prompt_to_encode = "<|turn>user\n" + prompt_to_encode + "<turn|>\n<|turn>model\n";
-            } else if (hp_.arch == "olmoe" || tokenizer_.token_to_id("<|user|>") >= 0) {
-                prompt_to_encode = "<|user|>\n" + prompt_to_encode + "\n<|assistant|>\n";
-            } else if (hp_.arch == "qwen2" || tokenizer_.token_to_id("<|im_start|>") >= 0) {
-                prompt_to_encode = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n" + prompt_to_encode + "<|im_end|>\n<|im_start|>assistant\n";
-            }
-        }
+        // Single shared chat-template path (identical to the HTTP server):
+        // GGUF tokenizer.chat_template wins, else a per-arch fallback.
+        // Raw prompts become one user turn; already-templated prompts
+        // pass through unchanged. No default system prompt is injected.
+        std::string prompt_to_encode = wrap_raw_prompt_for_chat(
+            prompt, hp_.arch, tokenizer_.chat_template(), tokenizer_);
 
-        bool add_bos = (hp_.arch == "gemma4" || hp_.arch == "gemma3" || hp_.arch == "gemma2" || hp_.arch == "gemma");
+        bool add_bos = should_add_bos(hp_.arch, tokenizer_);
+        if (add_bos && tokenizer_.bos_id() < tokenizer_.vocab_size()) {
+            // The rendered template may already start with the BOS token
+            // text (e.g. Llama3 {{ bos_token }}); do not emit it twice.
+            const std::string& bos_text = tokenizer_.vocab()[tokenizer_.bos_id()];
+            if (!bos_text.empty() && prompt_to_encode.rfind(bos_text, 0) == 0) add_bos = false;
+        }
         std::vector<uint32_t> prompt_tokens = tokenizer_.encode(prompt_to_encode, add_bos);
         if (prompt_tokens.empty()) {
             prompt_tokens.push_back(tokenizer_.bos_id());
@@ -1143,8 +1933,7 @@ void MoETransformerEngine::generate_stream(
         }
 
         uint32_t next_id = sample_next_token(logits, hist, sampler_cfg);
-        if (next_id == tokenizer_.eos_id() || next_id == tokenizer_.im_end_id() ||
-            next_id == 50279 || next_id == 50280 || next_id == 151645 || next_id == 151643) {
+        if (is_stop_token(next_id)) {
             break;
         }
 
@@ -1164,6 +1953,8 @@ void MoETransformerEngine::generate_stream(
             if (piece.find("<|im_end|>") != std::string::npos ||
                 piece.find("<|endoftext|>") != std::string::npos ||
                 piece.find("<|end_of_text|>") != std::string::npos ||
+                piece.find("<|eot_id|>") != std::string::npos ||
+                piece.find("<|end_of_turn|>") != std::string::npos ||
                 piece.find("<turn|>") != std::string::npos ||
                 piece.find("<eos>") != std::string::npos) {
                 break;
@@ -1210,8 +2001,7 @@ void MoETransformerEngine::generate_stream(
                         // Draft rejected: stop speculative run cleanly without corrupting KV cache
                         break;
                     }
-                    if (target_tok == tokenizer_.eos_id() || target_tok == tokenizer_.im_end_id() ||
-                        target_tok == 151645 || target_tok == 151643 ||
+                    if (is_stop_token(target_tok) ||
                         target_tok == tokenizer_.think_start_id() || target_tok == tokenizer_.think_end_id()) {
                         break;
                     }

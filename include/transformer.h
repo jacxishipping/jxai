@@ -35,12 +35,20 @@ struct ModelHyperparams {
     uint32_t rope_dim_swa = 0;
     float    rope_freq_base_swa = 10000.0f;
     float    final_logit_softcapping = 0.0f;
+    float    attn_logit_softcapping = 0.0f; // Gemma2/3: <arch>.attn_logit_softcapping
     bool     use_gelu = false;
     bool     scale_embeddings = false;
     bool     v_norm = false;
     float    rms_norm_eps = 1e-5f;
     float    rope_freq_base = 10000.0f;
     float    yarn_scale = 1.0f;
+    // RoPE scaling (GGUF: <arch>.rope.scaling.*). yarn_scale is only set
+    // from .factor when type == "yarn"; otherwise it stays 1.0.
+    std::string rope_scaling_type; // "", "none", "linear", "yarn", ...
+    float    rope_scaling_factor = 1.0f;
+    float    yarn_log_multiplier = 0.0f;
+    uint32_t rope_orig_ctx_len = 0;
+    bool     rope_neox = true; // computed in bind_tensors(); Neox is the default
 };
 
 struct LayerDenseWeights {
@@ -133,6 +141,49 @@ struct SamplerConfig {
     float    repetition_penalty = 1.10f;
     uint64_t seed = 42;
 };
+
+// --- Universal-model helpers (shared by CLI chat and the HTTP server) ---
+// RoPE style: Neox (rotate-half) is the default for essentially every modern
+// LLM (Llama, Qwen3, Mistral, Phi3/4, ...). Only GPT-2 / GPT-J style models
+// use interleaved (GPT-J) RoPE.
+bool arch_uses_neox_rope(const std::string& arch);
+bool arch_is_known(const std::string& arch);
+
+struct ChatMessage {
+    std::string role;
+    std::string content;
+};
+
+// Render chat messages to a prompt string. Source of truth, in order:
+//  1. `chat_template` from GGUF metadata (tokenizer.chat_template), rendered
+//     with a minimal Jinja subset (for/endfor, if/elif/else, {{ expr }} with
+//     string literals + message['role'/'content'] + bos/eos_token).
+//  2. Per-architecture fallback template (ChatML / Llama3 / Mistral / Gemma / Phi).
+// If source_out is non-null it receives "gguf-chat-template" or
+// "fallback:<name>". BOS is NOT emitted by these templates; the caller adds
+// it via encode(..., should_add_bos(...)).
+std::string format_chat_messages(
+    const std::vector<ChatMessage>& msgs,
+    const std::string& arch,
+    const std::string& chat_template,
+    const Tokenizer& tok,
+    bool add_generation_prompt = true,
+    std::string* source_out = nullptr
+);
+
+// Wrap a raw (non-templated) user prompt as a single-user chat turn. Prompts
+// that already contain template markers are returned unchanged.
+std::string wrap_raw_prompt_for_chat(
+    const std::string& prompt,
+    const std::string& arch,
+    const std::string& chat_template,
+    const Tokenizer& tok
+);
+
+// BOS policy: tokenizer.ggml.add_bos_token wins when present in the GGUF;
+// otherwise per-architecture defaults (true for Llama/Gemma/Mistral/Phi,
+// false for Qwen/DeepSeek/GPT-2 family).
+bool should_add_bos(const std::string& arch, const Tokenizer& tok);
 
 struct SystemOneOptionScore {
     std::string option;
@@ -241,6 +292,16 @@ public:
     std::vector<ProfileSample> recent_profiles() const;
     uint64_t dense_backbone_bytes() const { return dense_bytes_; }
     uint64_t sparse_disk_bytes() const { return sparse_bytes_; }
+
+    // Universal-model introspection (used by `moe_engine info` and generation)
+    // Stop set built from the loaded tokenizer/model: eos_id plus any token
+    // found for <|end_of_text|>, <|im_end|>, <|end_of_turn|>, <|eot_id|>,
+    // </s>, <|endoftext|>. Hardcoded vendor IDs are NOT used.
+    std::vector<uint32_t> stop_token_ids() const;
+    bool is_stop_token(uint32_t id) const;
+    // "gguf-chat-template" | "fallback:<name>" | "none"
+    std::string chat_template_source() const;
+    const std::string& chat_template() const { return tokenizer_.chat_template(); }
 
 private:
     bool bind_tensors(std::string& err_msg);

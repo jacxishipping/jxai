@@ -122,15 +122,16 @@ std::string extract_last_message_content(const std::string& body) {
     return out;
 }
 
-// Extract multi-turn ChatML prompt from "messages" array, or fallback to single prompt
-// Quote-aware and brace-depth-aware so messages containing code or JSON braces {} never break parsing
-std::string extract_chat_prompt(const std::string& body) {
+// Parse the "messages" array of an OpenAI-style request body into
+// {role, content} pairs. Quote-aware and brace-depth-aware so messages
+// containing code or JSON braces {} never break parsing. Returns an empty
+// vector when there is no usable messages array.
+std::vector<ChatMessage> parse_chat_messages(const std::string& body) {
+    std::vector<ChatMessage> msgs;
     size_t m_pos = body.find("\"messages\"");
-    if (m_pos == std::string::npos) {
-        return extract_last_message_content(body);
-    }
+    if (m_pos == std::string::npos) return msgs;
     size_t arr_start = body.find('[', m_pos);
-    if (arr_start == std::string::npos) return extract_last_message_content(body);
+    if (arr_start == std::string::npos) return msgs;
 
     // Find matching ']' for the messages array while respecting string literals
     size_t arr_end = std::string::npos;
@@ -158,14 +159,11 @@ std::string extract_chat_prompt(const std::string& body) {
             }
         }
     }
-    if (arr_end == std::string::npos || arr_end <= arr_start) return extract_last_message_content(body);
+    if (arr_end == std::string::npos || arr_end <= arr_start) return msgs;
 
     std::string arr_str = body.substr(arr_start, arr_end - arr_start + 1);
 
-    std::ostringstream formatted_prompt;
     size_t i = 0;
-    int msg_count = 0;
-
     while (i < arr_str.size()) {
         // Find start of next message object '{' outside quotes
         bool in_str = false;
@@ -222,48 +220,24 @@ std::string extract_chat_prompt(const std::string& body) {
         }
 
         if (!content.empty()) {
-            formatted_prompt << "<|im_start|>" << role << "\n" << content << "<|im_end|>\n";
-            msg_count++;
+            msgs.push_back({role, content});
         }
     }
-
-    if (msg_count > 0) {
-        formatted_prompt << "<|im_start|>assistant\n";
-        return formatted_prompt.str();
-    }
-
-    return extract_last_message_content(body);
+    return msgs;
 }
 
-std::string format_chat_prompt_for_arch(const std::string& body, const std::string& arch) {
-    if (arch != "gemma4" && arch != "gemma3" && arch != "gemma2" && arch != "gemma") {
-        return extract_chat_prompt(body);
+// Build the generation prompt for a chat request, using the SAME shared
+// helper as CLI chat (generate_stream): the GGUF tokenizer.chat_template
+// wins, otherwise a per-architecture fallback template.
+std::string format_chat_prompt_for_arch(const std::string& body, const MoETransformerEngine& engine) {
+    const auto& hp = engine.hparams();
+    const auto& tok = engine.tokenizer();
+    auto msgs = parse_chat_messages(body);
+    if (msgs.empty()) {
+        return wrap_raw_prompt_for_chat(extract_last_message_content(body),
+                                        hp.arch, tok.chat_template(), tok);
     }
-    std::string chatml = extract_chat_prompt(body);
-    if (chatml.find("<|im_start|>") == std::string::npos) {
-        return chatml;
-    }
-    // Convert ChatML turns into Gemma <|turn>role\n...<turn|>\n format
-    std::ostringstream out;
-    size_t pos = 0;
-    while (true) {
-        size_t s = chatml.find("<|im_start|>", pos);
-        if (s == std::string::npos) break;
-        s += 12;
-        size_t nl = chatml.find('\n', s);
-        if (nl == std::string::npos) break;
-        std::string role = chatml.substr(s, nl - s);
-        size_t e = chatml.find("<|im_end|>", nl + 1);
-        if (e == std::string::npos) {
-            if (role == "assistant") out << "<|turn>model\n";
-            break;
-        }
-        std::string content = chatml.substr(nl + 1, e - (nl + 1));
-        std::string gemma_role = (role == "assistant") ? "model" : role;
-        out << "<|turn>" << gemma_role << "\n" << content << "<turn|>\n";
-        pos = e + 10;
-    }
-    return out.str();
+    return format_chat_messages(msgs, hp.arch, tok.chat_template(), tok, true, nullptr);
 }
 
 double extract_json_number(const std::string& body, const std::string& key, double def) {
@@ -989,7 +963,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     // 4. POST /v1/chat/completions, /v1/completions, /api/chat, /api/generate
     // ------------------------------------------------------------------------
     if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions" || path == "/api/chat" || path == "/api/generate")) {
-        std::string user_prompt = format_chat_prompt_for_arch(body, engine_.hparams().arch);
+        std::string user_prompt = format_chat_prompt_for_arch(body, engine_);
         bool stream = extract_json_bool(body, "stream", true);
         uint32_t max_tokens = static_cast<uint32_t>(std::clamp(extract_json_number(body, "max_tokens", 1024.0), 1.0, 4096.0));
         uint32_t slot_id = static_cast<uint32_t>(std::max(0.0, extract_json_number(body, "cache_slot", 0.0)));
@@ -1003,6 +977,9 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         scfg.top_k = static_cast<uint32_t>(extract_json_number(body, "top_k", 40.0));
         scfg.top_p = static_cast<float>(extract_json_number(body, "top_p", 0.9));
         scfg.repetition_penalty = static_cast<float>(extract_json_number(body, "repetition_penalty", 1.1));
+        // Seed 0 (default) = fresh entropy per request; an explicit seed is
+        // deterministic across requests.
+        scfg.seed = static_cast<uint64_t>(extract_json_number(body, "seed", 0.0));
 
         if (!stream) {
             std::string reasoning_acc;
