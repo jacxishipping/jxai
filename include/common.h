@@ -182,7 +182,7 @@ inline size_t ggml_type_size(GGMLType t) {
         case GGMLType::IQ3_XXS:  return 98;  // 256 weights
         case GGMLType::IQ3_S:    return 110; // 256 weights
         case GGMLType::IQ4_XS:   return 136; // 256 weights
-        case GGMLType::IQ1_S:    return 48;  // 256 weights
+        case GGMLType::IQ1_S:    return 50;  // 256 weights (2 + 32 + 16)
         case GGMLType::IQ1_M:    return 56;  // 256 weights
         default:                 return 4;
     }

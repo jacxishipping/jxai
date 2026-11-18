@@ -37,6 +37,7 @@ import {
 } from '../types';
 import { MarkdownRenderer } from '../utils/markdownParser';
 import { Translations } from '../utils/i18n';
+import { apiFetch } from '../utils/api';
 
 interface ChatWorkspaceProps {
   health: EngineHealth | null;
@@ -132,7 +133,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
   const fetchModelsAndSlots = async () => {
     try {
-      const [mRes, sRes] = await Promise.all([fetch('/v1/models'), fetch('/v1/slots')]);
+      const [mRes, sRes] = await Promise.all([apiFetch('/v1/models'), apiFetch('/v1/slots')]);
       if (mRes.ok) {
         const mData = await mRes.json();
         const list = (mData.data || []).filter((m: LocalModelInfo) => m.path);
@@ -173,7 +174,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     if (!modelPath || isSwitchingModel || isStreaming) return;
     setIsSwitchingModel(true);
     try {
-      const res = await fetch('/v1/models/load', {
+      const res = await apiFetch('/v1/models/load', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ model_path: modelPath })
@@ -189,7 +190,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
 
   const handleClearCurrentSlot = async () => {
     try {
-      await fetch('/v1/slots/clear', {
+      await apiFetch('/v1/slots/clear', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ slot_id: currentSlot })
@@ -233,7 +234,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     let tokenCount = 0;
 
     try {
-      const response = await fetch('/v1/chat/completions', {
+      const response = await apiFetch('/v1/chat/completions', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         signal: controller.signal,
@@ -517,7 +518,7 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
     setPullPercent(0);
     setPullStatus('Connecting to Hugging Face Hub...');
     try {
-      const res = await fetch('/v1/models/pull', {
+      const res = await apiFetch('/v1/models/pull', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ source: pullSource.trim() })

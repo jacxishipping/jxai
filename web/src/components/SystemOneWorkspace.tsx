@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Target, CheckCircle2, Loader2, Sparkles, Gauge } from 'lucide-react';
 import { SystemOneResult } from '../types';
 import { Translations } from '../utils/i18n';
+import { apiFetch } from '../utils/api';
 
 interface SystemOneWorkspaceProps {
   t: Translations;
@@ -46,7 +47,7 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
         .split(',')
         .map(s => s.trim())
         .filter(Boolean);
-      const res = await fetch('/v1/systemone', {
+      const res = await apiFetch('/v1/systemone', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({

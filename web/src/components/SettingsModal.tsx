@@ -2,6 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Settings as SettingsIcon, Key, Globe, Terminal, Save, Cpu, Sliders, Zap } from 'lucide-react';
 import { EngineHealth, SamplerSettings, SupportedLanguage } from '../types';
 import { Translations } from '../utils/i18n';
+import { apiFetch, getApiKey, setApiKey } from '../utils/api';
 
 interface SettingsModalProps {
   isOpen: boolean;
@@ -28,8 +29,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   samplerSettings,
   onSaveSamplerSettings
 }) => {
-  // Memory-only API key: NOT written to localStorage or sessionStorage!
-  const [apiKey, setApiKey] = useState('');
+  // API key for the engine (required when MOE_API_KEY is set server-side).
+  // Stored in this browser's localStorage as `jxai_api_key` and sent as
+  // `Authorization: Bearer <key>` by apiFetch. Clear the field and save
+  // to remove it. Never hardcoded.
+  const [apiKey, setApiKeyInput] = useState(() => getApiKey());
   const [currentPrompt, setCurrentPrompt] = useState(systemPrompt);
   const [localSampler, setLocalSampler] = useState<SamplerSettings>(samplerSettings);
 
@@ -63,10 +67,11 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   if (!isOpen) return null;
 
   const handleSave = async () => {
+    setApiKey(apiKey); // persist (or clear) before the config call below
     onSaveSystemPrompt(currentPrompt);
     onSaveSamplerSettings(localSampler);
     try {
-      await fetch('/v1/config', {
+      await apiFetch('/v1/config', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -99,7 +104,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         </div>
 
         <div className="space-y-4">
-          {/* Memory-only API Key (Zero Disk Persistence) */}
+          {/* API Key (stored in this browser's localStorage) */}
           <div>
             <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono flex items-center space-x-2">
               <Key className="w-3.5 h-3.5 text-amber-400" />
@@ -108,12 +113,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             <input
               type="password"
               value={apiKey}
-              onChange={e => setApiKey(e.target.value)}
+              onChange={e => setApiKeyInput(e.target.value)}
               placeholder={t.apiKeyPlaceholder}
               className="w-full bg-slate-950/80 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs font-mono text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
             />
             <span className="text-[10px] text-slate-500 font-mono mt-1 block">
-              Purged from disk and local storage to prevent key leakage.
+              Saved in this browser only (localStorage key `jxai_api_key`). Clear the field and save to remove it.
             </span>
           </div>
 

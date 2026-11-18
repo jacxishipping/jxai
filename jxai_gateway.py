@@ -2,7 +2,15 @@
 """
 JXAI API Gateway - OpenAI-compatible proxy to Ollama
 Serves as the backend API for Open WebUI
+
+Security (2026-11-17): binds 127.0.0.1 by default (port 8001). When
+MOE_API_KEY is set, every POST endpoint requires
+`Authorization: Bearer <key>` or `x-api-key: <key>` (401 otherwise);
+GET /health stays open as the liveness probe. A non-loopback bind with
+no key configured is refused unless --allow-insecure-remote is passed.
 """
+import argparse
+import hmac
 import json
 import os
 import sys
@@ -13,7 +21,24 @@ from urllib.request import Request, urlopen, HTTPError
 from urllib.error import URLError
 
 OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
-GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8000"))
+GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8001"))
+GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
+API_KEY = os.environ.get("MOE_API_KEY", "")
+
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
+
+
+def is_authorized(handler):
+    """True when no key is configured, or the request carries the right one."""
+    if not API_KEY:
+        return True
+    auth = handler.headers.get("Authorization", "")
+    if auth.startswith("Bearer ") and hmac.compare_digest(auth[7:], API_KEY):
+        return True
+    xkey = handler.headers.get("x-api-key", "")
+    if xkey and hmac.compare_digest(xkey, API_KEY):
+        return True
+    return False
 
 
 class JXAIAPIHandler(BaseHTTPRequestHandler):
@@ -34,6 +59,16 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
         self.send_header("X-JXAI-Engine", "JXAI Inference Engine v2")
         self.end_headers()
         self.wfile.write(body)
+
+    def _require_auth(self):
+        """401 + False when a configured key is missing/wrong on this request."""
+        if is_authorized(self):
+            return True
+        self._send_json(401, {
+            "error": "unauthorized",
+            "message": "Missing or invalid API key. Send Authorization: Bearer <key> or x-api-key: <key>.",
+        })
+        return False
 
     def _proxy_to_ollama(self, path, body=None, method="GET"):
         url = f"{OLLAMA_HOST}{path}"
@@ -163,6 +198,9 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
 
     def do_POST(self):
         path = self.path
+        # Mutating endpoints require the API key whenever one is configured.
+        if not self._require_auth():
+            return
         content_length = int(self.headers.get("Content-Length", 0))
         body = self.rfile.read(content_length) if content_length > 0 else b"{}"
 
@@ -223,6 +261,33 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="JXAI API Gateway (Ollama proxy)")
+    parser.add_argument("--host", default=GATEWAY_HOST,
+                        help="Bind host (default: 127.0.0.1; env GATEWAY_HOST)")
+    parser.add_argument("--port", type=int, default=GATEWAY_PORT,
+                        help="Bind port (default: 8001; env GATEWAY_PORT)")
+    parser.add_argument("--allow-insecure-remote", action="store_true",
+                        help="Allow a non-loopback bind with no MOE_API_KEY configured")
+    args = parser.parse_args()
+
+    if args.host not in LOOPBACK_HOSTS and not API_KEY and not args.allow_insecure_remote:
+        print(f"""
+[SECURITY] Refusing to bind {args.host} without an API key: set MOE_API_KEY,
+bind 127.0.0.1, or pass --allow-insecure-remote to accept the risk explicitly.
+""", file=sys.stderr)
+        sys.exit(1)
+    if args.host not in LOOPBACK_HOSTS and not API_KEY:
+        print(f"""
+[SECURITY WARNING] Binding {args.host} with NO API key
+(--allow-insecure-remote). Anyone who can reach this port can use the
+models. This is strongly discouraged.
+""", file=sys.stderr)
+    elif args.host not in LOOPBACK_HOSTS:
+        print(f"[SECURITY] Binding {args.host} — API-key auth is enabled.")
+    elif not API_KEY:
+        print("[SECURITY] Listening on loopback only with no API key configured. "
+              "Set MOE_API_KEY to require auth.")
+
     print(f"""
 ╔══════════════════════════════════════════════╗
 ║         JXAI API Gateway v2.0                ║
@@ -230,11 +295,12 @@ if __name__ == "__main__":
 ╚══════════════════════════════════════════════╝
     """)
     print(f"  Ollama endpoint: {OLLAMA_HOST}")
-    print(f"  Gateway port:    {GATEWAY_PORT}")
-    print(f"  Listening on:    http://127.0.0.1:{GATEWAY_PORT}")
+    print(f"  Gateway port:    {args.port}")
+    print(f"  Listening on:    http://{args.host}:{args.port}")
+    print(f"  Auth:            {'API key required (MOE_API_KEY)' if API_KEY else 'disabled (loopback only, no key set)'}")
     print()
 
-    server = HTTPServer(("0.0.0.0", GATEWAY_PORT), JXAIAPIHandler)
+    server = HTTPServer((args.host, args.port), JXAIAPIHandler)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

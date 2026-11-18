@@ -60,7 +60,7 @@ int main(int argc, char* argv[]) {
     // BitBlt directly from screen DC which includes DWM composited Direct2D
     BitBlt(hdcMem, 0, 0, w, h, hdcScreen, rc.left, rc.top, SRCCOPY);
 
-    std::wstring out_path = (argc > 1) ? L"C:\\Users\\RDP\\.gemini\\antigravity\\brain\\9c15bc63-3d5e-4ae4-bc9a-8203acf60398\\moe_studio_window.bmp" : L"moe_studio_window.bmp";
+    std::wstring out_path = L"moe_studio_window.bmp"; // default output in the current directory
     bool ok = SaveHBitmapToBmp(hbm, out_path);
 
     DeleteObject(hbm);

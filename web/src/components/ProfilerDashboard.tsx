@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import { Activity, Zap, HardDrive, Cpu, Clock, Layers, Trash2 } from 'lucide-react';
 import { ProfileSample, EngineHealth, SlotsResponse } from '../types';
 import { Translations } from '../utils/i18n';
+import { apiFetch } from '../utils/api';
 
 interface ProfilerDashboardProps {
   health: EngineHealth | null;
@@ -15,8 +16,8 @@ export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t 
   const fetchProfile = async () => {
     try {
       const [profRes, slotsRes] = await Promise.all([
-        fetch('/profile'),
-        fetch('/v1/slots')
+        apiFetch('/profile'),
+        apiFetch('/v1/slots')
       ]);
       if (profRes.ok) {
         const data = await profRes.json();
@@ -33,7 +34,7 @@ export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t 
 
   const handleClearSlot = async (slotId: number) => {
     try {
-      await fetch('/v1/slots/clear', {
+      await apiFetch('/v1/slots/clear', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ slot_id: slotId })

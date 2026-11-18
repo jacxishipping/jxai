@@ -15,7 +15,9 @@
 #include "server.h"
 #include "model_pull.h"
 #include "vulkan_backend.h"
+#include <cstdlib>
 #include <fstream>
+#include <iostream>
 #include <sstream>
 #include <thread>
 #include <algorithm>
@@ -120,6 +122,300 @@ std::string extract_last_message_content(const std::string& body) {
         }
     }
     return out;
+}
+
+// Find the balanced JSON value that follows "key": at the top level of
+// `body` (object / array / string / literal). Returns the [start, end)
+// span in `body`, or false when the key is absent or the value is malformed.
+bool extract_json_value_span(const std::string& body, const std::string& key,
+                             size_t& val_start, size_t& val_end) {
+    std::string pat = "\"" + key + "\"";
+    size_t pos = body.find(pat);
+    if (pos == std::string::npos) return false;
+    size_t colon = body.find(':', pos + pat.size());
+    if (colon == std::string::npos) return false;
+    size_t i = colon + 1;
+    while (i < body.size() && (body[i] == ' ' || body[i] == '\t' || body[i] == '\n' || body[i] == '\r')) ++i;
+    if (i >= body.size()) return false;
+    if (body[i] == '{' || body[i] == '[') {
+        char open = body[i], close = (body[i] == '{') ? '}' : ']';
+        int depth = 0;
+        bool in_str = false;
+        for (size_t j = i; j < body.size(); ++j) {
+            char c = body[j];
+            if (in_str) {
+                if (c == '\\' && j + 1 < body.size()) ++j;
+                else if (c == '"') in_str = false;
+            } else if (c == '"') {
+                in_str = true;
+            } else if (c == open) {
+                ++depth;
+            } else if (c == close) {
+                if (--depth == 0) { val_start = i; val_end = j + 1; return true; }
+            }
+        }
+        return false;
+    }
+    if (body[i] == '"') {
+        size_t j = i + 1;
+        while (j < body.size()) {
+            if (body[j] == '\\' && j + 1 < body.size()) { j += 2; continue; }
+            if (body[j] == '"') { val_start = i; val_end = j + 1; return true; }
+            ++j;
+        }
+        return false;
+    }
+    size_t j = i;
+    while (j < body.size() && body[j] != ',' && body[j] != '}' && body[j] != ']') ++j;
+    val_start = i; val_end = j;
+    return true;
+}
+
+// Parse the OpenAI-style "tools" array of a chat request into ToolDefinition
+// records. Only tools with a function name survive; malformed entries are
+// skipped (a template rendering a nameless tool would be worse than none).
+// The raw JSON of each tool object is kept verbatim so {{ tool | tojson }}
+// renders exactly what the client sent.
+std::vector<ToolDefinition> parse_chat_tools(const std::string& body) {
+    std::vector<ToolDefinition> out;
+    size_t vs = 0, ve = 0;
+    if (!extract_json_value_span(body, "tools", vs, ve)) return out;
+    if (ve <= vs || body[vs] != '[') return out;
+    // Iterate the top-level objects of the array (depth-aware, quote-aware).
+    size_t i = vs + 1;
+    while (i < ve) {
+        while (i < ve && body[i] != '{') ++i;
+        if (i >= ve) break;
+        size_t obj_start = i;
+        int depth = 0;
+        bool in_str = false;
+        size_t obj_end = std::string::npos;
+        for (size_t j = i; j < ve; ++j) {
+            char c = body[j];
+            if (in_str) {
+                if (c == '\\' && j + 1 < ve) ++j;
+                else if (c == '"') in_str = false;
+            } else if (c == '"') {
+                in_str = true;
+            } else if (c == '{') {
+                ++depth;
+            } else if (c == '}') {
+                if (--depth == 0) { obj_end = j + 1; break; }
+            }
+        }
+        if (obj_end == std::string::npos) break;
+        std::string tool_json = body.substr(obj_start, obj_end - obj_start);
+        i = obj_end;
+
+        ToolDefinition td;
+        td.raw_json = tool_json;
+        // The function object, or the tool object itself for flat shapes.
+        std::string fn_json = tool_json;
+        size_t fs = 0, fe = 0;
+        if (extract_json_value_span(tool_json, "function", fs, fe) &&
+            fe > fs && tool_json[fs] == '{') {
+            fn_json = tool_json.substr(fs, fe - fs);
+        }
+        td.function_json = fn_json;
+        td.name = extract_json_string(fn_json, "name", "");
+        if (td.name.empty()) continue; // nameless tool: skip, do not render
+        td.description = extract_json_string(fn_json, "description", "");
+        size_t ps = 0, pe = 0;
+        if (extract_json_value_span(fn_json, "parameters", ps, pe) && pe > ps) {
+            td.parameters_json = fn_json.substr(ps, pe - ps);
+        } else {
+            td.parameters_json = "{}";
+        }
+        out.push_back(std::move(td));
+    }
+    return out;
+}
+
+// One tool call parsed out of generated text.
+struct ParsedToolCall {
+    std::string id;
+    std::string name;
+    std::string arguments_json; // JSON object text (or "" when absent)
+};
+
+// Extract the "arguments"/"parameters" value of one tool-call JSON object
+// span as JSON text: an object/array is kept verbatim; a string is decoded
+// (its content is the arguments JSON in the Qwen <tool_call> convention).
+std::string tool_call_arguments_json(const std::string& obj_json) {
+    size_t s = 0, e = 0;
+    if (!extract_json_value_span(obj_json, "arguments", s, e)) {
+        if (!extract_json_value_span(obj_json, "parameters", s, e)) return "";
+    }
+    std::string v = obj_json.substr(s, e - s);
+    if (!v.empty() && v.front() == '"') {
+        // JSON string: decode escapes.
+        std::string out;
+        for (size_t i = 1; i + 1 < v.size(); ++i) {
+            if (v[i] == '\\' && i + 1 < v.size() - 1) {
+                char n = v[++i];
+                if (n == 'n') out.push_back('\n');
+                else if (n == 'r') out.push_back('\r');
+                else if (n == 't') out.push_back('\t');
+                else out.push_back(n);
+            } else {
+                out.push_back(v[i]);
+            }
+        }
+        return out;
+    }
+    return v;
+}
+
+// Parse tool calls out of generated text. Accepted forms (in order):
+//   1. <tool_call>{...}</tool_call> blocks (Qwen2.5/3, as instructed by
+//      their templates; possibly several in one reply).
+//   2. [TOOL_CALLS] [{...}, ...] (Mistral).
+//   3. A bare leading JSON object {"name": ..., "arguments"|"parameters":
+//      ...} (Llama3 style) — only when the whole trimmed reply is that
+//      object (or starts with it and the rest is whitespace).
+// A call is only accepted when its name matches a declared tool: a model
+// inventing a function name is a hallucination, not a tool call, and the
+// reply falls through to plain content.
+std::vector<ParsedToolCall> parse_tool_calls_from_text(
+    const std::string& text, const std::vector<ToolDefinition>& declared) {
+    auto is_declared = [&](const std::string& name) {
+        for (const auto& t : declared) if (t.name == name) return true;
+        return false;
+    };
+    std::vector<ParsedToolCall> calls;
+    uint64_t call_no = 0;
+    auto next_id = [&]() {
+        return "call_" + std::to_string(now_us()) + "_" + std::to_string(call_no++);
+    };
+
+    // 1. <tool_call> blocks.
+    size_t pos = 0;
+    while (true) {
+        size_t b = text.find("<tool_call>", pos);
+        if (b == std::string::npos) break;
+        size_t e = text.find("</tool_call>", b + 11);
+        if (e == std::string::npos) break;
+        std::string inner = text.substr(b + 11, e - (b + 11));
+        // Trim whitespace.
+        size_t a = inner.find_first_not_of(" \t\r\n");
+        size_t z = inner.find_last_not_of(" \t\r\n");
+        if (a != std::string::npos) inner = inner.substr(a, z - a + 1);
+        std::string name = extract_json_string(inner, "name", "");
+        if (!name.empty() && is_declared(name)) {
+            calls.push_back({next_id(), name, tool_call_arguments_json(inner)});
+        }
+        pos = e + 12;
+    }
+    if (!calls.empty()) return calls;
+
+    // 2. [TOOL_CALLS] array.
+    size_t tc = text.find("[TOOL_CALLS]");
+    if (tc != std::string::npos) {
+        size_t arr = text.find('[', tc + 12);
+        if (arr != std::string::npos) {
+            // Balanced array scan starting at `arr`.
+            int depth = 0;
+            bool in_str = false;
+            size_t arr_end = std::string::npos;
+            for (size_t j = arr; j < text.size(); ++j) {
+                char c = text[j];
+                if (in_str) {
+                    if (c == '\\' && j + 1 < text.size()) ++j;
+                    else if (c == '"') in_str = false;
+                } else if (c == '"') {
+                    in_str = true;
+                } else if (c == '[') {
+                    ++depth;
+                } else if (c == ']') {
+                    if (--depth == 0) { arr_end = j + 1; break; }
+                }
+            }
+            if (arr_end != std::string::npos) {
+                std::string arr_json = text.substr(arr, arr_end - arr);
+                size_t i = 0;
+                while (i < arr_json.size()) {
+                    size_t os = arr_json.find('{', i);
+                    if (os == std::string::npos) break;
+                    int d = 0;
+                    bool ins = false;
+                    size_t oe = std::string::npos;
+                    for (size_t j = os; j < arr_json.size(); ++j) {
+                        char c = arr_json[j];
+                        if (ins) {
+                            if (c == '\\' && j + 1 < arr_json.size()) ++j;
+                            else if (c == '"') ins = false;
+                        } else if (c == '"') {
+                            ins = true;
+                        } else if (c == '{') {
+                            ++d;
+                        } else if (c == '}') {
+                            if (--d == 0) { oe = j + 1; break; }
+                        }
+                    }
+                    if (oe == std::string::npos) break;
+                    std::string obj = arr_json.substr(os, oe - os);
+                    std::string name = extract_json_string(obj, "name", "");
+                    if (!name.empty() && is_declared(name)) {
+                        std::string id = extract_json_string(obj, "id", "");
+                        calls.push_back({id.empty() ? next_id() : id, name,
+                                         tool_call_arguments_json(obj)});
+                    }
+                    i = oe;
+                }
+            }
+        }
+    }
+    if (!calls.empty()) return calls;
+
+    // 3. Bare leading JSON object.
+    size_t t0 = text.find_first_not_of(" \t\r\n");
+    if (t0 != std::string::npos && text[t0] == '{') {
+        int depth = 0;
+        bool in_str = false;
+        size_t obj_end = std::string::npos;
+        for (size_t j = t0; j < text.size(); ++j) {
+            char c = text[j];
+            if (in_str) {
+                if (c == '\\' && j + 1 < text.size()) ++j;
+                else if (c == '"') in_str = false;
+            } else if (c == '"') {
+                in_str = true;
+            } else if (c == '{') {
+                ++depth;
+            } else if (c == '}') {
+                if (--depth == 0) { obj_end = j + 1; break; }
+            }
+        }
+        if (obj_end != std::string::npos) {
+            std::string rest = text.substr(obj_end);
+            if (rest.find_first_not_of(" \t\r\n") == std::string::npos) {
+                std::string obj = text.substr(t0, obj_end - t0);
+                std::string name = extract_json_string(obj, "name", "");
+                if (!name.empty() && is_declared(name) &&
+                    (obj.find("\"arguments\"") != std::string::npos ||
+                     obj.find("\"parameters\"") != std::string::npos)) {
+                    calls.push_back({next_id(), name, tool_call_arguments_json(obj)});
+                }
+            }
+        }
+    }
+    return calls;
+}
+
+// Build the chat.completion "choices" message JSON for a tool-call reply
+// (content null, tool_calls array, finish_reason "tool_calls").
+std::string tool_calls_message_json(const std::vector<ParsedToolCall>& calls) {
+    std::ostringstream js;
+    js << "\"role\":\"assistant\",\"content\":null,\"tool_calls\":[";
+    for (size_t i = 0; i < calls.size(); ++i) {
+        if (i > 0) js << ",";
+        js << "{\"id\":\"" << json_escape(calls[i].id) << "\","
+           << "\"type\":\"function\","
+           << "\"function\":{\"name\":\"" << json_escape(calls[i].name) << "\","
+           << "\"arguments\":\"" << json_escape(calls[i].arguments_json) << "\"}}";
+    }
+    js << "]";
+    return js.str();
 }
 
 // Parse the "messages" array of an OpenAI-style request body into
@@ -229,15 +525,19 @@ std::vector<ChatMessage> parse_chat_messages(const std::string& body) {
 // Build the generation prompt for a chat request, using the SAME shared
 // helper as CLI chat (generate_stream): the GGUF tokenizer.chat_template
 // wins, otherwise a per-architecture fallback template.
-std::string format_chat_prompt_for_arch(const std::string& body, const MoETransformerEngine& engine) {
+std::string format_chat_prompt_for_arch(const std::string& body, const MoETransformerEngine& engine,
+                                        const std::vector<ToolDefinition>* tools = nullptr) {
     const auto& hp = engine.hparams();
     const auto& tok = engine.tokenizer();
     auto msgs = parse_chat_messages(body);
     if (msgs.empty()) {
-        return wrap_raw_prompt_for_chat(extract_last_message_content(body),
-                                        hp.arch, tok.chat_template(), tok);
+        if (tools == nullptr || tools->empty()) {
+            return wrap_raw_prompt_for_chat(extract_last_message_content(body),
+                                            hp.arch, tok.chat_template(), tok);
+        }
+        msgs = {{"user", extract_last_message_content(body)}};
     }
-    return format_chat_messages(msgs, hp.arch, tok.chat_template(), tok, true, nullptr);
+    return format_chat_messages(msgs, hp.arch, tok.chat_template(), tok, true, nullptr, tools);
 }
 
 double extract_json_number(const std::string& body, const std::string& key, double def) {
@@ -340,6 +640,97 @@ void send_http_json(uintptr_t sock, int status_code, const std::string& status_t
     send_all(sock, json_body.data(), json_body.size());
 }
 
+// ---------------------------------------------------------------------------
+// Auth / bind helpers (security workstream, 2026-11-17)
+// ---------------------------------------------------------------------------
+
+// Read one string field from moe_config.json in the working directory.
+// Returns `def` when the file is missing or the field is absent.
+std::string read_config_string(const std::string& key, const std::string& def = "") {
+    std::ifstream ifs("moe_config.json");
+    if (!ifs.is_open()) return def;
+    std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+    return extract_json_string(content, key, def);
+}
+
+// Resolve the API key: MOE_API_KEY env var wins; otherwise moe_config.json
+// "api_key" if present. Empty = auth disabled (localhost-only use).
+std::string resolve_api_key() {
+    const char* env_key = std::getenv("MOE_API_KEY");
+    if (env_key != nullptr && env_key[0] != '\0') return std::string(env_key);
+    return read_config_string("api_key", "");
+}
+
+bool is_loopback_host(const std::string& host) {
+    return host == "127.0.0.1" || host == "localhost" || host == "::1";
+}
+
+// Constant-time comparison so key guessing cannot use timing as an oracle.
+bool constant_time_equal(const std::string& a, const std::string& b) {
+    if (a.size() != b.size()) return false;
+    unsigned char diff = 0;
+    for (size_t i = 0; i < a.size(); ++i) diff |= static_cast<unsigned char>(a[i] ^ b[i]);
+    return diff == 0;
+}
+
+// Case-insensitive single header lookup in the raw request header block.
+std::string header_value(const std::string& headers, const std::string& name) {
+    std::string lower_h = headers;
+    std::transform(lower_h.begin(), lower_h.end(), lower_h.begin(), ::tolower);
+    std::string lower_name = name;
+    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
+    size_t pos = lower_h.find(lower_name + ":");
+    if (pos == std::string::npos) return "";
+    size_t start = pos + lower_name.size() + 1;
+    while (start < headers.size() && (headers[start] == ' ' || headers[start] == '\t')) ++start;
+    size_t end = headers.find("\r\n", start);
+    if (end == std::string::npos) end = headers.size();
+    std::string val = headers.substr(start, end - start);
+    while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r')) val.pop_back();
+    return val;
+}
+
+// Mutating routes that require a key whenever one is configured. Read-only
+// GETs (including GET /health, the liveness probe) stay open.
+bool route_requires_auth(const std::string& method, const std::string& path) {
+    if (method == "POST" || method == "DELETE") {
+        if (path == "/v1/models/load" || path == "/v1/models/pull") return true;
+        if (path == "/v1/config" || path == "/api/config") return true;
+        if (path == "/v1/slots/clear" || path.starts_with("/v1/slots/")) return true;
+        if (path == "/v1/chat/completions" || path == "/v1/completions" ||
+            path == "/api/chat" || path == "/api/generate") return true;
+        if (path == "/v1/embeddings" || path == "/v1/systemone" ||
+            path == "/v1/images/generations") return true;
+    }
+    return false;
+}
+
+// Check Authorization: Bearer <key> or x-api-key: <key> against `key`.
+bool request_authorized(const std::string& headers, const std::string& key) {
+    std::string auth = header_value(headers, "Authorization");
+    if (auth.rfind("Bearer ", 0) == 0 && constant_time_equal(auth.substr(7), key)) return true;
+    std::string xkey = header_value(headers, "x-api-key");
+    if (!xkey.empty() && constant_time_equal(xkey, key)) return true;
+    return false;
+}
+
+// Replace the value of "api_key" in a JSON blob with "***" so a key stored in
+// moe_config.json is never leaked through GET /v1/config.
+std::string redact_api_key(const std::string& json) {
+    std::string pat = "\"api_key\"";
+    size_t pos = json.find(pat);
+    if (pos == std::string::npos) return json;
+    size_t colon = json.find(':', pos + pat.size());
+    if (colon == std::string::npos) return json;
+    size_t q1 = json.find('"', colon + 1);
+    if (q1 == std::string::npos) return json;
+    size_t q2 = json.find('"', q1 + 1);
+    if (q2 == std::string::npos) return json;
+    std::string out = json;
+    out.replace(q1 + 1, q2 - q1 - 1, "***");
+    return out;
+}
+
 } // namespace
 
 HttpServer::HttpServer(MoETransformerEngine& engine, const std::string& web_root)
@@ -357,8 +748,36 @@ void HttpServer::stop() {
     }
 }
 
-bool HttpServer::start(uint16_t port, std::string& err_msg) {
+bool HttpServer::start(uint16_t port, std::string& err_msg,
+                       const std::string& host, bool allow_insecure_remote) {
     port_ = port;
+    host_ = host;
+    api_key_ = resolve_api_key();
+
+    // Refuse a non-loopback bind with no key unless the operator explicitly
+    // opts out. Listening on all interfaces unauthenticated is how the old
+    // default leaked model-load / config-write to the whole network.
+    if (!is_loopback_host(host_) && api_key_.empty() && !allow_insecure_remote) {
+        err_msg = "Refusing to bind " + host_ + " without an API key: set MOE_API_KEY "
+                  "(or \"api_key\" in moe_config.json), bind 127.0.0.1, or pass "
+                  "--allow-insecure-remote to accept the risk explicitly.";
+        std::cerr << "\n\033[1;31m[SECURITY] " << err_msg << "\033[0m\n\n";
+        return false;
+    }
+    if (!is_loopback_host(host_)) {
+        if (api_key_.empty()) {
+            std::cerr << "\n\033[1;31m[SECURITY WARNING] Binding " << host_
+                      << " with NO API key (--allow-insecure-remote). Any host that can "
+                         "reach this port can load models, download files, and overwrite "
+                         "moe_config.json. This is strongly discouraged.\033[0m\n\n";
+        } else {
+            std::cerr << "\n[SECURITY] Binding " << host_
+                      << " — API-key auth is enabled for mutating endpoints.\n\n";
+        }
+    } else if (api_key_.empty()) {
+        std::cerr << "\n[SECURITY] Listening on loopback only (" << host_
+                  << ") with no API key configured. Set MOE_API_KEY to require auth.\n\n";
+    }
 #ifdef _WIN32
     WSADATA wsa;
     if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
@@ -383,7 +802,11 @@ bool HttpServer::start(uint16_t port, std::string& err_msg) {
 
     sockaddr_in addr{};
     addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = INADDR_ANY;
+    if (inet_pton(AF_INET, host_.c_str(), &addr.sin_addr) != 1) {
+        err_msg = "Invalid bind host: " + host_;
+        stop();
+        return false;
+    }
     addr.sin_port = htons(port);
 
     if (::bind(
@@ -393,7 +816,7 @@ bool HttpServer::start(uint16_t port, std::string& err_msg) {
             static_cast<int>(s),
 #endif
             reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
-        err_msg = "Failed to bind HTTP server to port " + std::to_string(port);
+        err_msg = "Failed to bind HTTP server to " + host_ + ":" + std::to_string(port);
         stop();
         return false;
     }
@@ -500,6 +923,21 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     if (method == "OPTIONS") {
         send_http_json(client_sock, 200, "OK", "{}");
         return;
+    }
+
+    // API-key auth: when a key is configured (MOE_API_KEY env or
+    // moe_config.json "api_key"), every mutating endpoint requires
+    // `Authorization: Bearer <key>` or `x-api-key: <key>`. Read-only GETs
+    // (including GET /health) stay open. No key configured = no auth
+    // (server is loopback-only by default; see start()).
+    if (!api_key_.empty() && route_requires_auth(method, path)) {
+        std::string headers = req.substr(0, header_end);
+        if (!request_authorized(headers, api_key_)) {
+            send_http_json(client_sock, 401, "Unauthorized",
+                           "{\"error\":\"unauthorized\",\"message\":\"Missing or invalid API key. "
+                           "Send Authorization: Bearer <key> or x-api-key: <key>.\"}");
+            return;
+        }
     }
 
     // ------------------------------------------------------------------------
@@ -900,7 +1338,8 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                << "}";
             json_content = js.str();
         }
-        send_http_json(client_sock, 200, "OK", json_content);
+        // Never leak a stored api_key through the read endpoint.
+        send_http_json(client_sock, 200, "OK", redact_api_key(json_content));
         return;
     }
 
@@ -918,6 +1357,12 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         int spec_tokens = static_cast<int>(extract_json_number(body, "speculative_draft_tokens", 3.0));
         double temp = extract_json_number(body, "temperature", 0.7);
         double top_p = extract_json_number(body, "top_p", 0.9);
+        // Preserve the stored API key and bind host: a config update must not
+        // silently wipe the key or the loopback bind. The body may override
+        // api_host; api_key is never accepted from a request body (env or
+        // direct file edit only).
+        std::string keep_key = read_config_string("api_key", "");
+        std::string keep_host = extract_json_string(body, "api_host", read_config_string("api_host", "127.0.0.1"));
 
         std::ofstream ofs("moe_config.json", std::ios::trunc | std::ios::binary);
         if (ofs.is_open()) {
@@ -931,7 +1376,9 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                 << "  \"active_slots\": " << active_slots << ",\n"
                 << "  \"max_context\": " << max_ctx << ",\n"
                 << "  \"api_port\": " << api_port << ",\n"
-                << "  \"speculative_draft_tokens\": " << spec_tokens << ",\n"
+                << "  \"api_host\": \"" << keep_host << "\",\n";
+            if (!keep_key.empty()) ofs << "  \"api_key\": \"" << keep_key << "\",\n";
+            ofs << "  \"speculative_draft_tokens\": " << spec_tokens << ",\n"
                 << "  \"temperature\": " << temp << ",\n"
                 << "  \"top_p\": " << top_p << "\n"
                 << "}\n";
@@ -950,6 +1397,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
            << "    \"active_slots\": " << active_slots << ",\n"
            << "    \"max_context\": " << max_ctx << ",\n"
            << "    \"api_port\": " << api_port << ",\n"
+           << "    \"api_host\": \"" << keep_host << "\",\n"
            << "    \"speculative_draft_tokens\": " << spec_tokens << ",\n"
            << "    \"temperature\": " << temp << ",\n"
            << "    \"top_p\": " << top_p << "\n"
@@ -963,7 +1411,12 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     // 4. POST /v1/chat/completions, /v1/completions, /api/chat, /api/generate
     // ------------------------------------------------------------------------
     if (method == "POST" && (path == "/v1/chat/completions" || path == "/v1/completions" || path == "/api/chat" || path == "/api/generate")) {
-        std::string user_prompt = format_chat_prompt_for_arch(body, engine_);
+        // Tools: parsed before prompt formatting so the template's `tools`
+        // variable renders them. "tool_choice": "none" disables tool use.
+        std::vector<ToolDefinition> tools = parse_chat_tools(body);
+        if (extract_json_string(body, "tool_choice", "") == "none") tools.clear();
+        const std::vector<ToolDefinition>* tools_ptr = tools.empty() ? nullptr : &tools;
+        std::string user_prompt = format_chat_prompt_for_arch(body, engine_, tools_ptr);
         bool stream = extract_json_bool(body, "stream", true);
         uint32_t max_tokens = static_cast<uint32_t>(std::clamp(extract_json_number(body, "max_tokens", 1024.0), 1.0, 4096.0));
         uint32_t slot_id = static_cast<uint32_t>(std::max(0.0, extract_json_number(body, "cache_slot", 0.0)));
@@ -980,6 +1433,99 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         // Seed 0 (default) = fresh entropy per request; an explicit seed is
         // deterministic across requests.
         scfg.seed = static_cast<uint64_t>(extract_json_number(body, "seed", 0.0));
+
+        // --- Tool-calling path: generation is buffered, because the
+        // content-vs-tool_calls decision is atomic — nothing is sent before
+        // the full reply is parsed. The reply is either plain content
+        // (finish_reason "stop") or tool_calls (content null,
+        // finish_reason "tool_calls"), in both streaming and non-streaming
+        // form.
+        if (!tools.empty()) {
+            std::string reasoning_acc;
+            std::string content_acc;
+            ProfileSample final_prof{};
+            engine_.generate_stream(user_prompt, max_tokens, slot_id, compaction, scfg,
+                [&](const std::string& piece, bool is_reasoning, uint32_t, const ProfileSample& prof) {
+                    final_prof = prof;
+                    if (is_reasoning) reasoning_acc += piece;
+                    else content_acc += piece;
+                    return true;
+                },
+                continue_asst,
+                speculative,
+                draft_count
+            );
+            std::vector<ParsedToolCall> calls = parse_tool_calls_from_text(content_acc, tools);
+            const std::string cmpl_id = "chatcmpl-moe-" + std::to_string(now_us());
+            const std::string mname = json_escape(engine_.hparams().model_name);
+
+            if (!stream) {
+                std::ostringstream js;
+                js << "{"
+                   << "\"id\":\"" << cmpl_id << "\","
+                   << "\"object\":\"chat.completion\","
+                   << "\"model\":\"" << mname << "\","
+                   << "\"choices\":[{\"index\":0,\"message\":{";
+                if (!calls.empty()) {
+                    js << tool_calls_message_json(calls);
+                } else {
+                    js << "\"role\":\"assistant\","
+                       << "\"reasoning_content\":\"" << json_escape(reasoning_acc) << "\","
+                       << "\"content\":\"" << json_escape(content_acc) << "\"";
+                }
+                js << "},\"finish_reason\":\"" << (calls.empty() ? "stop" : "tool_calls") << "\"}],"
+                   << "\"usage\":{"
+                   << "\"prompt_tokens\":" << (user_prompt.size() / 4 + 1) << ","
+                   << "\"completion_tokens\":" << (content_acc.size() / 4 + 1) << ","
+                   << "\"total_tokens\":" << ((user_prompt.size() + content_acc.size()) / 4 + 2)
+                   << "},"
+                   << "\"moe_telemetry\":{"
+                   << "\"tok_per_sec\":" << final_prof.tok_per_sec << ","
+                   << "\"wall_ms\":" << final_prof.wall_ms << ","
+                   << "\"io_wait_ms\":" << final_prof.io_wait_ms
+                   << "}"
+                   << "}";
+                send_http_json(client_sock, 200, "OK", js.str());
+                return;
+            }
+
+            std::ostringstream sse_hdr;
+            sse_hdr << "HTTP/1.1 200 OK\r\n"
+                    << "Content-Type: text/event-stream; charset=utf-8\r\n"
+                    << "Cache-Control: no-cache\r\n"
+                    << "Connection: keep-alive\r\n"
+                    << "Access-Control-Allow-Origin: *\r\n\r\n";
+            std::string hstr = sse_hdr.str();
+            if (!send_all(client_sock, hstr.data(), hstr.size())) return;
+            std::ostringstream ev;
+            ev << "data: {"
+               << "\"id\":\"" << cmpl_id << "\","
+               << "\"object\":\"chat.completion.chunk\","
+               << "\"model\":\"" << mname << "\","
+               << "\"choices\":[{\"index\":0,\"delta\":{";
+            if (!calls.empty()) {
+                ev << tool_calls_message_json(calls);
+            } else {
+                ev << "\"role\":\"assistant\",\"content\":\"" << json_escape(content_acc) << "\"";
+            }
+            ev << "},\"finish_reason\":\"" << (calls.empty() ? "stop" : "tool_calls") << "\"}]"
+               << "}\n\n";
+            std::string chunk = ev.str();
+            send_all(client_sock, chunk.data(), chunk.size());
+            std::ostringstream fin;
+            fin << "data: {"
+                << "\"id\":\"" << cmpl_id << "\","
+                << "\"object\":\"chat.completion.chunk\","
+                << "\"model\":\"" << mname << "\","
+                << "\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\""
+                << (calls.empty() ? "stop" : "tool_calls") << "\"}]"
+                << "}\n\n";
+            std::string fstr = fin.str();
+            send_all(client_sock, fstr.data(), fstr.size());
+            const char* done_msg = "data: [DONE]\n\n";
+            send_all(client_sock, done_msg, std::strlen(done_msg));
+            return;
+        }
 
         if (!stream) {
             std::string reasoning_acc;

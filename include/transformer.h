@@ -89,6 +89,10 @@ struct LayerDenseWeights {
 
     // Sparse experts on NVMe disk (per expert slice offsets) or zero-copy mapped FFN
     bool is_dense_ffn = false;
+    // 2-matrix GELU MLP (Phi-3: fc1/fc2, no gate projection). The FFN is
+    // down(GELU(up(x))) — the SwiGLU path cannot run it (no gate matrix),
+    // so the forward pass takes a separate branch for these layers.
+    bool ffn_gelu_only = false;
     GGMLType expert_gate_type = GGMLType::Q4_0;
     GGMLType expert_up_type   = GGMLType::Q4_0;
     GGMLType expert_down_type = GGMLType::Q4_0;
@@ -154,21 +158,42 @@ struct ChatMessage {
     std::string content;
 };
 
+// One OpenAI-style function tool definition, as passed to a chat template's
+// `tools` variable (Qwen2.5/3, Mistral, Llama3 templates render it with
+// `{{ tool | tojson }}` / `{{ tool.function.name }}`).
+// `parameters_json` is the raw JSON object string from the request
+// ("{}" when absent); `function_json` is the whole {"name","description",
+// "parameters"} object; `raw_json` is the whole tool object as received.
+struct ToolDefinition {
+    std::string name;
+    std::string description;
+    std::string parameters_json = "{}";
+    std::string function_json;
+    std::string raw_json;
+};
+
 // Render chat messages to a prompt string. Source of truth, in order:
 //  1. `chat_template` from GGUF metadata (tokenizer.chat_template), rendered
-//     with a minimal Jinja subset (for/endfor, if/elif/else, {{ expr }} with
-//     string literals + message['role'/'content'] + bos/eos_token).
+//     with a minimal Jinja subset (for/endfor, if/elif/else, {% set %} with
+//     scalar/list/namespace variables, {{ expr }} with string literals +
+//     message['role'/'content'] + bos/eos_token + method chains).
 //  2. Per-architecture fallback template (ChatML / Llama3 / Mistral / Gemma / Phi).
 // If source_out is non-null it receives "gguf-chat-template" or
 // "fallback:<name>". BOS is NOT emitted by these templates; the caller adds
 // it via encode(..., should_add_bos(...)).
+// `tools` (optional) is the request's tool list: when non-null it is bound
+// to the template's `tools` variable ({% if tools %}, {% for tool in tools %},
+// {{ tool | tojson }}, {{ tool.function.name }}). When null the templates
+// see no tools at all. Fallback templates (no chat_template in the GGUF)
+// render the tools as a Qwen-style <tools> system block instead.
 std::string format_chat_messages(
     const std::vector<ChatMessage>& msgs,
     const std::string& arch,
     const std::string& chat_template,
     const Tokenizer& tok,
     bool add_generation_prompt = true,
-    std::string* source_out = nullptr
+    std::string* source_out = nullptr,
+    const std::vector<ToolDefinition>* tools = nullptr
 );
 
 // Wrap a raw (non-templated) user prompt as a single-user chat turn. Prompts

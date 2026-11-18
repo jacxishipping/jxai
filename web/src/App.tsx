@@ -25,6 +25,7 @@ import {
   ChatSessionMeta
 } from './types';
 import { translations } from './utils/i18n';
+import { apiFetch } from './utils/api';
 
 const DEFAULT_SAMPLER: SamplerSettings = {
   temperature: 0.7,
@@ -93,7 +94,7 @@ export const App: React.FC = () => {
 
   const fetchHealth = async () => {
     try {
-      const res = await fetch('/health');
+      const res = await apiFetch('/health');
       if (res.ok) {
         const data = await res.json();
         setHealth(data);
@@ -148,7 +149,7 @@ export const App: React.FC = () => {
 
   useEffect(() => {
     fetchHealth();
-    fetch('/v1/config')
+    apiFetch('/v1/config')
       .then(r => (r.ok ? r.json() : null))
       .then(cfg => {
         if (cfg) {

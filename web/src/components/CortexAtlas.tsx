@@ -2,6 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import { Activity, RefreshCw, RotateCw, ZoomIn, ZoomOut, Zap } from 'lucide-react';
 import { ExpertTelemetry } from '../types';
 import { Translations } from '../utils/i18n';
+import { apiFetch } from '../utils/api';
 
 interface CortexAtlasProps {
   t: Translations;
@@ -22,7 +23,7 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
   const fetchExperts = async () => {
     setIsLoading(true);
     try {
-      const res = await fetch('/experts');
+      const res = await apiFetch('/experts');
       if (res.ok) {
         const data = await res.json();
         setExperts(data.experts || []);

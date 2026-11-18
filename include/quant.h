@@ -87,20 +87,28 @@ struct block_q8_1 {
     int8_t   qs[32];  // 32 x 8-bit signed ints
 };
 
-// Q2_K: 256 weights per super-block (84 bytes) — ggml block_q2_K
+// Q2_K: 256 weights per super-block (84 bytes) — ggml block_q2_K.
+// FIELD ORDER MATTERS: ggml lays this out as scales, qs, then d/dmin
+// LAST (ggml/src/ggml-common.h). The engine previously had d/dmin first,
+// which made every Q2_K matmul read garbage from real GGUF files — the
+// self-consistent round-trip tests could not catch it because test data
+// was built through the same wrong struct. Verified 2026-11-17: Qwen3
+// Q2_K went from 32x "!" to coherent text after this reorder.
 struct block_q2_K {
-    uint16_t d;           // super-block scale (FP16)
-    uint16_t dmin;        // super-block min scale (FP16)
     uint8_t  scales[16];  // 16 x (4-bit scale | 4-bit min << 4)
     uint8_t  qs[64];      // 256 x 2-bit values, strided (see dequantize)
+    uint16_t d;           // super-block scale (FP16)
+    uint16_t dmin;        // super-block min scale (FP16)
 };
 
-// Q3_K: 256 weights per super-block (110 bytes) — ggml block_q3_K
+// Q3_K: 256 weights per super-block (110 bytes) — ggml block_q3_K.
+// FIELD ORDER MATTERS: ggml lays this out as hmask, qs, scales, then d
+// LAST (ggml/src/ggml-common.h). Same wrong-order bug as Q2_K (see above).
 struct block_q3_K {
-    uint16_t d;           // super-block scale (FP16)
-    uint8_t  qs[64];      // 256 x 2-bit low parts, strided
     uint8_t  hmask[32];   // high-bit mask: bit (elem/32) of byte (elem%32)
+    uint8_t  qs[64];      // 256 x 2-bit low parts, strided
     uint8_t  scales[12];  // 16 x 6-bit scales, packed (see dequantize)
+    uint16_t d;           // super-block scale (FP16)
 };
 
 // Q8_K: 256 weights per super-block (292 bytes) — ggml block_q8_K.
@@ -141,6 +149,56 @@ struct block_iq3_s {
     uint8_t  signs[4];    // sign bits
 };
 
+// IQ2_XXS: 256 weights per super-block (66 bytes) — ggml block_iq2_xxs.
+// qs holds 8 x 32-element groups; each group is 2 x uint32: the first
+// holds 4 grid-index bytes (one per 8 elements) into kIq2xxsGrid, the
+// second holds 4 x 7-bit sign codes (via kSignsIq2xs) plus a 4-bit
+// per-group scale in its top nibble.
+struct block_iq2_xxs {
+    uint16_t d;           // FP16 super-block scale
+    uint16_t qs[32];      // 256 x 2-bit grid indices + signs + scales
+};
+
+// IQ2_XS: 256 weights per super-block (74 bytes) — ggml block_iq2_xs.
+// Each uint16 in qs holds a 9-bit grid index into kIq2xsGrid (low 9
+// bits) and a 7-bit sign code (top 7 bits, via kSignsIq2xs). scales
+// holds two 4-bit per-group scales per 32-element group.
+struct block_iq2_xs {
+    uint16_t d;           // FP16 super-block scale
+    uint16_t qs[32];      // 256 x 2-bit grid indices + sign codes
+    uint8_t  scales[8];   // 2 x 4-bit scales per 32-element group
+};
+
+// IQ3_XXS: 256 weights per super-block (98 bytes) — ggml block_iq3_xxs.
+// qs[0..63] holds grid indices (2 per 8 elements) into kIq3xxsGrid;
+// qs[64..95] holds the sign codes (4 x 7-bit, via kSignsIq2xs) plus a
+// 4-bit per-group scale in the top nibble, 4 bytes per 32-element group.
+struct block_iq3_xxs {
+    uint16_t d;           // FP16 super-block scale
+    uint8_t  qs[96];      // grid indices + signs + scales (see above)
+};
+
+// IQ1_S: 256 weights per super-block (50 bytes) — ggml block_iq1_s.
+// qs holds the low 8 bits of each grid index into kIq1sGrid; qh holds
+// the high 3 bits per 8-element subgroup (bits 3*l..3*l+2), the 3-bit
+// scale in bits 12-14, and the delta sign in bit 15.
+struct block_iq1_s {
+    uint16_t d;           // FP16 super-block scale
+    uint8_t  qs[32];      // low 8 bits of grid indices
+    uint16_t qh[8];       // high grid bits + scale + delta sign
+};
+
+// IQ1_M: 256 weights per super-block (56 bytes) — ggml block_iq1_m.
+// qs holds the low 8 bits of each grid index; qh holds the high 3 bits
+// (bits 0-2 and 4-6) and one delta-sign bit per 8-element subgroup
+// (bits 3 and 7); scales packs the FP16 block scale across the top
+// nibbles of its 4 uint16 words plus two 3-bit scales per word.
+struct block_iq1_m {
+    uint8_t  qs[32];      // low 8 bits of grid indices
+    uint8_t  qh[16];      // high grid bits + delta signs
+    uint8_t  scales[8];   // packed FP16 scale + 3-bit group scales
+};
+
 #pragma pack(pop)
 
 static_assert(sizeof(block_q4_0) == 18, "block_q4_0 must be 18 bytes");
@@ -159,6 +217,11 @@ static_assert(sizeof(block_q2_K) == 84, "block_q2_K must be 84 bytes");
 static_assert(sizeof(block_q3_K) == 110, "block_q3_K must be 110 bytes");
 static_assert(sizeof(block_q8_K) == 292, "block_q8_K must be 292 bytes");
 static_assert(sizeof(block_iq4_xs) == 136, "block_iq4_xs must be 136 bytes");
+static_assert(sizeof(block_iq2_xxs) == 66, "block_iq2_xxs must be 66 bytes");
+static_assert(sizeof(block_iq2_xs) == 74, "block_iq2_xs must be 74 bytes");
+static_assert(sizeof(block_iq3_xxs) == 98, "block_iq3_xxs must be 98 bytes");
+static_assert(sizeof(block_iq1_s) == 50, "block_iq1_s must be 50 bytes");
+static_assert(sizeof(block_iq1_m) == 56, "block_iq1_m must be 56 bytes");
 
 // Non-linear 4-bit lookup table (standard llama.cpp / ggml IQ4_NL table)
 extern const int8_t kvalues_iq4nl[16];
@@ -188,6 +251,17 @@ void quantize_row_q8_1(const float* x, void* vy, int64_t k);
 void quantize_row_q2_K(const float* x, void* vy, int64_t k);
 void quantize_row_q3_K(const float* x, void* vy, int64_t k);
 void quantize_row_q8_K(const float* x, void* vy, int64_t k);
+// Simplified IQ encoders (see src/quant.cpp): the block layout and the
+// dequantization path are exact ggml; the encoder searches the literal
+// dequant grid directly for the nearest entry instead of ggml's
+// imatrix-weighted neighbour search (ggml's IQ2_XXS/IQ2_XS/IQ1_S
+// quantizers REQUIRE an importance matrix, which this API does not
+// carry, so an exact port of the encoder is not possible here).
+void quantize_row_iq2_xxs(const float* x, void* vy, int64_t k);
+void quantize_row_iq2_xs(const float* x, void* vy, int64_t k);
+void quantize_row_iq3_xxs(const float* x, void* vy, int64_t k);
+void quantize_row_iq1_s(const float* x, void* vy, int64_t k);
+void quantize_row_iq1_m(const float* x, void* vy, int64_t k);
 void quantize_row_f16(const float* x, void* vy, int64_t k);
 void quantize_row_bf16(const float* x, void* vy, int64_t k);
 void quantize_row_fp8_e4m3(const float* x, void* vy, int64_t k);
@@ -210,6 +284,12 @@ void dequantize_row_q2_K(const void* vx, float* y, int64_t k);
 void dequantize_row_q3_K(const void* vx, float* y, int64_t k);
 void dequantize_row_q8_K(const void* vx, float* y, int64_t k);
 void dequantize_row_iq4_xs(const void* vx, float* y, int64_t k);
+// Exact ggml dequantizers (scalar, literal grid tables — see src/quant.cpp)
+void dequantize_row_iq2_xxs(const void* vx, float* y, int64_t k);
+void dequantize_row_iq2_xs(const void* vx, float* y, int64_t k);
+void dequantize_row_iq3_xxs(const void* vx, float* y, int64_t k);
+void dequantize_row_iq1_s(const void* vx, float* y, int64_t k);
+void dequantize_row_iq1_m(const void* vx, float* y, int64_t k);
 void dequantize_row_f16(const void* vx, float* y, int64_t k);
 void dequantize_row_bf16(const void* vx, float* y, int64_t k);
 void dequantize_row_fp8_e4m3(const void* vx, float* y, int64_t k);
@@ -233,6 +313,11 @@ float vec_dot_q2_K_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_q3_K_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_q8_K_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_iq4_xs_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_iq2_xxs_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_iq2_xs_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_iq3_xxs_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_iq1_s_f32(const void* vx, const float* y, int64_t k);
+float vec_dot_iq1_m_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_f16_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_bf16_f32(const void* vx, const float* y, int64_t k);
 float vec_dot_fp8_f32(const void* vx, const float* y, int64_t k);

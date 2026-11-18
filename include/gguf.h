@@ -1,6 +1,7 @@
 #pragma once
 
 #include "common.h"
+#include <deque>
 #include <unordered_map>
 #include <variant>
 
@@ -108,9 +109,10 @@ public:
     // Recorded only — tokenizer.json parsing belongs to the tokenizer layer.
     const std::string& tokenizer_path() const { return tokenizer_path_; }
     // True when the file contains MoE routed-expert tensors
-    // (".experts." / "block_sparse_moe.experts."). Those are NOT translated:
-    // the engine expects packed 3D expert tensors (ffn_gate_exps.weight),
-    // which cannot be faked from per-expert SafeTensors files.
+    // (".experts." / "block_sparse_moe.experts.") that could NOT be packed
+    // into the packed 3D expert tensors the engine expects (see
+    // pack_safetensors_experts()). When packing succeeds the flag is
+    // cleared and blk.<l>.ffn_{gate,up,down}_exps.weight descriptors exist.
     bool safetensors_moe_unsupported() const { return st_moe_unsupported_; }
     // HF tensor names seen in the file that had no translation (e.g. fused
     // "qkv_proj" weights, MoE experts). The original names are still stored
@@ -118,10 +120,49 @@ public:
     const std::vector<std::string>& safetensors_untranslated() const { return st_untranslated_; }
     // SafeTensors dtypes with no GGMLType mapping (left as F32, see gguf.cpp).
     const std::vector<std::string>& safetensors_unknown_dtypes() const { return st_unknown_dtypes_; }
+    // True when this file is one shard of a multi-file SafeTensors model
+    // (model-0000N-of-0000M.safetensors): all shards were loaded, so
+    // tensors() spans the whole model.
+    bool is_sharded_safetensors() const { return st_shard_count_ > 1; }
+    uint32_t safetensors_shard_count() const { return st_shard_count_; }
+    // End of the KV section in a GGUF file (== start of the tensor infos).
+    // Only meaningful for GGUF files; used by merge_gguf_files().
+    uint64_t kv_section_end() const { return kv_end_offset_; }
+    // Split a fused SafeTensors attention tensor (Phi3 qkv_proj, aliased as
+    // blk.<layer>.attn_qkv.weight) into separate blk.<layer>.attn_q/k/v
+    // (.bias) descriptors. q_dim = n_heads * head_dim, kv_dim =
+    // n_kv_heads * head_dim. The new descriptors are views into the fused
+    // tensor's mmap (no data is copied). Returns true when the split
+    // tensors already exist or were just created; false with err_msg when
+    // no fused tensor exists for the layer or its dims do not match
+    // q_dim + 2*kv_dim. Safe to call when no fused tensor exists (then it
+    // returns false and the caller keeps its previous behaviour).
+    bool split_fused_qkv(uint32_t layer, uint32_t q_dim, uint32_t kv_dim,
+                         std::string& err_msg);
 
 private:
     bool parse_gguf(std::string& err_msg);
-    bool parse_safetensors(std::string& err_msg);
+    bool parse_safetensors_shard(const uint8_t* base, uint64_t size,
+                                 uint64_t& data_offset_out, std::string& err_msg);
+    // Open every shard of a multi-file SafeTensors model (paths in shard
+    // order). Used when open() is given a directory or one shard of a
+    // model-0000N-of-0000M.safetensors group.
+    bool open_safetensors_group(const std::vector<std::string>& shard_paths,
+                                std::string& err_msg);
+    // Post-pass after all SafeTensors shards + config.json are loaded:
+    // pack per-expert tensors into contiguous packed 3D
+    // blk.<l>.ffn_{gate,up,down}_exps.weight descriptors (experts stacked
+    // along dim 0, one expert per contiguous byte slice — exactly the
+    // layout bind_tensors() expects). Two source layouts are handled:
+    // per-expert 2D tensors (mlp.experts.<i>.gate/up/down_proj.weight,
+    // block_sparse_moe.experts.<i>.w1/w2/w3 — production checkpoints) and
+    // already-packed 3D tensors (mlp.experts.gate_up_proj [E,2I,H] +
+    // down_proj [E,H,I], transformers 5.x). The packed bytes are copied
+    // once into packed_buffers_ (owned by this ModelFile); the per-expert
+    // source tensors stay listed under their original names. Layers whose
+    // experts are incomplete or inconsistent are skipped with a warning
+    // and keep st_moe_unsupported_ set.
+    bool pack_safetensors_experts();
     // Best-effort: load sibling config.json / tokenizer.json. Never fails
     // open(); returns false when no usable config was found.
     bool load_safetensors_config();
@@ -155,7 +196,59 @@ private:
     bool st_moe_unsupported_ = false;
     std::vector<std::string> st_untranslated_;
     std::vector<std::string> st_unknown_dtypes_;
+    // Multi-file SafeTensors: mappings for shards beyond the first (the
+    // first shard lives in mapped_base_/fd_/file_size_ above). Each shard's
+    // tensors keep mapped_ptr/abs_file_offset into their own mapping.
+    struct ShardMapping {
+#ifdef _WIN32
+        HANDLE file_handle = INVALID_HANDLE_VALUE;
+        HANDLE map_handle = nullptr;
+#else
+        int fd = -1;
+#endif
+        const uint8_t* base = nullptr;
+        uint64_t size = 0;
+    };
+    std::vector<ShardMapping> extra_shards_;
+    uint32_t st_shard_count_ = 0;
+    // Owned packed MoE expert buffers (see pack_safetensors_experts()).
+    // deque: element addresses never move, so TensorDescriptor::mapped_ptr
+    // values pointing into them stay valid while the ModelFile is open.
+    std::deque<std::vector<uint8_t>> packed_buffers_;
+    uint64_t kv_end_offset_ = 0;
 };
+
+// Merge sharded GGUF files (model-00001-of-00002.gguf, ...) into one valid
+// GGUF file: the KV/metadata section is copied verbatim from the first
+// shard, all tensors are combined in shard order with fresh aligned
+// offsets. Returns false with err_msg on any problem (missing/unreadable
+// shard, version/architecture mismatch, duplicate tensor name, I/O error).
+// The output is re-opened and verified (tensor count + spot-checked bytes)
+// before returning true.
+bool merge_gguf_files(const std::vector<std::string>& shard_paths,
+                      const std::string& out_path, std::string& err_msg);
+
+// Re-quantize a GGUF file to `target_type` using the engine's own quantizers
+// (quant.cpp): every 2-D+ weight tensor whose row length is a multiple of
+// both the source and target block sizes is dequantized to F32 and
+// re-quantized row by row; everything else is copied byte-for-byte and
+// reported (1-D norm/bias tensors, tensors already in the target type,
+// tensors whose source type has no dequantizer, tensors whose row length
+// is not a multiple of the target block size). Nothing is ever written in
+// the wrong type: a tensor that cannot be re-quantized exactly keeps its
+// original type. Mixed-type targets (Q4_K_M etc.) are out of scope —
+// those are per-tensor policies, not a single target type.
+// The output is re-opened and verified (tensor count + types + byte sizes)
+// before returning true. Input must be GGUF; SafeTensors input is refused
+// (use the engine's direct SafeTensors loading instead).
+bool quantize_gguf_file(const std::string& in_path, GGMLType target_type,
+                        const std::string& out_path, std::string& err_msg);
+
+// Parse a quant type name ("Q4_0", "Q8_0", "Q4_K", "Q5_K", "Q6_K",
+// "Q4_1", "Q5_0", "Q5_1", "Q8_1", "Q2_K", "Q3_K", "Q8_K") into a GGMLType.
+// Returns false for anything else — including the IQ types, which have no
+// quantizer in quant.cpp, and F32 (not a quantization).
+bool parse_quant_type_name(const std::string& name, GGMLType& out);
 
 } // namespace moe
 

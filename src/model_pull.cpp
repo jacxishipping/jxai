@@ -596,27 +596,92 @@ bool validate_model_file(const fs::path& path, const std::string& filename, std:
     return true;
 }
 
-// Best-effort fetch of a small sibling file (config.json / tokenizer.json)
-// next to a downloaded .safetensors file. Never fails the pull.
-void fetch_safetensors_sibling(const std::string& base_url, const std::string& sibling,
-                               const fs::path& dest_dir) {
+// Validate a downloaded sibling file (config.json / tokenizer.json).
+// Catches the common failure modes: empty files, HTML error pages, and
+// the 39-byte proxy-CONNECT stub a misconfigured proxy returns instead of
+// the real file. Returns false with a reason in `reason` when invalid.
+bool validate_sibling_file(const fs::path& dest, const std::string& sibling,
+                           std::string& reason) {
+    std::error_code ec;
+    uint64_t size = fs::file_size(dest, ec);
+    if (ec || size <= 100) {
+        reason = "file is missing or suspiciously small (" + std::to_string(size) + " bytes)";
+        return false;
+    }
+    std::ifstream in(dest, std::ios::binary);
+    if (!in) {
+        reason = "cannot open downloaded file for validation";
+        return false;
+    }
+    std::string content((std::istreambuf_iterator<char>(in)), std::istreambuf_iterator<char>());
+    size_t first = content.find_first_not_of(" \t\r\n");
+    size_t last = content.find_last_not_of(" \t\r\n");
+    if (first == std::string::npos || content[first] != '{' || content[last] != '}') {
+        reason = "content is not a JSON object (proxy stub / HTML error page?)";
+        return false;
+    }
+    if (sibling == "config.json") {
+        // A real HF config.json names the architecture. A stub never does.
+        if (content.find("\"architectures\"") == std::string::npos &&
+            content.find("\"model_type\"") == std::string::npos) {
+            reason = "config.json contains neither \"architectures\" nor \"model_type\"";
+            return false;
+        }
+    }
+    return true;
+}
+
+// Fetch a small sibling file (config.json / tokenizer.json) next to a
+// downloaded .safetensors file. A sibling that is genuinely absent (404,
+// unreachable repo) stays best-effort: the pull continues with a NOTE and
+// the engine falls back to architecture defaults. But a download that
+// *returns bytes* which fail validation (proxy-CONNECT stub, empty file,
+// HTML error page) is retried once and then fails LOUDLY — returning false
+// so the pull aborts instead of silently leaving a corrupt file behind.
+// Returns true on success or on genuinely-absent (best-effort) siblings.
+bool fetch_safetensors_sibling(const std::string& base_url, const std::string& sibling,
+                               const fs::path& dest_dir, std::string& err_msg) {
     fs::path dest = dest_dir / sibling;
     std::error_code ec;
-    if (fs::exists(dest, ec) && !ec) return; // never clobber an existing file
+    if (fs::exists(dest, ec) && !ec) return true; // never clobber an existing file
     std::string url = base_url + "/" + sibling;
     std::string err;
 #ifdef _WIN32
     (void)url; (void)err;
     std::cout << "[PULL] NOTE: sibling '" << sibling << "' not auto-fetched on Windows — download it manually from the repo.\n";
+    return true;
 #else
-    if (curl_download(url, dest, 0, false, nullptr, err)) {
-        std::cout << "[PULL] Fetched sibling file: " << dest.string() << "\n";
-    } else {
-        std::cout << "[PULL] NOTE: sibling '" << sibling << "' not available (" << err << ") — "
-                  << "the engine will load the SafeTensors file without a config.json "
-                  << "(architecture defaults apply).\n";
-        fs::remove(dest, ec); // drop any partial file curl left behind
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        if (!curl_download(url, dest, 0, false, nullptr, err)) {
+            if (attempt == 0) {
+                // First attempt failed to fetch anything: sibling may simply
+                // not exist in the repo. Best-effort — do not fail the pull.
+                std::cout << "[PULL] NOTE: sibling '" << sibling << "' not available (" << err << ") — "
+                          << "the engine will load the SafeTensors file without a config.json "
+                          << "(architecture defaults apply).\n";
+                fs::remove(dest, ec); // drop any partial file curl left behind
+                return true;
+            }
+            err_msg = "Sibling '" + sibling + "' failed validation on first download and the retry download failed (" + err + ")";
+            std::cerr << "[PULL] ERROR: " << err_msg << "\n";
+            fs::remove(dest, ec);
+            return false;
+        }
+        std::string reason;
+        if (validate_sibling_file(dest, sibling, reason)) {
+            std::cout << "[PULL] Fetched sibling file: " << dest.string() << "\n";
+            return true;
+        }
+        // Bytes came back but they are not a real sibling file (proxy stub,
+        // empty file, HTML error page). Delete and retry once.
+        std::cerr << "[PULL] WARNING: downloaded sibling '" << sibling << "' failed validation ("
+                  << reason << ") — retrying once.\n";
+        fs::remove(dest, ec);
     }
+    err_msg = "Sibling '" + sibling + "' downloaded but failed validation twice (proxy stub / empty file / HTML error page?) — refusing to continue with a corrupt sibling. Check your proxy and retry the pull.";
+    std::cerr << "[PULL] ERROR: " << err_msg << "\n";
+    fs::remove(dest, ec);
+    return false;
 #endif
 }
 
@@ -913,13 +978,16 @@ bool pull_model_from_hub(
         }
         if (!validate_model_file(dest_path, it.filename, err_msg)) return false;
         // SafeTensors needs its siblings to be usable: fetch config.json and
-        // tokenizer.json from the same base URL (best-effort, never fatal).
+        // tokenizer.json from the same base URL. Absent siblings are
+        // best-effort; corrupt ones fail the pull (see fetch_safetensors_sibling).
         if (ends_with_ci(it.filename, ".safetensors") &&
             (it.url.starts_with("https://huggingface.co/") || it.url.starts_with("http://"))) {
             size_t slash = it.url.find_last_of('/');
             std::string base_url = (slash == std::string::npos) ? it.url : it.url.substr(0, slash);
-            fetch_safetensors_sibling(base_url, "config.json", target_dir);
-            fetch_safetensors_sibling(base_url, "tokenizer.json", target_dir);
+            // A corrupt sibling (proxy stub / empty file) fails the pull
+            // loudly; a genuinely absent sibling is best-effort (see above).
+            if (!fetch_safetensors_sibling(base_url, "config.json", target_dir, err_msg)) return false;
+            if (!fetch_safetensors_sibling(base_url, "tokenizer.json", target_dir, err_msg)) return false;
         }
     }
 #endif
@@ -936,10 +1004,12 @@ bool pull_model_from_hub(
               << (total_downloaded / (1024.0 * 1024.0)) << " MB\n\n";
     if (is_sharded_pick) {
         std::cout << "\033[1;33m[WARNING] SHARDED MODEL — " << shard_total << " parts downloaded.\033[0m\n"
-                  << "  The engine CANNOT load a single shard as a model. Merge the parts first,\n"
-                  << "  e.g. with llama.cpp:\n"
-                  << "    gguf-split --merge " << out_file << " " << (target_dir / "merged.gguf").string() << "\n"
-                  << "  (`moe_engine convert` is not implemented yet — see `moe_engine convert`.)\n\n";
+                  << "  The engine CANNOT load a single shard as a model. Merge the parts first:\n"
+                  << "    ./build/moe_engine convert --merge " << out_file;
+        for (size_t i = 1; i < items.size(); ++i) {
+            std::cout << " " << (target_dir / items[i].filename).string();
+        }
+        std::cout << " -o " << (target_dir / "merged.gguf").string() << "\n\n";
     } else {
         std::cout << "To launch this model immediately with the Engine & Studio:\n"
                   << "  \033[1;33m./build/moe_engine serve --model " << out_file << "\033[0m\n\n";

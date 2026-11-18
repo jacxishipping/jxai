@@ -13,6 +13,9 @@
 #include <fstream>
 #include <numeric>
 #include <map>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace fs = std::filesystem;
 using namespace moe;
@@ -32,12 +35,18 @@ void print_usage() {
               << "  moe_engine doctor [--quick]                      [run hardware, NVMe speed, and SIMD diagnostics]\n"
               << "  moe_engine test                                  [run 10-point rigorous verification suite]\n"
               << "  moe_engine chat   --model <file> [--prompt \"...\"] [--max-tokens 64] [--speculative]\n"
+              << "  moe_engine bench  --model <file> [--prompt \"...\"] [--tokens 32]\n"
+              << "                                                [prefill/decode timing: prefill ms + tok/s, decode tok/s, per-forward matmul/attn/lm_head split]\n"
               << "  moe_engine info <model>                        [compatibility report: arch, RoPE, tokenizer, chat template, quant types]\n"
-              << "  moe_engine serve  --model <file> [--port 8000] [--web-dir web/dist]\n"
+              << "  moe_engine serve  --model <file> [--port 8000] [--host 127.0.0.1] [--allow-insecure-remote] [--web-dir web/dist]\n"
               << "  moe_engine studio [--model <file>] [--port 8000] [launch native C++ Windows desktop app]\n"
               << "  moe_engine pull   <repo|url> [--out <dir>]       [stream & verify models from Hugging Face hub]\n"
               << "  moe_engine pull --list <repo>                  [list available .gguf files (no download)]\n"
-              << "  moe_engine convert                             [not implemented: merge/convert guidance]\n"
+              << "  moe_engine convert --merge <shard1.gguf> [shard2.gguf ...] -o <merged.gguf>\n"
+              << "                                                [merge sharded GGUF files into one loadable file]\n"
+              << "  moe_engine convert --quantize <in.gguf> --to <Q4_0|Q8_0|Q4_K|Q5_K|Q6_K> -o <out.gguf>\n"
+              << "                                                [re-quantize a GGUF with the engine's own quantizers]\n"
+              << "  moe_engine systemone --eval --model <model.gguf> [run built-in 30-item sentiment smoke eval]\n"
               << "  moe_engine forge  --out <file.gguf> [--format gguf|safetensors]\n";
 }
 
@@ -52,7 +61,9 @@ bool run_hardware_doctor() {
     std::cout << "   Logical Cores:   " << hw.logical_cores << "\n";
     std::cout << "   SIMD Backend:    " << hw.simd_backend << "\n";
     std::cout << "   AVX2 Support:    " << (hw.has_avx2 ? "\033[1;32mYES (Optimal FP32/INT8 FMA)\033[0m" : "\033[1;31mNO\033[0m") << "\n";
-    std::cout << "   AVX-512 Support: " << (hw.has_avx512 ? "\033[1;32mYES (VNNI / 512-bit registers)\033[0m" : "\033[0;37mNot detected / Fallback to AVX2\033[0m") << "\n";
+    // AVX-512 is CPUID-detected; the only AVX-512 code paths are the
+    // Q4_0/Q4_K/Q8_0 dot kernels in quant.cpp. The general backend is AVX2.
+    std::cout << "   AVX-512 Support: " << (hw.has_avx512 ? "\033[1;37mDetected via CPUID (AVX-512 dot kernels: Q4_0/Q4_K/Q8_0; general backend AVX2/FMA)\033[0m" : "\033[0;37mNot detected / Fallback to AVX2\033[0m") << "\n";
 
     // 2. Memory Tier Analysis
     double total_ram_gb = static_cast<double>(hw.total_ram_bytes) / (1024.0 * 1024.0 * 1024.0);
@@ -60,8 +71,8 @@ bool run_hardware_doctor() {
     std::cout << "\n\033[1;37m2. Host Memory Hierarchy:\033[0m\n";
     std::cout << "   Total RAM:       " << std::fixed << std::setprecision(1) << total_ram_gb << " GB\n";
     std::cout << "   Available RAM:   " << avail_ram_gb << " GB\n";
-    std::cout << "   Dense Capacity:  Up to 14 GB INT4 dense backbones resident\n";
-    std::cout << "   MoE Supported:   \033[1;32m30B to 700B+ Parameters\033[0m via PILOT NVMe Streaming\n";
+    std::cout << "   Dense Capacity:  Limited by available RAM (see above)\n";
+    std::cout << "   MoE Streaming:   Large-scale MoE streaming (30B-700B+) is untested in this repo\n";
 
     // 3. NVMe Real-World Benchmarking (Sequential & 4K Random IOPS)
     std::cout << "\n\033[1;37m3. NVMe Asynchronous Direct I/O Benchmark:\033[0m\n";
@@ -106,8 +117,14 @@ bool run_hardware_doctor() {
     std::cout << "   Seq Read Speed:  \033[1;32m" << std::fixed << std::setprecision(1) << seq_mb_s << " MB/s\033[0m\n";
     std::cout << "   Random 4K IOPS:  \033[1;32m" << std::fixed << std::setprecision(0) << iops << " IOPS\033[0m (Avg Latency: "
               << std::fixed << std::setprecision(1) << avg_latency_us << " µs)\n";
+#ifdef _WIN32
     std::cout << "   Windows BypassIO:\033[1;32m QUALIFIED (DirectStorage DMA Fast-Path Active)\033[0m\n";
-    std::cout << "   Storage Status:  \033[1;32mPASSED (Ready for Layer L+1 Asynchronous Prefetch)\033[0m\n";
+#else
+    // Never claim Windows BypassIO/DirectStorage on Linux. Linux I/O here
+    // is plain pread(); io_uring is not used.
+    std::cout << "   Windows BypassIO: N/A (Linux build — plain pread() reads)\n";
+#endif
+    std::cout << "   Storage Status:  \033[1;32mPASSED (benchmark completed — see speeds above)\033[0m\n";
 
     // 4. GPU & Vulkan 1.3 Subgroup Diagnostic
     std::cout << "\n\033[1;37m4. GPU & Vulkan Compute Acceleration:\033[0m\n";
@@ -119,16 +136,28 @@ bool run_hardware_doctor() {
         std::cout << "   Compute Device:  " << dinfo.device_name << "\n";
         std::cout << "   Coop Matrix:     " << (dinfo.has_cooperative_matrix ? "Supported (VK_KHR_cooperative_matrix)" : "Disabled") << "\n";
         std::cout << "   Subgroup Size:   " << dinfo.subgroup_size << " threads\n";
+        std::cout << "   Compute Dispatch: NOT implemented — GEMV falls back to CPU\n";
     } else {
         std::cout << "   Vulkan Status:   " << vk_err << "\n";
         std::cout << "   Compute Mode:    \033[1;32mHigh-Performance Vectorized AVX2+FMA CPU Core\033[0m\n";
     }
 
-    std::cout << "\n\033[1;32m===================================================================\033[0m\n";
-    std::cout << "\033[1;32m  [DOCTOR VERDICT] SYSTEM FULLY QUALIFIED FOR MoE HYBRID STREAMING  \033[0m\n";
-    std::cout << "\033[1;32m===================================================================\033[0m\n\n";
+    // Verdict reflects only what was actually detected on THIS machine:
+    // AVX2 is required for the vectorised kernels; the storage benchmark
+    // above ran to completion. Vulkan compute, large-scale MoE streaming
+    // and DirectStorage are not claimed here.
+    bool qualified = hw.has_avx2;
+    if (qualified) {
+        std::cout << "\n\033[1;32m===================================================================\033[0m\n";
+        std::cout << "\033[1;32m  [DOCTOR VERDICT] QUALIFIED FOR LOCAL CPU INFERENCE (AVX2 path)      \033[0m\n";
+        std::cout << "\033[1;32m===================================================================\033[0m\n\n";
+    } else {
+        std::cout << "\n\033[1;31m===================================================================\033[0m\n";
+        std::cout << "\033[1;31m  [DOCTOR VERDICT] NOT FULLY QUALIFIED — AVX2 not detected            \033[0m\n";
+        std::cout << "\033[1;31m===================================================================\033[0m\n\n";
+    }
 
-    return true;
+    return qualified;
 }
 
 bool run_verification_tests() {
@@ -195,17 +224,20 @@ bool run_verification_tests() {
     dequantize_row_q6_K(q6k_buf.data(), deq256.data(), K256);
     assert(std::fabs(q6k_dot - vec_dot_f32(deq256.data(), y256.data(), K256)) < 1e-3f);
 
-    // 1b. New quant types (Q4_1/Q5_0/Q5_1/Q8_1/Q2_K/Q3_K/Q8_K): quantize ->
-    // dequantize -> dot must agree with the FP32 reference, using the same
-    // tolerances as the Q4_K/Q5_K/Q6_K checks above (3.0 for the coarse
-    // 2/3/4/5-bit types, 1.0 for the 8-bit types). These are explicit
-    // runtime checks (not assert()) so they also run in Release builds,
-    // where NDEBUG disables assert.
+    // 1b. New quant types (Q4_1/Q5_0/Q5_1/Q8_1/Q2_K/Q3_K/Q8_K/IQ2_XXS/
+    // IQ2_XS/IQ3_XXS/IQ1_S/IQ1_M): quantize -> dequantize -> dot must
+    // agree with the FP32 reference, using the same tolerances as the
+    // Q4_K/Q5_K/Q6_K checks above (3.0 for the coarse 2/3/4/5-bit types,
+    // 1.0 for the 8-bit types; 8.0 for the ~1.5-bit IQ1 types, whose
+    // grid only offers magnitudes {0.125, 0.875, 1.125} per element).
+    // These are explicit runtime checks (not assert()) so they also run
+    // in Release builds, where NDEBUG disables assert.
     {
         auto check_roundtrip = [&](const char* name, GGMLType type,
                                    void (*qf)(const float*, void*, int64_t),
-                                   float tol) -> bool {
-            std::vector<uint8_t> qb(tensor_byte_size(type, static_cast<uint64_t>(K256)));
+                                   float tol, size_t block_bytes = 0) -> bool {
+            std::vector<uint8_t> qb(block_bytes ? block_bytes
+                                                : tensor_byte_size(type, static_cast<uint64_t>(K256)));
             qf(x256.data(), qb.data(), K256);
             const float dot = vec_dot_quant_f32(type, qb.data(), y256.data(), K256);
             std::vector<float> deq(K256);
@@ -238,6 +270,16 @@ bool run_verification_tests() {
         if (!check_roundtrip("Q2_K", GGMLType::Q2_K, quantize_row_q2_K, 3.0f)) return false;
         if (!check_roundtrip("Q3_K", GGMLType::Q3_K, quantize_row_q3_K, 3.0f)) return false;
         if (!check_roundtrip("Q8_K", GGMLType::Q8_K, quantize_row_q8_K, 1.0f)) return false;
+        if (!check_roundtrip("IQ2_XXS", GGMLType::IQ2_XXS, quantize_row_iq2_xxs, 3.0f)) return false;
+        if (!check_roundtrip("IQ2_XS", GGMLType::IQ2_XS, quantize_row_iq2_xs, 3.0f)) return false;
+        if (!check_roundtrip("IQ3_XXS", GGMLType::IQ3_XXS, quantize_row_iq3_xxs, 3.0f)) return false;
+        // IQ1_S: block_bytes is passed explicitly because
+        // ggml_type_size(IQ1_S) in include/common.h returns 48 while the
+        // real ggml block is 50 bytes (2 + 32 + 16); tensor_byte_size
+        // would under-allocate by 2 bytes. Pre-existing common.h bug,
+        // flagged — do not "fix" it by changing this call.
+        if (!check_roundtrip("IQ1_S", GGMLType::IQ1_S, quantize_row_iq1_s, 8.0f, sizeof(block_iq1_s))) return false;
+        if (!check_roundtrip("IQ1_M", GGMLType::IQ1_M, quantize_row_iq1_m, 8.0f)) return false;
     }
 
     // 1c. IQ4_XS dequantizer (no quantizer exists in this repo — ggml's
@@ -265,6 +307,133 @@ bool run_verification_tests() {
         if (!(std::fabs(dot - dot_deq) < 1e-3f)) {
             std::cerr << "\n[FAIL] IQ4_XS vec_dot/dequant mismatch\n";
             return false;
+        }
+    }
+
+    // 1d. K-quant remainder rows (k=896 and k=100): quantize -> dot ->
+    // dequantize must agree with the FP32 reference. Before the
+    // remainder fix every function below silently dropped the final
+    // partial 256-block (k=896 lost 128 weights, k=100 lost all 100),
+    // so these checks fail on the old code and pass on the fixed code.
+    // Same tolerances as 1b. Also covers matmul_quant_f32 (the real
+    // inference path: row stride is ceil(k/256) blocks) and the
+    // Q8-activation dots at k=896.
+    {
+        const int K896 = 896, K100 = 100;
+        std::vector<float> x896(K896), y896(K896), x100(K100), y100(K100);
+        for (int i = 0; i < K896; ++i) {
+            x896[i] = std::sin(static_cast<float>(i) * 0.15f);
+            y896[i] = std::cos(static_cast<float>(i) * 0.25f);
+        }
+        for (int i = 0; i < K100; ++i) {
+            x100[i] = std::sin(static_cast<float>(i) * 0.15f);
+            y100[i] = std::cos(static_cast<float>(i) * 0.25f);
+        }
+        const float ref896 = vec_dot_f32(x896.data(), y896.data(), K896);
+        const float ref100 = vec_dot_f32(x100.data(), y100.data(), K100);
+        auto check_rem = [&](const char* name, GGMLType type,
+                             void (*qf)(const float*, void*, int64_t),
+                             float tol) -> bool {
+            for (int trial = 0; trial < 2; ++trial) {
+                const int K = (trial == 0) ? K896 : K100;
+                const std::vector<float>& xv = (trial == 0) ? x896 : x100;
+                const std::vector<float>& yv = (trial == 0) ? y896 : y100;
+                const float ref = (trial == 0) ? ref896 : ref100;
+                std::vector<uint8_t> qb(tensor_byte_size(type, static_cast<uint64_t>(K)));
+                qf(xv.data(), qb.data(), K);
+                const float dot = vec_dot_quant_f32(type, qb.data(), yv.data(), K);
+                std::vector<float> deq(static_cast<size_t>(K));
+                dequantize_row(type, qb.data(), deq.data(), K);
+                const float dot_deq = vec_dot_f32(deq.data(), yv.data(), K);
+                std::cout << " [" << name << " k=" << K << ": dot-err "
+                          << std::fabs(ref - dot) << "]";
+                if (!(std::fabs(ref - dot) < tol)) {
+                    std::cerr << "\n[FAIL] " << name << " k=" << K << " dot error "
+                              << std::fabs(ref - dot) << " exceeds tolerance " << tol << "\n";
+                    return false;
+                }
+                if (!(std::fabs(dot - dot_deq) < 1e-3f)) {
+                    std::cerr << "\n[FAIL] " << name << " k=" << K << " vec_dot/dequant mismatch "
+                              << std::fabs(dot - dot_deq) << "\n";
+                    return false;
+                }
+            }
+            return true;
+        };
+        if (!check_rem("Q2_K", GGMLType::Q2_K, quantize_row_q2_K, 3.0f)) return false;
+        if (!check_rem("Q3_K", GGMLType::Q3_K, quantize_row_q3_K, 3.0f)) return false;
+        if (!check_rem("Q4_K", GGMLType::Q4_K, quantize_row_q4_K, 3.0f)) return false;
+        if (!check_rem("Q5_K", GGMLType::Q5_K, quantize_row_q5_K, 3.0f)) return false;
+        if (!check_rem("Q6_K", GGMLType::Q6_K, quantize_row_q6_K, 1.0f)) return false;
+        if (!check_rem("Q8_K", GGMLType::Q8_K, quantize_row_q8_K, 1.0f)) return false;
+
+        // matmul_quant_f32 at k=896 (4 rows) vs the FP32 reference.
+        // The Q8-activation fast paths are gated on cols % 256 == 0,
+        // so this exercises the vec_dot_quant_f32 fallback with the
+        // tail. Tolerances are 2x the 1b dot tolerances (dot errors
+        // grow ~sqrt(k)).
+        auto check_matmul = [&](const char* name, GGMLType type,
+                                void (*qf)(const float*, void*, int64_t),
+                                float tol) -> bool {
+            const int rows = 4;
+            const size_t row_bytes = tensor_byte_size(type, static_cast<uint64_t>(K896));
+            std::vector<float> W(static_cast<size_t>(rows) * K896);
+            for (int i = 0; i < rows * K896; ++i) W[i] = std::sin(static_cast<float>(i) * 0.13f);
+            std::vector<uint8_t> Wq(row_bytes * static_cast<size_t>(rows));
+            std::vector<float> ref_out(rows, 0.0f), out(rows, 0.0f);
+            for (int r = 0; r < rows; ++r) {
+                qf(W.data() + r * K896, Wq.data() + r * row_bytes, K896);
+                ref_out[r] = vec_dot_f32(W.data() + r * K896, y896.data(), K896);
+            }
+            matmul_quant_f32(type, Wq.data(), y896.data(), out.data(), rows, K896);
+            float max_err = 0.0f;
+            for (int r = 0; r < rows; ++r) max_err = std::max(max_err, std::fabs(ref_out[r] - out[r]));
+            std::cout << " [" << name << " matmul896: max-err " << max_err << "]";
+            if (!(max_err < tol)) {
+                std::cerr << "\n[FAIL] " << name << " matmul k=896 max error "
+                          << max_err << " exceeds tolerance " << tol << "\n";
+                return false;
+            }
+            return true;
+        };
+        if (!check_matmul("Q2_K", GGMLType::Q2_K, quantize_row_q2_K, 6.0f)) return false;
+        if (!check_matmul("Q3_K", GGMLType::Q3_K, quantize_row_q3_K, 6.0f)) return false;
+        if (!check_matmul("Q4_K", GGMLType::Q4_K, quantize_row_q4_K, 6.0f)) return false;
+        if (!check_matmul("Q5_K", GGMLType::Q5_K, quantize_row_q5_K, 6.0f)) return false;
+        if (!check_matmul("Q6_K", GGMLType::Q6_K, quantize_row_q6_K, 2.0f)) return false;
+        if (!check_matmul("Q8_K", GGMLType::Q8_K, quantize_row_q8_K, 2.0f)) return false;
+
+        // Q8-activation dots at k=896. The activation buffer needs
+        // ceil(896/256)*8 = 32 Q8_0 blocks (the matmul path only calls
+        // these with cols % 256 == 0, but the functions must handle a
+        // remainder when called directly).
+        {
+            std::vector<uint8_t> y896_q8(32 * sizeof(block_q8_0), 0);
+            quantize_row_q8_0(y896.data(), y896_q8.data(), K896);
+            auto check_q8 = [&](const char* name,
+                                float (*q8f)(const void*, const block_q8_0*, int64_t),
+                                float (*qf32)(const void*, const float*, int64_t),
+                                const uint8_t* qb) -> bool {
+                const float d32 = qf32(qb, y896.data(), K896);
+                const float dq8 = q8f(qb, reinterpret_cast<const block_q8_0*>(y896_q8.data()), K896);
+                std::cout << " [" << name << "_q8 k=896: |dot-q8| "
+                          << std::fabs(d32 - dq8) << "]";
+                if (!(std::fabs(d32 - dq8) < 0.5f)) {
+                    std::cerr << "\n[FAIL] " << name << "_q8 k=896 mismatch "
+                              << std::fabs(d32 - dq8) << " exceeds 0.5\n";
+                    return false;
+                }
+                return true;
+            };
+            std::vector<uint8_t> q4k896(tensor_byte_size(GGMLType::Q4_K, K896));
+            quantize_row_q4_K(x896.data(), q4k896.data(), K896);
+            if (!check_q8("Q4_K", vec_dot_q4_K_q8_0, vec_dot_q4_K_f32, q4k896.data())) return false;
+            std::vector<uint8_t> q5k896(tensor_byte_size(GGMLType::Q5_K, K896));
+            quantize_row_q5_K(x896.data(), q5k896.data(), K896);
+            if (!check_q8("Q5_K", vec_dot_q5_K_q8_0, vec_dot_q5_K_f32, q5k896.data())) return false;
+            std::vector<uint8_t> q6k896(tensor_byte_size(GGMLType::Q6_K, K896));
+            quantize_row_q6_K(x896.data(), q6k896.data(), K896);
+            if (!check_q8("Q6_K", vec_dot_q6_K_q8_0, vec_dot_q6_K_f32, q6k896.data())) return false;
         }
     }
     std::cout << " \033[1;32mPASSED\033[0m (Ref: " << ref_dot << ", Q8: " << q8_dot << ", Q4: " << q4_dot << ", Q6_K: " << q6k_dot << ")\n";
@@ -441,6 +610,7 @@ bool run_setup_wizard() {
             << "  \"direct_dma\": true,\n"
             << "  \"paged_attention_blocks\": 2048,\n"
             << "  \"active_slots\": 4,\n"
+            << "  \"api_host\": \"127.0.0.1\",\n"
             << "  \"api_port\": 8000\n"
             << "}\n";
         std::cout << "   Config status:          \033[1;32mGENERATED (moe_config.json)\033[0m\n";
@@ -451,6 +621,113 @@ bool run_setup_wizard() {
     std::cout << "\033[1;32m  Run 'run_studio.bat' or 'moe_studio.exe' to launch the suite.    \033[0m\n";
     std::cout << "\033[1;32m===================================================================\033[0m\n\n";
 
+    return true;
+}
+
+// ---------------------------------------------------------------------------
+// SystemOne real evaluation (workstream G, 2026-11-17)
+// The `test` suite's SystemOne check only asserts the scoring path runs —
+// on the forged toy model it returns exactly uniform probabilities
+// (1/3 each), which says nothing about the model. This is a small BUILT-IN
+// labeled smoke eval, not a benchmark: 30 short sentences, 10 per sentiment
+// class, scored with evaluate_system_one (zero-token: the model's logits
+// for each class label, no generation). Accuracy is reported against the
+// uniform 1/3 baseline so a result at ~33% means "no signal".
+// ---------------------------------------------------------------------------
+struct SystemOneEvalItem {
+    const char* text;
+    const char* expected; // "Positive" | "Negative" | "Neutral"
+};
+
+static const SystemOneEvalItem kSystemOneEvalSet[] = {
+    {"I absolutely love this new phone, it works perfectly.", "Positive"},
+    {"The concert last night was amazing, I had the best time.", "Positive"},
+    {"This restaurant serves delicious food and the staff are wonderful.", "Positive"},
+    {"I am so happy with my exam results, I passed with top marks.", "Positive"},
+    {"The movie was fantastic, I laughed the whole way through.", "Positive"},
+    {"What a beautiful sunny day, I feel great.", "Positive"},
+    {"My new job is wonderful and my colleagues are so kind.", "Positive"},
+    {"The hotel room was clean, comfortable and the view was stunning.", "Positive"},
+    {"I really enjoyed the book, I could not put it down.", "Positive"},
+    {"The service was excellent and the food arrived quickly.", "Positive"},
+    {"I hate this phone, the battery dies within an hour.", "Negative"},
+    {"The concert was terrible, the sound was awful and we left early.", "Negative"},
+    {"This restaurant is disgusting, the food was cold and the staff rude.", "Negative"},
+    {"I am so disappointed with my exam results, I failed badly.", "Negative"},
+    {"The movie was boring, I fell asleep halfway through.", "Negative"},
+    {"What a miserable rainy day, everything went wrong.", "Negative"},
+    {"My new job is horrible and my boss treats me badly.", "Negative"},
+    {"The hotel room was dirty, noisy and the bed was broken.", "Negative"},
+    {"I did not enjoy the book at all, it was dull and confusing.", "Negative"},
+    {"The service was rude and the food took forever to arrive.", "Negative"},
+    {"The train leaves the station at 9:15 in the morning.", "Neutral"},
+    {"The meeting is scheduled for Tuesday at 2pm in room 4.", "Neutral"},
+    {"The book has 320 pages and was published in 2019.", "Neutral"},
+    {"The store opens at 8am and closes at 6pm on weekdays.", "Neutral"},
+    {"The package weighs 2 kilograms and measures 30 centimeters.", "Neutral"},
+    {"The bus stops at the corner of Main Street and Fifth Avenue.", "Neutral"},
+    {"The report contains three sections and two appendices.", "Neutral"},
+    {"The water temperature is 22 degrees Celsius today.", "Neutral"},
+    {"The office has 45 employees working across two floors.", "Neutral"},
+    {"The flight takes approximately three hours and fifteen minutes.", "Neutral"},
+};
+
+bool run_systemone_eval(const std::string& model_path) {
+    MoETransformerEngine eng;
+    std::string err;
+    if (!eng.load_model(model_path, err)) {
+        std::cerr << "Failed to load model: " << err << "\n";
+        return false;
+    }
+    const std::vector<std::string> options = {"Positive", "Negative", "Neutral"};
+    const char* kClassNames[3] = {"Positive", "Negative", "Neutral"};
+    const size_t kN = sizeof(kSystemOneEvalSet) / sizeof(kSystemOneEvalSet[0]);
+    int per_class_ok[3] = {0, 0, 0};
+    int per_class_total[3] = {0, 0, 0};
+    int total_ok = 0;
+    double total_ms = 0.0;
+    std::vector<std::string> misses;
+
+    for (size_t i = 0; i < kN; ++i) {
+        const auto& item = kSystemOneEvalSet[i];
+        int ci = (std::string(item.expected) == "Positive") ? 0
+               : (std::string(item.expected) == "Negative") ? 1 : 2;
+        per_class_total[ci]++;
+        ProfileSample prof{};
+        auto scores = eng.evaluate_system_one(
+            item.text, "What is the sentiment of the following text?", options, &prof);
+        total_ms += prof.wall_ms;
+        std::string pred = scores.empty() ? "<none>" : scores[0].option;
+        if (pred == item.expected) {
+            per_class_ok[ci]++;
+            total_ok++;
+        } else if (misses.size() < 5) {
+            std::ostringstream m;
+            m << "  \"" << item.text << "\" — expected " << item.expected
+              << ", got " << pred;
+            misses.push_back(m.str());
+        }
+    }
+
+    std::cout << "=== SystemOne eval (built-in sentiment smoke set, " << kN << " items) ===\n"
+              << "model: " << model_path << " (" << eng.hparams().model_name << ")\n";
+    for (int c = 0; c < 3; ++c) {
+        double acc = per_class_total[c]
+            ? (100.0 * per_class_ok[c] / per_class_total[c]) : 0.0;
+        std::cout << "  " << kClassNames[c] << ": " << per_class_ok[c] << "/"
+                  << per_class_total[c] << "  (" << std::fixed << std::setprecision(1)
+                  << acc << "%)\n";
+    }
+    std::cout << "overall: " << total_ok << "/" << kN << "  ("
+              << std::fixed << std::setprecision(1)
+              << (100.0 * total_ok / static_cast<double>(kN))
+              << "% vs 33.3% uniform baseline)\n"
+              << "avg eval time: " << std::fixed << std::setprecision(1)
+              << (total_ms / static_cast<double>(kN)) << " ms/item\n";
+    if (!misses.empty()) {
+        std::cout << "sample misses:\n";
+        for (const auto& m : misses) std::cout << m << "\n";
+    }
     return true;
 }
 
@@ -557,7 +834,9 @@ int main(int argc, char* argv[]) {
             any_warn = true;
         }
         static const char* kDequant[] = {"F32", "F16", "BF16", "FP8_E4M3", "Q4_0", "Q8_0",
-                                         "IQ4_NL", "Q4_K", "Q5_K", "Q6_K", "IQ2_S", "IQ3_S"};
+                                         "IQ4_NL", "Q4_K", "Q5_K", "Q6_K", "IQ2_S", "IQ3_S",
+                                         "Q4_1", "Q5_0", "Q5_1", "Q8_1", "Q2_K", "Q3_K", "Q8_K",
+                                         "IQ4_XS", "IQ2_XXS", "IQ2_XS", "IQ3_XXS", "IQ1_S", "IQ1_M"};
         for (const auto& kv : qcounts) {
             bool supported = false;
             for (const char* s : kDequant) if (kv.first == s) { supported = true; break; }
@@ -650,6 +929,9 @@ int main(int argc, char* argv[]) {
     std::string prompt = "Explain the MoE streaming and PILOT prefetch architecture.";
     bool has_cli_prompt = false;
     uint16_t port = 8000;
+    std::string host = "127.0.0.1";
+    bool host_from_cli = false;
+    bool allow_insecure_remote = false;
     std::string web_dir = "web/dist";
     uint32_t max_tokens = 64;
     bool enable_speculative = false;
@@ -660,8 +942,11 @@ int main(int argc, char* argv[]) {
         if (arg == "--model" && i + 1 < argc) model_path = argv[++i];
         else if (arg == "--prompt" && i + 1 < argc) { prompt = argv[++i]; has_cli_prompt = true; }
         else if (arg == "--port" && i + 1 < argc) port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        else if (arg == "--host" && i + 1 < argc) { host = argv[++i]; host_from_cli = true; }
+        else if (arg == "--allow-insecure-remote") allow_insecure_remote = true;
         else if (arg == "--web-dir" && i + 1 < argc) web_dir = argv[++i];
         else if (arg == "--max-tokens" && i + 1 < argc) max_tokens = static_cast<uint32_t>(std::stoul(argv[++i]));
+        else if (arg == "--tokens" && i + 1 < argc) max_tokens = static_cast<uint32_t>(std::stoul(argv[++i]));
         else if (arg == "--temperature" && i + 1 < argc) cli_temp = std::stof(argv[++i]);
         else if (arg == "--speculative") enable_speculative = true;
     }
@@ -773,19 +1058,131 @@ int main(int argc, char* argv[]) {
     }
 
     if (mode == "convert") {
-        // NOTE only: merging sharded GGUFs and converting SafeTensors ->
-        // GGUF need repacking logic the engine does not have yet. Point at
-        // the standard external tools instead of pretending to convert.
-        std::cout << "moe_engine convert is not implemented yet.\n\n"
-                  << "Sharded GGUF (model-00001-of-00002.gguf, ...): merge the parts\n"
-                  << "first with llama.cpp:\n"
-                  << "  gguf-split --merge <first-part.gguf> <merged.gguf>\n"
-                  << "then load the merged file with `moe_engine serve --model <merged.gguf>`.\n\n"
+        if (argc >= 3 && std::string(argv[2]) == "--quantize") {
+            // moe_engine convert --quantize <in.gguf> --to <type> -o <out.gguf>
+            std::string in_path, out_path, type_name;
+            for (int i = 3; i < argc; ++i) {
+                std::string a = argv[i];
+                if (a == "--to" && i + 1 < argc) {
+                    type_name = argv[++i];
+                } else if ((a == "-o" || a == "--out") && i + 1 < argc) {
+                    out_path = argv[++i];
+                } else if (!a.empty() && a[0] == '-') {
+                    std::cerr << "Unknown option for convert --quantize: " << a << "\n";
+                    return 1;
+                } else if (in_path.empty()) {
+                    in_path = a;
+                } else {
+                    std::cerr << "Unexpected argument for convert --quantize: " << a << "\n";
+                    return 1;
+                }
+            }
+            if (in_path.empty() || type_name.empty() || out_path.empty()) {
+                std::cerr << "Usage: moe_engine convert --quantize <in.gguf> --to <type> -o <out.gguf>\n"
+                          << "  type: Q4_0 Q8_0 Q4_K Q5_K Q6_K Q4_1 Q5_0 Q5_1 Q8_1 Q2_K Q3_K Q8_K\n"
+                          << "  (1-D norm/bias tensors and tensors whose rows are not a multiple\n"
+                          << "  of the target block size are kept in their original type and\n"
+                          << "  reported; mixed-type targets such as Q4_K_M are out of scope.)\n";
+                return 1;
+            }
+            GGMLType target = GGMLType::F32;
+            if (!parse_quant_type_name(type_name, target)) {
+                std::cerr << "\033[1;31m[ERROR] Unsupported quantize target '" << type_name << "'.\n"
+                          << "Supported: Q4_0 Q8_0 Q4_K Q5_K Q6_K Q4_1 Q5_0 Q5_1 Q8_1 Q2_K Q3_K Q8_K.\n"
+                          << "IQ types have no quantizer in quant.cpp and F32 is not a quantization.\033[0m\n";
+                return 1;
+            }
+            std::string err;
+            if (!quantize_gguf_file(in_path, target, out_path, err)) {
+                std::cerr << "\033[1;31m[ERROR] Quantize failed: " << err << "\033[0m\n";
+                return 1;
+            }
+            std::cout << "Verify the output with:\n"
+                      << "  ./build/moe_engine info " << out_path << "\n"
+                      << "  ./build/moe_engine chat --model " << out_path
+                      << " --prompt \"What is 2 + 2?\" --max-tokens 32\n";
+            return 0;
+        }
+        if (argc >= 3 && std::string(argv[2]) == "--merge") {
+            // moe_engine convert --merge <shard1.gguf> [shard2.gguf ...] -o <merged.gguf>
+            std::vector<std::string> shards;
+            std::string out_path;
+            for (int i = 3; i < argc; ++i) {
+                std::string a = argv[i];
+                if ((a == "-o" || a == "--out") && i + 1 < argc) {
+                    out_path = argv[++i];
+                } else if (!a.empty() && a[0] == '-') {
+                    std::cerr << "Unknown option for convert --merge: " << a << "\n";
+                    return 1;
+                } else {
+                    shards.push_back(a);
+                }
+            }
+            if (shards.empty() || out_path.empty()) {
+                std::cerr << "Usage: moe_engine convert --merge <shard1.gguf> [shard2.gguf ...] -o <merged.gguf>\n";
+                return 1;
+            }
+            std::string err;
+            if (!merge_gguf_files(shards, out_path, err)) {
+                std::cerr << "\033[1;31m[ERROR] Merge failed: " << err << "\033[0m\n";
+                return 1;
+            }
+            std::cout << "Load the merged file with:\n"
+                      << "  ./build/moe_engine serve --model " << out_path << "\n";
+            return 0;
+        }
+        // No subcommand: usage + guidance for conversions the engine does
+        // not do itself (SafeTensors -> GGUF still needs llama.cpp).
+        std::cout << "moe_engine convert --merge <shard1.gguf> [shard2.gguf ...] -o <merged.gguf>\n"
+                  << "  Merge sharded GGUF files (model-00001-of-00002.gguf, ...) into one\n"
+                  << "  loadable GGUF file. Metadata/tokenizer come from the first shard;\n"
+                  << "  all tensors are combined in shard order and the result is verified.\n\n"
+                  << "moe_engine convert --quantize <in.gguf> --to <type> -o <out.gguf>\n"
+                  << "  Re-quantize a GGUF with the engine's own quantizers.\n"
+                  << "  type: Q4_0 Q8_0 Q4_K Q5_K Q6_K Q4_1 Q5_0 Q5_1 Q8_1 Q2_K Q3_K Q8_K.\n"
+                  << "  1-D tensors and tensors whose rows are not a multiple of the\n"
+                  << "  target block size are kept in their original type and reported.\n\n"
                   << "SafeTensors -> GGUF: convert with llama.cpp:\n"
                   << "  python convert_hf_to_gguf.py <hf-model-dir> --outfile <model.gguf>\n"
-                  << "Single-file SafeTensors models can also be loaded directly by the\n"
-                  << "engine when a sibling config.json is present (see ModelFile).\n";
+                  << "Single-file and multi-file SafeTensors models can also be loaded\n"
+                  << "directly by the engine when a sibling config.json is present\n"
+                  << "(see ModelFile); sharded GGUF is the only case that needs merging.\n";
         return 1;
+    }
+
+    if (mode == "systemone") {
+        // moe_engine systemone --eval --model <path>
+        // Runs the built-in 30-item sentiment smoke eval through the
+        // zero-token SystemOne scorer and reports per-class + overall
+        // accuracy vs the uniform 1/3 baseline. (No --eval yet: only the
+        // eval exists as a CLI mode; the HTTP endpoint is unchanged.)
+        bool do_eval = false;
+        std::string model_path;
+        for (int i = 2; i < argc; ++i) {
+            std::string a = argv[i];
+            if (a == "--eval") do_eval = true;
+            else if ((a == "--model") && i + 1 < argc) model_path = argv[++i];
+            else {
+                std::cerr << "Unknown option for systemone: " << a << "\n";
+                return 1;
+            }
+        }
+        if (!do_eval) {
+            std::cerr << "Usage: moe_engine systemone --eval --model <model.gguf>\n";
+            return 1;
+        }
+        if (model_path.empty()) {
+            // Default to the repo's usual 0.5B test model when present.
+            for (const char* cand : {"models/real/qwen2.5-0.5b-instruct-q4_0.gguf",
+                                     "models/qwen2.5-0.5b-instruct-q4_0.gguf"}) {
+                if (fs::exists(cand)) { model_path = cand; break; }
+            }
+            if (model_path.empty()) {
+                std::cerr << "No model given: pass --model <model.gguf>\n";
+                return 1;
+            }
+        }
+        return run_systemone_eval(model_path) ? 0 : 1;
     }
 
     if (mode == "studio") {
@@ -913,20 +1310,158 @@ int main(int argc, char* argv[]) {
                       << " tok/s, " << (elapsed * 1000.0) << " ms)\033[0m\n";
         }
     } else if (mode == "serve") {
-        std::cout << "\033[1;32m[GATEWAY STARTING]\033[0m Port: " << port << ", Web Root: " << web_dir << "\n";
-        std::cout << "  -> Web UI:               http://localhost:" << port << "/\n"
-                  << "  -> OpenAI Chat Endpoint: http://localhost:" << port << "/v1/chat/completions\n"
-                  << "  -> Health Endpoint:      http://localhost:" << port << "/health\n"
-                  << "  -> Telemetry Profile:    http://localhost:" << port << "/profile\n"
-                  << "  -> Cortex Atlas Hitmap:  http://localhost:" << port << "/experts\n"
-                  << "  -> SystemOne Classifier: http://localhost:" << port << "/v1/systemone\n"
-                  << "  -> Neural Latent Image:  http://localhost:" << port << "/v1/images/generations\n\n";
+        // Bind host: --host wins; otherwise moe_config.json "api_host" if
+        // present; otherwise the loopback default. A non-loopback bind with
+        // no API key is refused by HttpServer::start unless
+        // --allow-insecure-remote is passed.
+        if (!host_from_cli) {
+            std::ifstream cfg_ifs("moe_config.json");
+            if (cfg_ifs.is_open()) {
+                std::string cfg((std::istreambuf_iterator<char>(cfg_ifs)), std::istreambuf_iterator<char>());
+                std::string pat = "\"api_host\"";
+                size_t p = cfg.find(pat);
+                if (p != std::string::npos) {
+                    size_t c = cfg.find(':', p + pat.size());
+                    size_t q1 = (c == std::string::npos) ? std::string::npos : cfg.find('"', c + 1);
+                    size_t q2 = (q1 == std::string::npos) ? std::string::npos : cfg.find('"', q1 + 1);
+                    if (q2 != std::string::npos && q2 > q1 + 1) host = cfg.substr(q1 + 1, q2 - q1 - 1);
+                }
+            }
+        }
+        std::cout << "\033[1;32m[GATEWAY STARTING]\033[0m Host: " << host << ", Port: " << port << ", Web Root: " << web_dir << "\n";
+        std::cout << "  -> Web UI:               http://" << host << ":" << port << "/\n"
+                  << "  -> OpenAI Chat Endpoint: http://" << host << ":" << port << "/v1/chat/completions\n"
+                  << "  -> Health Endpoint:      http://" << host << ":" << port << "/health\n"
+                  << "  -> Telemetry Profile:    http://" << host << ":" << port << "/profile\n"
+                  << "  -> Cortex Atlas Hitmap:  http://" << host << ":" << port << "/experts\n"
+                  << "  -> SystemOne Classifier: http://" << host << ":" << port << "/v1/systemone\n"
+                  << "  -> Neural Latent Image:  http://" << host << ":" << port << "/v1/images/generations\n\n";
 
         HttpServer server(engine, web_dir);
-        if (!server.start(port, err_msg)) {
+        if (!server.start(port, err_msg, host, allow_insecure_remote)) {
             std::cerr << "Server error: " << err_msg << "\n";
             return 1;
         }
+    } else if (mode == "bench") {
+        // Greedy + deterministic: the same sampler `chat --temperature 0`
+        // uses (temp 0, top_k 40, top_p 0.9, rep penalty 1.1, seed 42), so
+        // the generated text must match chat output for the same prompt.
+        const SamplerConfig bench_cfg{0.0f, 40, 0.9f, 1.1f, 42};
+        std::string generated;
+        auto discard = [&](const std::string& piece, bool, uint32_t, const ProfileSample&) {
+            generated += piece;
+            return true;
+        };
+        // /proc/self/stat fields (1-based, comm has no spaces here):
+        // 10 minflt, 12 majflt. /proc/self/status: ctxt switches.
+        auto read_self_stat = [](long& minflt, long& majflt) {
+            minflt = majflt = -1;
+            std::ifstream st("/proc/self/stat");
+            if (!st.is_open()) return;
+            std::string s; std::getline(st, s);
+            std::istringstream iss(s);
+            std::string tok; long v; int field = 0;
+            while (iss >> tok) {
+                ++field;
+                if (field == 10) minflt = std::stol(tok);
+                if (field == 12) majflt = std::stol(tok);
+            }
+            (void)v;
+        };
+        auto read_ctxt = [](long& vol, long& invol) {
+            vol = invol = -1;
+            std::ifstream st("/proc/self/status");
+            if (!st.is_open()) return;
+            std::string line;
+            while (std::getline(st, line)) {
+                if (line.rfind("voluntary_ctxt_switches:", 0) == 0) vol = std::stol(line.substr(24));
+                if (line.rfind("nonvoluntary_ctxt_switches:", 0) == 0) invol = std::stol(line.substr(27));
+            }
+        };
+        long mj0, mn0, v0, iv0;
+        read_self_stat(mn0, mj0);
+        read_ctxt(v0, iv0);
+
+        // Warmup run: first touch of the mmap'd weights page-faults the
+        // model in and spins up the OpenMP pool. Without this, the first
+        // timed prefill is dominated by cold page faults, not compute.
+        engine.reset_slot(0);
+        engine.generate_stream(prompt, 0, 0, false, bench_cfg, discard);
+        generated.clear();
+
+        // Run 1: prefill only. max_new_tokens = 0 runs the prompt
+        // forwards and never enters the decode loop.
+        engine.reset_slot(0);
+        double t_pre0 = now_ms();
+        engine.generate_stream(prompt, 0, 0, false, bench_cfg, discard);
+        double prefill_ms = now_ms() - t_pre0;
+        uint32_t n_prompt = 0;
+        for (const auto& s : engine.list_slots()) if (s.slot_id == 0) n_prompt = static_cast<uint32_t>(s.token_count);
+
+        // Run 2: full generation on a fresh slot. The per-forward profile
+        // samples give the exact prefill/decode split; wall-clock decode
+        // is total minus the warm prefill time above.
+        engine.reset_slot(0);
+        double t_tot0 = now_ms();
+        engine.generate_stream(prompt, max_tokens, 0, false, bench_cfg, discard);
+        double total_ms = now_ms() - t_tot0;
+        uint32_t n_total_tokens = 0;
+        for (const auto& s : engine.list_slots()) if (s.slot_id == 0) n_total_tokens = static_cast<uint32_t>(s.token_count);
+        // token_history holds the prompt plus every generated token except
+        // the last one sampled (it is never forwarded), hence +1.
+        uint32_t n_gen = (n_total_tokens > n_prompt) ? (n_total_tokens - n_prompt + 1) : 0;
+
+        std::vector<ProfileSample> profs = engine.recent_profiles();
+        // Run 2 produced n_prompt prefill + (n_gen - 1) decode forwards.
+        // The profile deque keeps the most recent 120 samples, so take
+        // the tail that belongs to run 2.
+        size_t run2_samples = static_cast<size_t>(n_prompt) + (n_gen > 0 ? static_cast<size_t>(n_gen - 1) : 0);
+        bool prof_truncated = profs.size() < run2_samples;
+        size_t take = std::min(run2_samples, profs.size());
+        size_t skip = profs.size() - take;
+        double pre_mm = 0, pre_attn = 0, pre_head = 0, pre_wall = 0;
+        double dec_mm = 0, dec_attn = 0, dec_head = 0, dec_wall = 0;
+        size_t pre_n = 0, dec_n = 0;
+        for (size_t i = skip; i < profs.size(); ++i) {
+            size_t rel = i - skip;
+            const auto& p = profs[i];
+            if (rel < n_prompt) { pre_mm += p.matmul_ms; pre_attn += p.attention_ms; pre_head += p.lm_head_ms; pre_wall += p.wall_ms; ++pre_n; }
+            else { dec_mm += p.matmul_ms; dec_attn += p.attention_ms; dec_head += p.lm_head_ms; dec_wall += p.wall_ms; ++dec_n; }
+        }
+        double decode_ms = total_ms - prefill_ms;
+        long mj1, mn1, v1, iv1;
+        read_self_stat(mn1, mj1);
+        read_ctxt(v1, iv1);
+
+        std::string loadavg = "?";
+        {
+            std::ifstream la("/proc/loadavg");
+            if (la.is_open()) std::getline(la, loadavg);
+        }
+        int omp_threads = 0;
+#if defined(_OPENMP)
+        omp_threads = omp_get_max_threads();
+#endif
+
+        std::cout << std::fixed << std::setprecision(1)
+                  << "[BENCH] model: " << model_path << " (" << hp.arch << ")\n"
+                  << "  prompt tokens: " << n_prompt << ", generated tokens: " << n_gen << "\n"
+                  << "  prefill: " << prefill_ms << " ms (" << n_prompt << " tok, "
+                  << (n_prompt * 1000.0 / std::max(0.1, prefill_ms)) << " tok/s, "
+                  << (pre_n ? pre_wall / pre_n : 0.0) << " ms/forward)\n"
+                  << "  decode:  " << decode_ms << " ms wall (" << n_gen << " tok, "
+                  << (n_gen * 1000.0 / std::max(0.1, decode_ms)) << " tok/s); profile decode "
+                  << dec_wall << " ms over " << dec_n << " forwards ("
+                  << (dec_n ? (dec_n * 1000.0 / std::max(0.1, dec_wall)) : 0.0) << " tok/s)\n"
+                  << "  total:   " << total_ms << " ms (prefill + " << n_gen << " decode tokens)\n"
+                  << "  profile split (per-forward sums, ms):\n"
+                  << "    prefill: matmul " << pre_mm << ", attn " << pre_attn << ", lm_head " << pre_head << ", wall " << pre_wall << "\n"
+                  << "    decode:  matmul " << dec_mm << ", attn " << dec_attn << ", lm_head " << dec_head << ", wall " << dec_wall << "\n";
+        if (prof_truncated) std::cout << "  WARN: profile history truncated (>" << 120 << " samples); split is partial.\n";
+        std::cout << "  threads: OpenMP max " << omp_threads << ", loadavg: " << loadavg << "\n"
+                  << "  faults: major " << (mj1 - mj0) << " (disk re-reads), minor " << (mn1 - mn0)
+                  << "; ctxt switches vol " << (v1 - v0) << " invol " << (iv1 - iv0) << "\n"
+                  << "  generated: \"" << generated.substr(0, 200) << "\"\n";
     } else {
         print_usage();
     }

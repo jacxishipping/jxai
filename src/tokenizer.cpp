@@ -247,8 +247,17 @@ void Tokenizer::rebuild_token_index() {
             }
         }
 
-        // Register special control tokens for exact prefix matching
-        if (t.size() >= 3 && t.front() == '<' && t.back() == '>' && t.substr(0, 3) != "<0x") {
+        // Register special control tokens for exact prefix matching.
+        // Angle-bracket tags (<s>, <|im_start|>, ...) and square-bracket
+        // tags ([INST], [/INST], [TOOL_CALLS], [control_N], ...) are both
+        // control tokens. The bracket form is required by Mistral: without
+        // it [INST] / [/INST] are BPE-split into "[", "INST", "]", the model
+        // never sees the turn boundary, and it echoes template tokens
+        // instead of answering (verified 2026-11-17 on
+        // Mistral-7B-Instruct-v0.3 Q2_K — both RoPE modes gave
+        // "\n\n[INST] 4 [" before this fix).
+        if ((t.size() >= 3 && t.front() == '<' && t.back() == '>' && t.substr(0, 3) != "<0x") ||
+            (t.size() >= 3 && t.front() == '[' && t.back() == ']')) {
             special_tokens_.emplace_back(t, i);
         }
     }
@@ -626,7 +635,11 @@ std::vector<uint32_t> Tokenizer::encode(const std::string& text, bool add_bos) c
     while (pos < text.size()) {
         int matched_special = -1;
         size_t matched_len = 0;
-        if (text[pos] == '<') {
+        // Special tokens start with '<' (e.g. <s>, <|im_start|>) or '['
+        // (e.g. [INST], [/INST]). The '[' case is required by Mistral:
+        // without it [INST]/[/INST] are BPE-split and the turn boundary
+        // is lost even though the tokens are registered as special.
+        if (text[pos] == '<' || text[pos] == '[') {
             for (const auto& sp : special_tokens_) {
                 if (pos + sp.first.size() <= text.size() &&
                     text.compare(pos, sp.first.size(), sp.first) == 0) {

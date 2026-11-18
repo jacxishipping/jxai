@@ -2,6 +2,7 @@ import React, { useState } from 'react';
 import { Image as ImageIcon, Sparkles, Maximize2, X, ZoomIn, ZoomOut, Loader2, Download, Info } from 'lucide-react';
 import { ImageResult } from '../types';
 import { Translations } from '../utils/i18n';
+import { apiFetch } from '../utils/api';
 
 interface ImageWorkspaceProps {
   t: Translations;
@@ -32,7 +33,7 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
   const handleGenerate = async () => {
     setIsLoading(true);
     try {
-      const res = await fetch('/v1/images/generations', {
+      const res = await apiFetch('/v1/images/generations', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
