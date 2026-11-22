@@ -15,6 +15,7 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
   const [query, setQuery] = useState('Categorize the system risk severity level:');
   const [optionsStr, setOptionsStr] = useState('Low Risk, Medium Risk, High Risk, Critical Panic');
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<SystemOneResult | null>(null);
 
   const calculateEntropyAndConfidence = (
@@ -42,6 +43,7 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
 
   const handleEvaluate = async () => {
     setIsLoading(true);
+    setError(null);
     try {
       const opts = optionsStr
         .split(',')
@@ -64,9 +66,18 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
           entropy,
           confidence
         });
+      } else {
+        let detail = `Server returned ${res.status}.`;
+        try {
+          const errBody = await res.json();
+          if (errBody?.message) detail = errBody.message;
+        } catch {
+          // keep the status fallback
+        }
+        setError(detail);
       }
     } catch (e) {
-      console.error(e);
+      setError(e instanceof Error ? e.message : 'Request failed — is the engine running?');
     } finally {
       setIsLoading(false);
     }
@@ -88,15 +99,23 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
               </p>
             </div>
           </div>
+          <p className="text-[11px] text-slate-500 font-mono leading-relaxed">
+            Scores come from the loaded model&apos;s LM-head logits for your options; entropy and
+            confidence are computed in this browser from those probabilities — they are derived,
+            not calibrated. Note: on the built-in sentiment benchmark the small reference model
+            scores 10/30 (baseline), so treat SystemOne output as a ranking signal, not a
+            verified classifier.
+          </p>
         </div>
 
         {/* Input Form */}
         <div className="p-6 rounded-2xl bg-slate-900/60 border border-slate-800 space-y-4 shadow-xl">
           <div>
-            <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
+            <label htmlFor="jxai-s1-document" className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
               {t.evalDocument}
             </label>
             <textarea
+              id="jxai-s1-document"
               rows={4}
               value={document}
               onChange={e => setDocument(e.target.value)}
@@ -104,12 +123,13 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
             />
           </div>
 
-          <div className="grid grid-cols-2 gap-4">
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
             <div>
-              <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
+              <label htmlFor="jxai-s1-query" className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
                 {t.evalQuery}
               </label>
               <input
+                id="jxai-s1-query"
                 type="text"
                 value={query}
                 onChange={e => setQuery(e.target.value)}
@@ -118,10 +138,11 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
             </div>
 
             <div>
-              <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
+              <label htmlFor="jxai-s1-options" className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
                 {t.candidateOptions}
               </label>
               <input
+                id="jxai-s1-options"
                 type="text"
                 value={optionsStr}
                 onChange={e => setOptionsStr(e.target.value)}
@@ -130,11 +151,11 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
             </div>
           </div>
 
-          <div className="pt-2 flex justify-end">
+          <div className="pt-2 flex flex-col items-end space-y-2">
             <button
               onClick={handleEvaluate}
               disabled={isLoading || !document.trim()}
-              className="px-6 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-medium text-sm transition-all duration-200 disabled:opacity-50 flex items-center space-x-2 shadow-lg shadow-purple-600/20 cursor-pointer"
+              className="px-6 py-2.5 rounded-xl bg-purple-600 hover:bg-purple-500 text-white font-medium text-sm transition-all duration-200 disabled:opacity-50 flex items-center space-x-2 shadow-lg shadow-purple-600/20 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-purple-400"
             >
               {isLoading ? (
                 <>
@@ -148,8 +169,20 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
                 </>
               )}
             </button>
+            {error && (
+              <div role="alert" className="w-full rounded-xl border border-red-500/40 bg-red-950/40 px-3.5 py-2.5 text-xs text-red-300">
+                Evaluation failed: {error}
+              </div>
+            )}
           </div>
         </div>
+
+        {/* Empty state — no evaluation yet */}
+        {!result && !isLoading && (
+          <p className="text-xs text-slate-500 font-mono text-center">
+            No evaluation yet — enter a document and options, then Evaluate.
+          </p>
+        )}
 
         {/* Results & Shannon Entropy Visualization */}
         {result && (
@@ -169,7 +202,7 @@ export const SystemOneWorkspace: React.FC<SystemOneWorkspaceProps> = ({ t }) => 
             </div>
 
             {/* Entropy & Confidence Gauges */}
-            <div className="grid grid-cols-2 gap-4">
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
               <div className="p-4 rounded-xl bg-slate-950/60 border border-slate-800 flex items-center space-x-3">
                 <Gauge className="w-5 h-5 text-cyan-400" />
                 <div>

@@ -65,7 +65,7 @@ export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t 
             <span>{t.profilerTitle}</span>
           </h2>
           <p className="text-xs text-slate-400 font-mono mt-1">
-            Breakdown of SIMD Matmul vs Attention vs LM Head vs PILOT Asynchronous Overlapped Disk Reads
+            Breakdown of Matmul vs Attention vs LM Head vs PILOT Disk Reads (sync pread; background prefetch)
           </p>
         </div>
 
@@ -95,24 +95,24 @@ export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t 
 
         <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-lg">
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2 font-mono">
-            <span>NVMe I/O Wait</span>
+            <span>I/O Wait</span>
             <HardDrive className="w-4 h-4 text-amber-400" />
           </div>
           <div className="text-2xl font-bold font-mono text-amber-400">
-            {latest ? `${latest.io_wait_ms.toFixed(2)} ms` : '0.00 ms'}
+            {latest ? `${latest.io_wait_ms.toFixed(2)} ms` : '--'}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1 font-mono">PILOT prefetch overlap efficiency</div>
+          <div className="text-[11px] text-slate-500 mt-1 font-mono">Time waiting on expert weight reads</div>
         </div>
 
         <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-lg">
           <div className="flex items-center justify-between text-xs text-slate-400 mb-2 font-mono">
-            <span>SIMD Compute Time</span>
+            <span>Matmul Time</span>
             <Cpu className="w-4 h-4 text-indigo-400" />
           </div>
           <div className="text-2xl font-bold font-mono text-indigo-300">
             {latest ? `${latest.matmul_ms.toFixed(2)} ms` : '--'}
           </div>
-          <div className="text-[11px] text-slate-500 mt-1 font-mono">SwiGLU & Attention GEMM/GEMV</div>
+          <div className="text-[11px] text-slate-500 mt-1 font-mono">Matmul per forward step</div>
         </div>
 
         <div className="p-5 rounded-2xl bg-slate-900/60 border border-slate-800/80 shadow-lg">
@@ -123,10 +123,10 @@ export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t 
           <div className="text-2xl font-bold font-mono text-cyan-400">
             {health && (health.tiers.cache_hits + health.tiers.cache_misses) > 0
               ? `${Math.round((health.tiers.cache_hits / (health.tiers.cache_hits + health.tiers.cache_misses)) * 100)}%`
-              : '94%'}
+              : '--'}
           </div>
           <div className="text-[11px] text-slate-500 mt-1 font-mono">
-            {t.hits}: {health?.tiers.cache_hits ?? 142} | Misses: {health?.tiers.cache_misses ?? 12}
+            {t.hits}: {health?.tiers.cache_hits ?? '—'} | Misses: {health?.tiers.cache_misses ?? '—'}
           </div>
         </div>
       </div>
@@ -140,7 +140,7 @@ export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t 
           <div className="flex items-center space-x-4 text-xs font-mono">
             <div className="flex items-center space-x-1.5">
               <span className="w-2.5 h-2.5 rounded bg-indigo-500"></span>
-              <span className="text-slate-400">Matmul (SIMD)</span>
+              <span className="text-slate-400">Matmul</span>
             </div>
             <div className="flex items-center space-x-1.5">
               <span className="w-2.5 h-2.5 rounded bg-blue-500"></span>
@@ -152,7 +152,7 @@ export const ProfilerDashboard: React.FC<ProfilerDashboardProps> = ({ health, t 
             </div>
             <div className="flex items-center space-x-1.5">
               <span className="w-2.5 h-2.5 rounded bg-amber-500"></span>
-              <span className="text-slate-400">NVMe I/O Wait</span>
+              <span className="text-slate-400">I/O Wait</span>
             </div>
           </div>
         </div>

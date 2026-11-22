@@ -54,7 +54,7 @@ interface ChatWorkspaceProps {
   samplerSettings: SamplerSettings;
 }
 
-const createWelcomeMessage = (slot: number, health: EngineHealth | null): ChatMessage => ({
+const createWelcomeMessage = (health: EngineHealth | null): ChatMessage => ({
   id: 'welcome',
   role: 'assistant',
   content: `### Welcome to the Next-Gen MoE Streaming Inference Engine
@@ -64,17 +64,7 @@ Dense attention parameters (GQA/MLA), embedding matrices, and router gating tabl
 - **Vectorized SIMD & Tensor Core Compute**: AVX-512, AVX2+FMA3, and Vulkan 1.3 Cooperative Matrix.
 - **Cache-Aware Routing (CACHE_ROUTE)**: Automatic expert substitution ($\\Delta p < \\epsilon$) to eliminate disk I/O.
 - **Interactive Sandbox**: Tag code blocks \`\`\`html or \`\`\`svg to inspect live rendering in the sandbox on the right!`,
-  reasoning_content: `MoE Core Initialized. Model: ${health?.model_name || 'Qwen2.5-MoE-Stream-Q4_0'}. All experts mapped with Win32 IOCP / POSIX asynchronous direct I/O prefetch. Dynamic pinning threshold: 12 hits.`,
-  telemetry: {
-    tok_per_sec: 25.8,
-    wall_ms: 38.7,
-    io_wait_ms: 0.0,
-    cache_hits: health?.tiers.cache_hits ?? 142,
-    disk_reads: 0,
-    ttft_ms: 12.4,
-    queue_latency_ms: 0.8,
-    cache_slot: slot
-  }
+  reasoning_content: `MoE Core Initialized. Model: ${health?.model_name || 'No model loaded'}.`
 });
 
 export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
@@ -91,11 +81,11 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
   samplerSettings,
   onRefreshHealth
 }) => {
-  const messages = messagesBySlot[currentSlot] || [createWelcomeMessage(currentSlot, health)];
+  const messages = messagesBySlot[currentSlot] || [createWelcomeMessage(health)];
 
   const updateSlotMessages = (slot: number, updater: (prev: ChatMessage[]) => ChatMessage[]) => {
     setMessagesBySlot(prevMap => {
-      const currentList = prevMap[slot] || [createWelcomeMessage(slot, health)];
+      const currentList = prevMap[slot] || [createWelcomeMessage(health)];
       return {
         ...prevMap,
         [slot]: updater(currentList)
@@ -254,6 +244,15 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
         })
       });
 
+      // apiFetch does not throw on HTTP errors, so check here: without
+      // this, a 401/400/500 body would be read as if it were SSE, yield no
+      // data: lines, and end with an empty assistant message and no error.
+      if (!response.ok) {
+        const errText = await response.text().catch(() => '');
+        let serverMsg = '';
+        try { serverMsg = JSON.parse(errText)?.message || JSON.parse(errText)?.error || ''; } catch { /* not JSON */ }
+        throw new Error(`HTTP ${response.status}${serverMsg ? `: ${serverMsg}` : ''}${!serverMsg && errText ? `: ${errText.slice(0, 200)}` : ''}`);
+      }
       if (!response.body) throw new Error('No readable stream');
       const reader = response.body.getReader();
       const decoder = new TextDecoder();
@@ -719,7 +718,14 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
               </button>
             )}
             <div className="flex items-center space-x-2">
-              <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse"></span>
+              {health?.status === 'ok' ? (
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-400 animate-pulse" title="Native engine connected"></span>
+              ) : (
+                <>
+                  <span className="w-2.5 h-2.5 rounded-full bg-red-500" title="Native engine unreachable"></span>
+                  <span className="text-[11px] font-mono text-red-400">Engine unreachable — run ./start_jxai.sh</span>
+                </>
+              )}
               {models.length > 0 ? (
                 <div className="flex items-center space-x-2">
                   <select
@@ -758,15 +764,15 @@ export const ChatWorkspace: React.FC<ChatWorkspaceProps> = ({
           <div className="flex items-center space-x-3 text-xs font-mono text-slate-400">
             <div className="flex items-center space-x-1.5" title="VRAM Backbone Residency">
               <Cpu className="w-3.5 h-3.5 text-indigo-400" />
-              <span>{t.vram}: {health?.tiers.vram_experts ?? 8}</span>
+              <span>{t.vram}: {health?.tiers.vram_experts ?? '–'}</span>
             </div>
             <div className="flex items-center space-x-1.5" title="LFRU RAM Cache Hits">
               <Database className="w-3.5 h-3.5 text-cyan-400" />
-              <span>{t.ram}: {health?.tiers.ram_experts ?? 8}</span>
+              <span>{t.ram}: {health?.tiers.ram_experts ?? '–'}</span>
             </div>
             <div className="flex items-center space-x-1.5" title="PILOT Overlapped NVMe Reads">
               <Disc className="w-3.5 h-3.5 text-amber-400" />
-              <span>{t.disk}: {health?.tiers.disk_experts ?? 16}</span>
+              <span>{t.disk}: {health?.tiers.disk_experts ?? '–'}</span>
             </div>
             <button
               onClick={handleClearCurrentSlot}

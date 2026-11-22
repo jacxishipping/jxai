@@ -1,7 +1,17 @@
 #!/usr/bin/env python3
 """
-JXAI API Gateway - OpenAI-compatible proxy to Ollama
-Serves as the backend API for Open WebUI
+JXAI Ollama Proxy — OPTIONAL integration, NOT the native engine.
+
+This is a legacy OpenAI-compatible proxy to Ollama. It exists only for users
+who explicitly want to run inference through Ollama + Open WebUI. It is NOT
+part of the default JXAI path: the default backend is the native C++ engine
+(`moe_engine serve` on 127.0.0.1:8001, started by start_jxai.sh), which the
+project's own web UI talks to directly. Do not mistake this proxy for the
+native engine — its /health reports "ollama_connected", and every chat
+request is forwarded to the Ollama daemon on 127.0.0.1:11434.
+
+Run it only deliberately, e.g.:
+    JXAI_ALLOW_OLLAMA_PROXY=1 python3 jxai_gateway.py --port 8001
 
 Security (2026-11-17): binds 127.0.0.1 by default (port 8001). When
 MOE_API_KEY is set, every POST endpoint requires
@@ -56,7 +66,7 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
         self._set_cors()
         self.send_header("Content-Type", "application/json; charset=utf-8")
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("X-JXAI-Engine", "JXAI Inference Engine v2")
+        self.send_header("X-JXAI-Engine", "JXAI Ollama Proxy (optional; NOT the native engine)")
         self.end_headers()
         self.wfile.write(body)
 
@@ -93,7 +103,7 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-cache")
             self.send_header("Connection", "keep-alive")
-            self.send_header("X-JXAI-Engine", "JXAI Inference Engine v2")
+            self.send_header("X-JXAI-Engine", "JXAI Ollama Proxy (optional; NOT the native engine)")
             self.end_headers()
             cmpl_id = f"chatcmpl-{uuid.uuid4().hex[:12]}"
             created_ts = int(time.time())
@@ -157,8 +167,8 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
                 pass
             self._send_json(200, {
                 "status": "ok",
-                "engine": "JXAI Inference Engine v2",
-                "gateway": "JXAI API Gateway",
+                "engine": "JXAI Ollama Proxy (optional; NOT the native engine)",
+                "gateway": "JXAI Ollama Proxy (optional)",
                 "ollama_connected": ollama_ok,
                 "version": "2.0.0"
             })
@@ -187,10 +197,10 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
 
         if path == "/":
             self._send_json(200, {
-                "service": "JXAI API Gateway",
+                "service": "JXAI Ollama Proxy (optional; NOT the native engine)",
                 "version": "2.0.0",
                 "status": "running",
-                "message": "JXAI backend API. Open WebUI is the frontend interface."
+                "message": "Optional Ollama proxy. The default JXAI backend is the native C++ engine (moe_engine serve on 127.0.0.1:8001)."
             })
             return
 
@@ -261,7 +271,7 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="JXAI API Gateway (Ollama proxy)")
+    parser = argparse.ArgumentParser(description="JXAI Ollama Proxy (OPTIONAL; not the native engine)")
     parser.add_argument("--host", default=GATEWAY_HOST,
                         help="Bind host (default: 127.0.0.1; env GATEWAY_HOST)")
     parser.add_argument("--port", type=int, default=GATEWAY_PORT,
@@ -290,10 +300,12 @@ models. This is strongly discouraged.
 
     print(f"""
 ╔══════════════════════════════════════════════╗
-║         JXAI API Gateway v2.0                ║
-║         OpenAI-compatible proxy to Ollama     ║
+║  JXAI Ollama Proxy v2.0 (OPTIONAL)           ║
+║  NOT the native engine — proxy to Ollama     ║
 ╚══════════════════════════════════════════════╝
     """)
+    print("[WARNING] This is the OPTIONAL Ollama proxy. The default JXAI backend is")
+    print("          the native C++ engine (moe_engine serve on 127.0.0.1:8001).")
     print(f"  Ollama endpoint: {OLLAMA_HOST}")
     print(f"  Gateway port:    {args.port}")
     print(f"  Listening on:    http://{args.host}:{args.port}")
@@ -304,5 +316,5 @@ models. This is strongly discouraged.
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\nShutting down JXAI API Gateway...")
+        print("\nShutting down JXAI Ollama Proxy...")
         server.shutdown()

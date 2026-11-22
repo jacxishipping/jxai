@@ -1,6 +1,7 @@
 #include "gguf.h"
 #include "quant.h"
 #include <algorithm>
+#include <charconv>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -400,6 +401,63 @@ bool is_expert_tensor_name(const std::string& name) {
            name.find(".experts.")     != std::string::npos;
 }
 
+// --- Malformed-file defenses (workstream C, 2026-11-21) -----------------
+// GGUF/SafeTensors headers are attacker-influenced bytes: every count,
+// dimension, offset and length below is validated with checked arithmetic
+// before it is used, so a corrupt file fails with a clear error instead of
+// crashing (allocation bomb, overflowed offset) or silently producing
+// wrong output (unknown tensor type read as F32).
+
+// True when `raw` is a GGMLType value this engine knows. Unknown values
+// (e.g. 999, or the unassigned ids 4/5/32-35) are rejected at parse time:
+// tensor_byte_size() would otherwise silently treat them as F32-sized
+// (blck 1, 4 bytes) and the dequantizer would return zeros.
+bool is_known_ggml_type(uint32_t raw) {
+    switch (static_cast<GGMLType>(raw)) {
+        case GGMLType::F32: case GGMLType::F16:
+        case GGMLType::Q4_0: case GGMLType::Q4_1:
+        case GGMLType::Q5_0: case GGMLType::Q5_1:
+        case GGMLType::Q8_0: case GGMLType::Q8_1:
+        case GGMLType::Q2_K: case GGMLType::Q3_K:
+        case GGMLType::Q4_K: case GGMLType::Q5_K:
+        case GGMLType::Q6_K: case GGMLType::Q8_K:
+        case GGMLType::IQ2_XXS: case GGMLType::IQ2_XS:
+        case GGMLType::IQ3_XXS: case GGMLType::IQ1_S:
+        case GGMLType::IQ4_NL: case GGMLType::IQ3_S:
+        case GGMLType::IQ2_S: case GGMLType::IQ4_XS:
+        case GGMLType::I8: case GGMLType::I16:
+        case GGMLType::I32: case GGMLType::I64:
+        case GGMLType::F64: case GGMLType::IQ1_M:
+        case GGMLType::BF16: case GGMLType::FP8_E4M3:
+        case GGMLType::IQ2_M:
+            return true;
+        default:
+            return false;
+    }
+}
+
+// Strict unsigned decimal parse: no exceptions, no sign, no trailing junk,
+// no overflow. (std::stoull throws out_of_range on huge inputs and wraps
+// a leading '-' — both crash paths in the old SafeTensors parser.)
+bool parse_u64_strict(const std::string& s, uint64_t& out) {
+    if (s.empty()) return false;
+    const char* b = s.data();
+    const char* e = b + s.size();
+    uint64_t v = 0;
+    auto res = std::from_chars(b, e, v);
+    if (res.ec != std::errc() || res.ptr != e) return false;
+    out = v;
+    return true;
+}
+
+// Hard caps for header counts. A real model has < 10k tensors and < 10k
+// KV entries; the caps only stop an allocation bomb from a corrupt header
+// (reserve() on a 2^60 count would throw / OOM before any byte is read).
+constexpr uint64_t kMaxGgufTensors = 1000000ULL;
+constexpr uint64_t kMaxGgufKv = 1000000ULL;
+constexpr uint64_t kMaxStHeaderBytes = 256ULL * 1024 * 1024;
+constexpr uint32_t kMaxGgufAlignment = 1u << 20;
+
 // ---------------------------------------------------------------------------
 // SafeTensors helpers: minimal flat-JSON field extraction (no JSON library),
 // HF architecture mapping, and HF -> GGUF tensor-name translation.
@@ -769,6 +827,27 @@ bool read_gguf_value(BinaryCursor& cur, GGUFValueType vtype, GGUFValue& val) {
             uint64_t arr_len = 0;
             if (!cur.read(elem_type_raw) || !cur.read(arr_len)) return false;
             if (arr_len > 10000000ULL) return false;
+            // Fixed-size element types must fit in the remaining bytes;
+            // otherwise the per-element reads below would fail one by one
+            // after a huge resize (10M strings ~= 320 MB) — fail fast.
+            {
+                size_t elem_sz = 0;
+                switch (static_cast<GGUFValueType>(elem_type_raw)) {
+                    case GGUFValueType::UINT8: case GGUFValueType::INT8:
+                    case GGUFValueType::BOOL: elem_sz = 1; break;
+                    case GGUFValueType::UINT16: case GGUFValueType::INT16:
+                        elem_sz = 2; break;
+                    case GGUFValueType::UINT32: case GGUFValueType::INT32:
+                    case GGUFValueType::FLOAT32: elem_sz = 4; break;
+                    case GGUFValueType::UINT64: case GGUFValueType::INT64:
+                    case GGUFValueType::FLOAT64: elem_sz = 8; break;
+                    default: elem_sz = 0; break; // STRING / nested: checked per element
+                }
+                if (elem_sz > 0) {
+                    uint64_t remain = (cur.size > cur.pos) ? (cur.size - cur.pos) : 0;
+                    if (arr_len > remain / elem_sz) return false;
+                }
+            }
             auto etype = static_cast<GGUFValueType>(elem_type_raw);
             if (etype == GGUFValueType::STRING) {
                 val.str_arr.resize(static_cast<size_t>(arr_len));
@@ -807,6 +886,22 @@ bool read_gguf_value(BinaryCursor& cur, GGUFValueType vtype, GGUFValue& val) {
 
 } // namespace
 
+// Checked version of tensor_byte_size(): false on overflow instead of
+// wrapping. (tensor_byte_size itself is in common.h and cannot check.)
+// Moved out of the anonymous namespace in workstream C so the transformer
+// layer can validate bound tensors with the same arithmetic the parsers
+// use; declared in gguf.h.
+bool checked_tensor_bytes(GGMLType t, uint64_t num_elements, uint64_t& out) {
+    uint64_t blck = static_cast<uint64_t>(ggml_blck_size(t));
+    uint64_t tsize = static_cast<uint64_t>(ggml_type_size(t));
+    if (blck == 0 || tsize == 0) return false;
+    if (num_elements > UINT64_MAX - (blck - 1)) return false;
+    uint64_t blocks = (num_elements + blck - 1) / blck;
+    if (blocks > UINT64_MAX / tsize) return false;
+    out = blocks * tsize;
+    return true;
+}
+
 bool ModelFile::parse_gguf(std::string& err_msg) {
     BinaryCursor cur{mapped_base_, file_size_, 4}; // skip "GGUF"
     uint32_t version = 0;
@@ -819,6 +914,18 @@ bool ModelFile::parse_gguf(std::string& err_msg) {
     }
     if (!cur.read(n_tensors) || !cur.read(n_kv)) {
         err_msg = "Truncated GGUF header";
+        return false;
+    }
+    // Corrupt-header guard: a huge count would make reserve() throw (or
+    // OOM) before a single byte is validated. Real models have < 10k
+    // tensors/KV entries; each tensor info is >= 24 bytes on disk.
+    if (n_tensors > kMaxGgufTensors || n_kv > kMaxGgufKv) {
+        err_msg = "GGUF header counts out of range (tensors: " + std::to_string(n_tensors) +
+                  ", kv: " + std::to_string(n_kv) + ")";
+        return false;
+    }
+    if (n_tensors > (file_size_ - cur.pos) / 24) {
+        err_msg = "GGUF tensor count exceeds file size";
         return false;
     }
 
@@ -834,7 +941,12 @@ bool ModelFile::parse_gguf(std::string& err_msg) {
             err_msg = "Failed reading GGUF KV value for key: " + key;
             return false;
         }
-        if (key == "general.alignment" && val.u64 > 0) {
+        if (key == "general.alignment") {
+            if (val.u64 == 0 || val.u64 > kMaxGgufAlignment) {
+                err_msg = "Invalid general.alignment in GGUF metadata: " +
+                          std::to_string(val.u64);
+                return false;
+            }
             alignment_ = static_cast<uint32_t>(val.u64);
         }
         metadata_[key] = std::move(val);
@@ -846,13 +958,24 @@ bool ModelFile::parse_gguf(std::string& err_msg) {
 
     for (uint64_t i = 0; i < n_tensors; ++i) {
         TensorDescriptor td;
-        if (!cur.read_string(td.name) || !cur.read(td.n_dims) || td.n_dims > 4) {
+        if (!cur.read_string(td.name) || !cur.read(td.n_dims) || td.n_dims < 1 || td.n_dims > 4) {
             err_msg = "Invalid GGUF tensor header at index " + std::to_string(i);
             return false;
         }
+        // Checked element count: a dim of 0 is malformed, and the product
+        // must not overflow uint64 (2^32 x 2^32 dims would wrap to a
+        // small byte_size and pass the bounds check below).
         uint64_t ne = 1;
         for (uint32_t d = 0; d < td.n_dims; ++d) {
             if (!cur.read(td.dims[d])) return false;
+            if (td.dims[d] == 0) {
+                err_msg = "GGUF tensor '" + td.name + "' has a zero dimension";
+                return false;
+            }
+            if (ne > UINT64_MAX / td.dims[d]) {
+                err_msg = "GGUF tensor '" + td.name + "' dimensions overflow";
+                return false;
+            }
             ne *= td.dims[d];
         }
         uint32_t type_raw = 0;
@@ -860,8 +983,16 @@ bool ModelFile::parse_gguf(std::string& err_msg) {
             err_msg = "Truncated GGUF tensor descriptor: " + td.name;
             return false;
         }
+        if (!is_known_ggml_type(type_raw)) {
+            err_msg = "GGUF tensor '" + td.name + "' has unknown type id " +
+                      std::to_string(type_raw) + " (not a GGML type)";
+            return false;
+        }
         td.type = static_cast<GGMLType>(type_raw);
-        td.byte_size = tensor_byte_size(td.type, ne);
+        if (!checked_tensor_bytes(td.type, ne, td.byte_size)) {
+            err_msg = "GGUF tensor '" + td.name + "' byte size overflows";
+            return false;
+        }
         td.is_sparse_expert = is_expert_tensor_name(td.name);
         temp_tensors.push_back(std::move(td));
     }
@@ -869,10 +1000,23 @@ bool ModelFile::parse_gguf(std::string& err_msg) {
     // Align cursor position to general.alignment (default 32 bytes)
     uint64_t rem = cur.pos % alignment_;
     data_offset_ = (rem == 0) ? cur.pos : (cur.pos + (alignment_ - rem));
+    if (data_offset_ > file_size_) {
+        err_msg = "GGUF data section starts past end of file (alignment " +
+                  std::to_string(alignment_) + ")";
+        return false;
+    }
 
     for (auto& td : temp_tensors) {
+        // Checked absolute offset: td.offset is file-controlled and can be
+        // up to 2^64-1, so data_offset_ + offset must not wrap.
+        if (td.offset > file_size_ - data_offset_) {
+            err_msg = "Tensor offset out of file bounds: " + td.name +
+                      " (offset: " + std::to_string(td.offset) +
+                      ", file_size: " + std::to_string(file_size_) + ")";
+            return false;
+        }
         td.abs_file_offset = data_offset_ + td.offset;
-        if (td.abs_file_offset + td.byte_size > file_size_) {
+        if (td.byte_size > file_size_ - td.abs_file_offset) {
             err_msg = "Tensor exceeds file bounds: " + td.name +
                       " (abs_offset: " + std::to_string(td.abs_file_offset) +
                       ", byte_size: " + std::to_string(td.byte_size) +
@@ -881,6 +1025,10 @@ bool ModelFile::parse_gguf(std::string& err_msg) {
             return false;
         }
         td.mapped_ptr = mapped_base_ + td.abs_file_offset;
+        if (tensors_.count(td.name) != 0) {
+            err_msg = "Duplicate tensor name in GGUF file: " + td.name;
+            return false;
+        }
         tensor_order_.push_back(td.name);
         tensors_[td.name] = std::move(td);
     }
@@ -900,7 +1048,11 @@ bool ModelFile::parse_safetensors_shard(const uint8_t* base, uint64_t size,
     }
     uint64_t header_len = 0;
     std::memcpy(&header_len, base, sizeof(uint64_t));
-    if (header_len == 0 || 8 + header_len > size) {
+    // Checked: `8 + header_len` overflows for header_len near 2^64, which
+    // used to pass the bounds check and then throw length_error in the
+    // std::string construction below (uncaught -> terminate).
+    if (header_len == 0 || header_len > kMaxStHeaderBytes ||
+        header_len > size - 8) {
         err_msg = "Invalid SafeTensors JSON header size";
         return false;
     }
@@ -910,6 +1062,9 @@ bool ModelFile::parse_safetensors_shard(const uint8_t* base, uint64_t size,
 
     // Parse top-level tensor objects in SafeTensors JSON header:
     // { "tensor_name": { "dtype": "F16", "shape": [r, c], "data_offsets": [start, end] }, "__metadata__": {...} }
+    // Any structural failure below is a hard error now: the old code
+    // `break` out of the loop on malformed input and returned success
+    // with whatever tensors parsed so far (partial model, silent).
     size_t pos = 0;
     auto skip_ws = [&]() {
         while (pos < json.size() && (json[pos] == ' ' || json[pos] == '\t' || json[pos] == '\n' || json[pos] == '\r' || json[pos] == ',')) pos++;
@@ -935,27 +1090,56 @@ bool ModelFile::parse_safetensors_shard(const uint8_t* base, uint64_t size,
     }
     pos++;
 
+    bool header_closed = false;
     while (pos < json.size()) {
         skip_ws();
-        if (pos >= json.size() || json[pos] == '}') break;
+        if (pos >= json.size()) {
+            err_msg = "SafeTensors header truncated (no closing '}')";
+            return false;
+        }
+        if (json[pos] == '}') { pos++; header_closed = true; break; }
         std::string key;
-        if (!parse_str(key)) break;
+        if (!parse_str(key)) {
+            err_msg = "SafeTensors header: cannot parse tensor name";
+            return false;
+        }
         skip_ws();
-        if (pos >= json.size() || json[pos] != ':') break;
+        if (pos >= json.size() || json[pos] != ':') {
+            err_msg = "SafeTensors header: expected ':' after tensor name '" + key + "'";
+            return false;
+        }
         pos++;
         skip_ws();
-        if (pos >= json.size() || json[pos] != '{') break;
+        if (pos >= json.size() || json[pos] != '{') {
+            err_msg = "SafeTensors header: expected '{' for tensor '" + key + "'";
+            return false;
+        }
 
-        // Find matching '}' for inner object
+        // Find matching '}' for inner object, string-aware: the old
+        // counter counted braces inside string values (a tensor name or
+        // metadata value containing '{'/' }' broke the split).
         size_t obj_start = pos;
         int depth = 0;
+        bool in_str = false;
+        bool obj_closed = false;
         while (pos < json.size()) {
-            if (json[pos] == '{') depth++;
-            else if (json[pos] == '}') {
+            char c = json[pos];
+            if (in_str) {
+                if (c == '\\' && pos + 1 < json.size()) { pos += 2; continue; }
+                if (c == '"') in_str = false;
+            } else if (c == '"') {
+                in_str = true;
+            } else if (c == '{') {
+                depth++;
+            } else if (c == '}') {
                 depth--;
-                if (depth == 0) { pos++; break; }
+                if (depth == 0) { pos++; obj_closed = true; break; }
             }
             pos++;
+        }
+        if (!obj_closed) {
+            err_msg = "SafeTensors header: unterminated object for tensor '" + key + "'";
+            return false;
         }
         std::string obj = json.substr(obj_start, pos - obj_start);
 
@@ -989,15 +1173,22 @@ bool ModelFile::parse_safetensors_shard(const uint8_t* base, uint64_t size,
         td.name = key;
         td.is_sparse_expert = is_expert_tensor_name(td.name);
 
-        // Extract dtype. Unknown dtypes keep the previous F32 default but
-        // are recorded (and warned about once) instead of silently
-        // misinterpreting the bytes.
+        // Extract dtype. An unknown dtype is a hard error now: the old
+        // code warned once and treated the bytes as F32, so a typo'd or
+        // unsupported dtype silently misread every weight of the tensor.
         size_t dt_pos = obj.find("\"dtype\"");
-        if (dt_pos != std::string::npos) {
+        if (dt_pos == std::string::npos) {
+            err_msg = "SafeTensors tensor '" + key + "' has no dtype";
+            return false;
+        }
+        {
             size_t q1 = obj.find('"', dt_pos + 7);
             size_t q2 = (q1 != std::string::npos) ? obj.find('"', q1 + 1) : std::string::npos;
-            if (q1 != std::string::npos && q2 != std::string::npos) {
-                std::string dt = obj.substr(q1 + 1, q2 - q1 - 1);
+            if (q1 == std::string::npos || q2 == std::string::npos) {
+                err_msg = "SafeTensors tensor '" + key + "' has a malformed dtype";
+                return false;
+            }
+            std::string dt = obj.substr(q1 + 1, q2 - q1 - 1);
                 static const std::pair<const char*, GGMLType> kDtypes[] = {
                     {"F32", GGMLType::F32},     {"F16", GGMLType::F16},
                     {"BF16", GGMLType::BF16},   {"F64", GGMLType::F64},
@@ -1013,15 +1204,13 @@ bool ModelFile::parse_safetensors_shard(const uint8_t* base, uint64_t size,
                 for (const auto& [name, type] : kDtypes) {
                     if (dt == name) { td.type = type; known = true; break; }
                 }
-                if (!known &&
-                    std::find(st_unknown_dtypes_.begin(), st_unknown_dtypes_.end(), dt) ==
-                        st_unknown_dtypes_.end()) {
-                    st_unknown_dtypes_.push_back(dt);
-                    std::cerr << "[SAFETENSORS] WARNING: unknown dtype '" << dt
-                              << "' for tensor '" << key << "' — treating as F32.\n";
+                if (!known) {
+                    err_msg = "SafeTensors tensor '" + key + "' has unsupported dtype '" + dt +
+                              "' (supported: F32 F16 BF16 F64 I8 I16 I32 I64 F8_E4M3 Q4_0 Q8_0 "
+                              "Q4_K Q5_K Q6_K Q8_K IQ4_NL)";
+                    return false;
                 }
             }
-        }
 
         // Extract shape. SafeTensors shapes are PyTorch order [out, in],
         // but this engine's GGUF convention is dims = [in, out]
@@ -1032,44 +1221,114 @@ bool ModelFile::parse_safetensors_shard(const uint8_t* base, uint64_t size,
         // already row-major [out][in], which is exactly the layout
         // matmul_quant_f32 expects (one output row per row of data), so
         // only the dims are reversed — never the data.
+        // A missing/malformed shape, a zero dimension, > 4 dims, or an
+        // overflowing element count is a hard error (the old code left
+        // defaults in place and std::stoull could throw on huge values).
         size_t sh_pos = obj.find("\"shape\"");
-        if (sh_pos != std::string::npos) {
+        if (sh_pos == std::string::npos) {
+            err_msg = "SafeTensors tensor '" + key + "' has no shape";
+            return false;
+        }
+        uint64_t numel = 1;
+        {
             size_t b1 = obj.find('[', sh_pos);
             size_t b2 = (b1 != std::string::npos) ? obj.find(']', b1) : std::string::npos;
-            if (b1 != std::string::npos && b2 != std::string::npos) {
-                std::string arr = obj.substr(b1 + 1, b2 - b1 - 1);
-                std::stringstream ss(arr);
-                std::string item;
-                uint32_t d = 0;
-                while (std::getline(ss, item, ',') && d < 4) {
-                    if (!item.empty()) {
-                        td.dims[d++] = std::stoull(item);
-                    }
-                }
-                td.n_dims = d;
-                if (td.n_dims == 2) std::swap(td.dims[0], td.dims[1]);
+            if (b1 == std::string::npos || b2 == std::string::npos) {
+                err_msg = "SafeTensors tensor '" + key + "' has a malformed shape";
+                return false;
             }
+            std::string arr = obj.substr(b1 + 1, b2 - b1 - 1);
+            std::stringstream ss(arr);
+            std::string item;
+            uint32_t d = 0;
+            while (std::getline(ss, item, ',')) {
+                if (item.empty()) continue;
+                // Trim spaces (std::from_chars rejects them).
+                size_t ib = item.find_first_not_of(" \t");
+                size_t ie = item.find_last_not_of(" \t");
+                if (ib == std::string::npos) continue;
+                uint64_t dim_v = 0;
+                if (!parse_u64_strict(item.substr(ib, ie - ib + 1), dim_v)) {
+                    err_msg = "SafeTensors tensor '" + key + "' has a non-numeric shape entry";
+                    return false;
+                }
+                if (d >= 4) {
+                    err_msg = "SafeTensors tensor '" + key + "' has more than 4 dimensions";
+                    return false;
+                }
+                if (dim_v == 0) {
+                    err_msg = "SafeTensors tensor '" + key + "' has a zero dimension";
+                    return false;
+                }
+                if (numel > UINT64_MAX / dim_v) {
+                    err_msg = "SafeTensors tensor '" + key + "' dimensions overflow";
+                    return false;
+                }
+                numel *= dim_v;
+                td.dims[d++] = dim_v;
+            }
+            td.n_dims = d;
+            if (td.n_dims == 2) std::swap(td.dims[0], td.dims[1]);
         }
 
-        // Extract data_offsets
+        // Extract data_offsets. start <= end, end within this shard's data
+        // section, and the byte span must EXACTLY match dtype*shape: a
+        // shorter span used to leave mapped_ptr null while the tensor
+        // stayed in the table (later readers dereference null or read
+        // short), and a longer span silently over-read into the next
+        // tensor. end < start used to underflow to a huge byte_size.
         size_t do_pos = obj.find("\"data_offsets\"");
-        if (do_pos != std::string::npos) {
+        if (do_pos == std::string::npos) {
+            err_msg = "SafeTensors tensor '" + key + "' has no data_offsets";
+            return false;
+        }
+        {
             size_t b1 = obj.find('[', do_pos);
             size_t b2 = (b1 != std::string::npos) ? obj.find(']', b1) : std::string::npos;
-            if (b1 != std::string::npos && b2 != std::string::npos) {
-                std::string arr = obj.substr(b1 + 1, b2 - b1 - 1);
-                size_t comma = arr.find(',');
-                if (comma != std::string::npos) {
-                    uint64_t start_off = std::stoull(arr.substr(0, comma));
-                    uint64_t end_off   = std::stoull(arr.substr(comma + 1));
-                    td.offset = start_off;
-                    td.abs_file_offset = data_offset_out + start_off;
-                    td.byte_size = end_off - start_off;
-                    if (td.abs_file_offset + td.byte_size <= size) {
-                        td.mapped_ptr = base + td.abs_file_offset;
-                    }
-                }
+            if (b1 == std::string::npos || b2 == std::string::npos) {
+                err_msg = "SafeTensors tensor '" + key + "' has malformed data_offsets";
+                return false;
             }
+            std::string arr = obj.substr(b1 + 1, b2 - b1 - 1);
+            size_t comma = arr.find(',');
+            if (comma == std::string::npos) {
+                err_msg = "SafeTensors tensor '" + key + "' data_offsets need [start, end]";
+                return false;
+            }
+            auto trim = [](const std::string& s) {
+                size_t b = s.find_first_not_of(" \t");
+                size_t e = s.find_last_not_of(" \t");
+                return (b == std::string::npos) ? std::string() : s.substr(b, e - b + 1);
+            };
+            uint64_t start_off = 0, end_off = 0;
+            if (!parse_u64_strict(trim(arr.substr(0, comma)), start_off) ||
+                !parse_u64_strict(trim(arr.substr(comma + 1)), end_off)) {
+                err_msg = "SafeTensors tensor '" + key + "' has non-numeric data_offsets";
+                return false;
+            }
+            uint64_t data_size = size - data_offset_out;
+            if (end_off < start_off || end_off > data_size) {
+                err_msg = "SafeTensors tensor '" + key + "' data_offsets out of range [" +
+                          std::to_string(start_off) + ", " + std::to_string(end_off) +
+                          "] (data section: " + std::to_string(data_size) + " bytes)";
+                return false;
+            }
+            uint64_t expected_bytes = 0;
+            if (!checked_tensor_bytes(td.type, numel, expected_bytes)) {
+                err_msg = "SafeTensors tensor '" + key + "' byte size overflows";
+                return false;
+            }
+            if (end_off - start_off != expected_bytes) {
+                err_msg = "SafeTensors tensor '" + key + "' byte size mismatch: header says " +
+                          std::to_string(end_off - start_off) + " bytes but dtype " +
+                          ggml_type_name(td.type) + " x " + std::to_string(numel) +
+                          " elements needs " + std::to_string(expected_bytes);
+                return false;
+            }
+            td.offset = start_off;
+            td.abs_file_offset = data_offset_out + start_off;
+            td.byte_size = end_off - start_off;
+            td.mapped_ptr = base + td.abs_file_offset;
         }
 
         // HF -> GGUF name translation. Routed MoE expert tensors have no
@@ -1096,7 +1355,23 @@ bool ModelFile::parse_safetensors_shard(const uint8_t* base, uint64_t size,
         tensors_[td.name] = std::move(td);
     }
 
-    return !tensors_.empty();
+    // The loop only exits via the '}' above (every other exit returns
+    // false). Anything but whitespace after the closing brace is trailing
+    // garbage — reject it instead of ignoring it.
+    if (!header_closed) {
+        err_msg = "SafeTensors header truncated (no closing '}')";
+        return false;
+    }
+    skip_ws();
+    if (pos < json.size()) {
+        err_msg = "SafeTensors header: trailing data after closing '}'";
+        return false;
+    }
+    if (tensors_.empty()) {
+        err_msg = "SafeTensors header contains no tensors";
+        return false;
+    }
+    return true;
 }
 
 // Load a sibling config.json (and note a sibling tokenizer.json) for a
@@ -1539,6 +1814,10 @@ bool ModelFile::split_fused_qkv(uint32_t layer, uint32_t q_dim, uint32_t kv_dim,
         find_tensor(bp + "attn_v.weight")) return true; // already split
     const TensorDescriptor* fused = find_tensor(bp + "attn_qkv.weight");
     if (!fused) return false; // no fused tensor: caller keeps previous behaviour
+    if (!fused->mapped_ptr) {
+        err_msg = "attn_qkv.weight for layer " + std::to_string(layer) + " has no data pointer";
+        return false;
+    }
     if (fused->n_dims != 2) {
         err_msg = "attn_qkv.weight for layer " + std::to_string(layer) + " is not 2D";
         return false;
@@ -1548,15 +1827,23 @@ bool ModelFile::split_fused_qkv(uint32_t layer, uint32_t q_dim, uint32_t kv_dim,
     if (total_out != static_cast<uint64_t>(q_dim) + 2ull * static_cast<uint64_t>(kv_dim)) {
         err_msg = "attn_qkv.weight for layer " + std::to_string(layer) + " has " +
                   std::to_string(total_out) + " output rows, expected q_dim + 2*kv_dim = " +
-                  std::to_string(q_dim + 2 * kv_dim);
+                  std::to_string(static_cast<uint64_t>(q_dim) + 2ull * static_cast<uint64_t>(kv_dim));
         return false;
     }
     // One output row = `dim` elements of the fused type. The fused matrix
     // is row-major [q_rows | k_rows | v_rows] (SafeTensors [out, in] order,
     // the layout matmul_quant_f32 expects), so each split is a contiguous
     // byte range of the fused tensor — views, no copy.
-    uint64_t row_bytes = tensor_byte_size(fused->type, dim);
-    if (row_bytes == 0 || fused->byte_size != row_bytes * total_out) {
+    // Checked arithmetic: row_bytes * total_out used to be a plain uint64
+    // multiply, so a crafted dims[1] could wrap it into a false match
+    // with byte_size and produce views reading past the tensor.
+    uint64_t row_bytes = 0;
+    if (!checked_tensor_bytes(fused->type, dim, row_bytes) || row_bytes == 0) {
+        err_msg = "attn_qkv.weight for layer " + std::to_string(layer) +
+                  " has an inconsistent row size for its type/dims";
+        return false;
+    }
+    if (total_out > UINT64_MAX / row_bytes || fused->byte_size != row_bytes * total_out) {
         err_msg = "attn_qkv.weight for layer " + std::to_string(layer) +
                   " has an inconsistent byte size for its type/dims";
         return false;

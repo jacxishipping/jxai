@@ -171,11 +171,25 @@ bool PilotIOEngine::read_at_offset(uint64_t offset, uint8_t* dst, size_t size, u
     total_io_ops_++;
     return bytes_read == size;
 #else
-    ssize_t r = ::pread(drive.fd, dst, size, static_cast<off_t>(offset));
-    if (r < 0) return false;
-    total_bytes_streamed_ += static_cast<uint64_t>(r);
+    // pread() may return short at EOF and may be interrupted (EINTR); loop
+    // until the full request is satisfied or a real failure/EOF occurs.
+    // A short read must never be reported as success: the caller sizes its
+    // buffers to the full slice, so a partial fill would be zero-filled
+    // weights passed off as valid data.
+    size_t done = 0;
+    while (done < size) {
+        ssize_t r = ::pread(drive.fd, dst + done, size - done,
+                            static_cast<off_t>(offset + done));
+        if (r < 0) {
+            if (errno == EINTR) continue;
+            return false;
+        }
+        if (r == 0) return false;  // EOF before the full slice was read
+        total_bytes_streamed_ += static_cast<uint64_t>(r);
+        done += static_cast<size_t>(r);
+    }
     total_io_ops_++;
-    return static_cast<size_t>(r) == size;
+    return true;
 #endif
 }
 
@@ -193,9 +207,11 @@ StreamedExpertWeights PilotIOEngine::read_expert_sync(
     out.down.resize(static_cast<size_t>(slice.down_bytes));
 
     uint32_t hint = layer * 257u + expert;
-    if (slice.gate_bytes > 0) read_at_offset(slice.gate_offset, out.gate.data(), out.gate.size(), hint);
-    if (slice.up_bytes > 0)   read_at_offset(slice.up_offset,   out.up.data(),   out.up.size(),   hint + 1);
-    if (slice.down_bytes > 0) read_at_offset(slice.down_offset, out.down.data(), out.down.size(), hint + 2);
+    bool ok = true;
+    if (slice.gate_bytes > 0) ok &= read_at_offset(slice.gate_offset, out.gate.data(), out.gate.size(), hint);
+    if (slice.up_bytes > 0)   ok &= read_at_offset(slice.up_offset,   out.up.data(),   out.up.size(),   hint + 1);
+    if (slice.down_bytes > 0) ok &= read_at_offset(slice.down_offset, out.down.data(), out.down.size(), hint + 2);
+    out.ok = ok;
 
     out.io_ms = now_ms() - t0;
     return out;

@@ -28,6 +28,11 @@ struct StreamedExpertWeights {
     std::vector<uint8_t> up;
     std::vector<uint8_t> down;
     double io_ms = 0.0;
+    // True only when every requested byte was actually read. A short or
+    // failed read leaves the vectors partially zero-filled, so callers must
+    // check ok before using the weights (never admit a failed read to the
+    // cache as if it were valid data).
+    bool ok = false;
 };
 
 struct DriveStripeInfo {

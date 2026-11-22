@@ -7,6 +7,13 @@
 
 namespace moe {
 
+// Checked version of tensor_byte_size() (common.h): returns false instead
+// of wrapping on overflow, and false for a type with a zero block size or
+// element size. The GGUF/SafeTensors parsers and the transformer layer all
+// validate tensor byte sizes through this one function, so a corrupt header
+// cannot make any of them compute a wrapped size. Defined in gguf.cpp.
+bool checked_tensor_bytes(GGMLType type, uint64_t num_elements, uint64_t& out_bytes);
+
 // GGUF v3 Metadata Value Types
 enum class GGUFValueType : uint32_t {
     UINT8   = 0,
@@ -118,7 +125,10 @@ public:
     // "qkv_proj" weights, MoE experts). The original names are still stored
     // and listed by tensor_names().
     const std::vector<std::string>& safetensors_untranslated() const { return st_untranslated_; }
-    // SafeTensors dtypes with no GGMLType mapping (left as F32, see gguf.cpp).
+    // SafeTensors dtypes with no GGMLType mapping. Since workstream C an
+    // unknown dtype FAILS the parse (see parse_safetensors_shard) instead
+    // of being silently treated as F32, so this is always empty for files
+    // loaded after that change; kept for API compatibility.
     const std::vector<std::string>& safetensors_unknown_dtypes() const { return st_unknown_dtypes_; }
     // True when this file is one shard of a multi-file SafeTensors model
     // (model-0000N-of-0000M.safetensors): all shards were loaded, so

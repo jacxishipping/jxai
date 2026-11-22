@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Image as ImageIcon, Sparkles, Maximize2, X, ZoomIn, ZoomOut, Loader2, Download, Info } from 'lucide-react';
 import { ImageResult } from '../types';
 import { Translations } from '../utils/i18n';
@@ -16,6 +16,7 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
   const [guidance, setGuidance] = useState(7.5);
   const [seed, setSeed] = useState(42);
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<ImageResult | null>(null);
   const [lightboxImage, setLightboxImage] = useState<string | null>(null);
   const [zoomLevel, setZoomLevel] = useState(1);
@@ -32,6 +33,7 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
 
   const handleGenerate = async () => {
     setIsLoading(true);
+    setError(null);
     try {
       const res = await apiFetch('/v1/images/generations', {
         method: 'POST',
@@ -48,13 +50,32 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
       if (res.ok) {
         const data = await res.json();
         setResult(data);
+      } else {
+        let detail = `Server returned ${res.status}.`;
+        try {
+          const errBody = await res.json();
+          if (errBody?.message) detail = errBody.message;
+        } catch {
+          // keep the status fallback
+        }
+        setError(detail);
       }
     } catch (e) {
-      console.error(e);
+      setError(e instanceof Error ? e.message : 'Request failed — is the engine running?');
     } finally {
       setIsLoading(false);
     }
   };
+
+  // Close the lightbox with Escape.
+  useEffect(() => {
+    if (!lightboxImage) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') setLightboxImage(null);
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [lightboxImage]);
 
   const handleExportPng = (dataUri: string) => {
     const img = new Image();
@@ -81,24 +102,29 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
   };
 
   return (
-    <div className="flex h-full w-full bg-[#080b13] overflow-hidden">
+    <div className="flex h-full w-full bg-[#080b13] overflow-hidden flex-col lg:flex-row">
       {/* Settings Sidebar */}
-      <div className="w-80 h-full border-r border-slate-800/80 bg-slate-900/40 p-6 flex flex-col space-y-5 overflow-y-auto">
+      <div className="w-full lg:w-80 h-full border-r border-slate-800/80 bg-slate-900/40 p-6 flex flex-col space-y-5 overflow-y-auto shrink-0">
         <div className="flex items-center space-x-2.5">
           <div className="p-2 rounded-xl bg-pink-950/60 border border-pink-800/40 text-pink-400">
             <ImageIcon className="w-5 h-5" />
           </div>
           <div>
-            <h2 className="text-sm font-bold text-slate-100">{t.imageTitle}</h2>
-            <p className="text-[11px] text-slate-400 font-mono">Denoising Conditioned by MoE Logits</p>
+            {/* Not image generation: the engine renders a 16x16 latent SVG
+                grid conditioned by a transformer forward pass. The i18n
+                keys imageTitle / generateImage / denoisingLatents still say
+                "image" / "synthesis" — they are intentionally not used here. */}
+            <h2 className="text-sm font-bold text-slate-100">Latent Visualisation</h2>
+            <p className="text-[11px] text-slate-400 font-mono">SVG grid conditioned by MoE logits — not a generated image</p>
           </div>
         </div>
 
         <div>
-          <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
+          <label htmlFor="jxai-visual-prompt" className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono">
             {t.prompt}
           </label>
           <textarea
+            id="jxai-visual-prompt"
             rows={3}
             value={prompt}
             onChange={e => setPrompt(e.target.value)}
@@ -117,6 +143,8 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
               {resolutionPresets.map(preset => (
                 <button
                   key={preset.label}
+                  aria-pressed={width === preset.w && height === preset.h}
+                  aria-label={`Resolution ${preset.label}`}
                   onClick={() => {
                     setWidth(preset.w);
                     setHeight(preset.h);
@@ -143,6 +171,7 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
             </div>
             <input
               type="range"
+              aria-label="Visualisation steps"
               min={4}
               max={32}
               step={1}
@@ -159,6 +188,7 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
             </div>
             <input
               type="range"
+              aria-label="Guidance scale"
               min={1.0}
               max={15.0}
               step={0.5}
@@ -175,6 +205,7 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
             </div>
             <input
               type="number"
+              aria-label="Seed"
               value={seed}
               onChange={e => setSeed(Number(e.target.value))}
               className="w-full bg-slate-950/80 border border-slate-700/80 rounded-xl px-3 py-1.5 text-xs font-mono text-slate-100"
@@ -185,20 +216,25 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
         <button
           onClick={handleGenerate}
           disabled={isLoading || !prompt.trim()}
-          className="w-full py-3 rounded-xl bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white font-medium text-sm transition-all duration-200 disabled:opacity-50 flex items-center justify-center space-x-2 shadow-lg shadow-pink-600/20 cursor-pointer"
+          className="w-full py-3 rounded-xl bg-gradient-to-r from-pink-600 to-purple-600 hover:from-pink-500 hover:to-purple-500 text-white font-medium text-sm transition-all duration-200 disabled:opacity-50 flex items-center justify-center space-x-2 shadow-lg shadow-pink-600/20 cursor-pointer focus:outline-none focus-visible:ring-2 focus-visible:ring-pink-400"
         >
           {isLoading ? (
             <>
               <Loader2 className="w-4 h-4 animate-spin" />
-              <span>{t.denoisingLatents}</span>
+              <span>Rendering visualisation…</span>
             </>
           ) : (
             <>
               <Sparkles className="w-4 h-4" />
-              <span>{t.generateImage}</span>
+              <span>Render Visualisation</span>
             </>
           )}
         </button>
+        {error && (
+          <div role="alert" className="rounded-xl border border-red-500/40 bg-red-950/40 px-3.5 py-2.5 text-xs text-red-300">
+            Visualisation failed: {error}
+          </div>
+        )}
       </div>
 
       {/* Main Canvas & Progressive Step Previews */}
@@ -209,13 +245,14 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
             <div className="relative group rounded-2xl overflow-hidden border border-slate-800 shadow-2xl bg-slate-950">
               <img
                 src={result.data[0].url}
-                alt="Generated synthesis"
-                className="w-[480px] h-[480px] object-cover"
+                alt="Latent visualisation (SVG grid) for the given prompt"
+                className="w-full max-w-[480px] aspect-square h-auto object-cover"
               />
               <div className="absolute top-4 right-4 flex items-center space-x-2 opacity-0 group-hover:opacity-100 transition-opacity">
                 <button
                   onClick={() => handleExportPng(result.data[0].url)}
-                  className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-700 text-white hover:bg-slate-900 transition-colors shadow-lg"
+                  aria-label={t.exportPng}
+                  className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-700 text-white hover:bg-slate-900 transition-colors shadow-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-pink-400"
                   title={t.exportPng}
                 >
                   <Download className="w-4 h-4" />
@@ -225,7 +262,8 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
                     setLightboxImage(result.data[0].url);
                     setZoomLevel(1);
                   }}
-                  className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-700 text-white hover:bg-slate-900 transition-colors shadow-lg"
+                  aria-label="Open lightbox"
+                  className="p-2.5 rounded-xl bg-slate-950/80 border border-slate-700 text-white hover:bg-slate-900 transition-colors shadow-lg focus:outline-none focus-visible:ring-2 focus-visible:ring-pink-400"
                   title="Open Lightbox"
                 >
                   <Maximize2 className="w-4 h-4" />
@@ -233,10 +271,10 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
               </div>
             </div>
 
-            {/* Progressive Denoising Step Previews Timeline */}
+            {/* Latent preview steps — illustrative SVG grids, not a diffusion render */}
             <div className="w-full bg-slate-900/60 border border-slate-800/80 rounded-2xl p-5">
               <div className="text-xs font-bold text-slate-300 uppercase tracking-wider mb-3 font-mono flex items-center justify-between">
-                <span>Euler-Maruyama Progressive Denoising Preview</span>
+                <span>Latent Preview Steps (illustrative)</span>
                 <span className="text-pink-400 font-normal">Completed in {result.elapsed_ms.toFixed(1)} ms</span>
               </div>
               <div className="grid grid-cols-4 gap-4">
@@ -244,7 +282,7 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
                   <div key={idx} className="flex flex-col items-center space-y-1.5">
                     <img
                       src={prev.url}
-                      alt={`Step ${prev.step}`}
+                      alt={`Latent preview step ${prev.step}`}
                       className="w-full h-24 object-cover rounded-xl border border-slate-800"
                     />
                     <span className="text-[10px] font-mono text-slate-400">
@@ -258,8 +296,8 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
         ) : (
           <div className="flex flex-col items-center justify-center text-slate-500 space-y-3">
             <ImageIcon className="w-12 h-12 opacity-30" />
-            <p className="text-sm">No image synthesized yet.</p>
-            <p className="text-xs text-slate-600">Configure parameters on the left and click Generate.</p>
+            <p className="text-sm">No visualisation rendered yet.</p>
+            <p className="text-xs text-slate-600">Configure parameters on the left and click Render Visualisation.</p>
           </div>
         )}
       </div>
@@ -272,7 +310,8 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
             <div className="absolute top-4 right-4 flex items-center space-x-2 z-10">
               <button
                 onClick={() => setShowMetadata(prev => !prev)}
-                className={`p-2 rounded-lg border transition-colors ${
+                aria-label="Toggle metadata"
+                className={`p-2 rounded-lg border transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400 ${
                   showMetadata ? 'bg-indigo-600 border-indigo-500 text-white' : 'bg-slate-900/80 border-slate-700 text-slate-300 hover:bg-slate-800'
                 }`}
                 title="Toggle Metadata"
@@ -281,28 +320,32 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
               </button>
               <button
                 onClick={() => setZoomLevel(prev => Math.min(3, +(prev + 0.5).toFixed(1)))}
-                className="p-2 rounded-lg bg-slate-900/80 border border-slate-700 text-white hover:bg-slate-800"
+                aria-label={t.zoomIn}
+                className="p-2 rounded-lg bg-slate-900/80 border border-slate-700 text-white hover:bg-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
                 title={t.zoomIn}
               >
                 <ZoomIn className="w-4 h-4" />
               </button>
               <button
                 onClick={() => setZoomLevel(prev => Math.max(1, +(prev - 0.5).toFixed(1)))}
-                className="p-2 rounded-lg bg-slate-900/80 border border-slate-700 text-white hover:bg-slate-800"
+                aria-label={t.zoomOut}
+                className="p-2 rounded-lg bg-slate-900/80 border border-slate-700 text-white hover:bg-slate-800 focus:outline-none focus-visible:ring-2 focus-visible:ring-indigo-400"
                 title={t.zoomOut}
               >
                 <ZoomOut className="w-4 h-4" />
               </button>
               <button
                 onClick={() => handleExportPng(lightboxImage)}
-                className="p-2 rounded-lg bg-emerald-700/80 border border-emerald-600 text-white hover:bg-emerald-600"
+                aria-label={t.exportPng}
+                className="p-2 rounded-lg bg-emerald-700/80 border border-emerald-600 text-white hover:bg-emerald-600 focus:outline-none focus-visible:ring-2 focus-visible:ring-emerald-400"
                 title={t.exportPng}
               >
                 <Download className="w-4 h-4" />
               </button>
               <button
                 onClick={() => setLightboxImage(null)}
-                className="p-2 rounded-lg bg-slate-900/80 border border-slate-700 text-white hover:bg-red-900/80"
+                aria-label={t.close}
+                className="p-2 rounded-lg bg-slate-900/80 border border-slate-700 text-white hover:bg-red-900/80 focus:outline-none focus-visible:ring-2 focus-visible:ring-red-400"
                 title={t.close}
               >
                 <X className="w-4 h-4" />
@@ -312,7 +355,7 @@ export const ImageWorkspace: React.FC<ImageWorkspaceProps> = ({ t }) => {
             <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-950 p-2">
               <img
                 src={lightboxImage}
-                alt="Modal zoom"
+                alt="Latent visualisation, zoomed"
                 style={{ transform: `scale(${zoomLevel})`, transition: 'transform 0.2s ease-out' }}
                 className="max-h-[75vh] max-w-full object-contain cursor-grab"
               />

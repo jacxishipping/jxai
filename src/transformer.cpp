@@ -2,13 +2,119 @@
 #include <algorithm>
 #include <cctype>
 #include <cmath>
+#include <limits>
 #include <map>
 #include <memory>
 #include <numeric>
 #include <random>
+#include <stdexcept>
 #include <thread>
 
 namespace moe {
+
+// ---- Workstream C: validation + concurrency model -----------------------
+// Concurrency model (documented in docs/SUPPORT_MATRIX.md):
+//  * engine_mtx_ (a plain std::mutex, NOT recursive) serializes every
+//    forward_token() — the only function that mutates slot KV state and
+//    the expert tier manager. get_or_create_slot() must only be called
+//    with engine_mtx_ held; every internal caller does.
+//  * generate_stream() / verify_speculative_batch() hold the lock only
+//    around slot-state accesses, so two generations on DIFFERENT slots
+//    interleave safely (each forward is atomic), but two generations on
+//    the SAME slot must not run concurrently — the caller (HTTP server)
+//    serializes per slot. Slot state is never shared between slots.
+//  * Slot ids are bounded (below): a client must not be able to force
+//    unbounded KV allocation by naming arbitrary slot ids. Internal
+//    scratch slots 9998 (embeddings) / 9999 (SystemOne) are exempt.
+//    NOTE (server seam): server.cpp currently validates cache_slot as an
+//    integer in [0, 4096] — wider than this cap. The server must be
+//    tightened to [0, 63] (workstream B); until then a request for slot
+//    64..4096 is rejected here with empty logits / no tokens.
+constexpr uint32_t kMaxUserSlot = 63;
+constexpr uint32_t kScratchSlotEmbeddings = 9998;
+constexpr uint32_t kScratchSlotSystemOne = 9999;
+constexpr uint32_t kScratchSlotDiffusion = 8888; // diffusion.cpp:115 image path (fixed internal id, not user-reachable: the server caps cache_slot at 4096)
+constexpr uint32_t kMaxNewTokens = 16384;
+constexpr uint32_t kMaxDraftTokens = 64;
+
+bool is_valid_slot_id(uint32_t slot_id) {
+    return slot_id <= kMaxUserSlot || slot_id == kScratchSlotEmbeddings ||
+           slot_id == kScratchSlotSystemOne || slot_id == kScratchSlotDiffusion;
+}
+
+// Validate one bound tensor structurally: data present, dimensions sane,
+// byte size exactly what its dtype+shape require. `expected_numel == 0`
+// means "any element count, just check internal consistency"; otherwise
+// the element count must match exactly (used for biases/norms whose
+// length the forward pass trusts without re-checking). A tensor that
+// fails this check must never reach a matmul: the matmul kernels do not
+// null-check or bounds-check their weight pointers.
+bool validate_bound_tensor(const TensorDescriptor* td, const char* name,
+                           uint64_t expected_numel, std::string& err_msg) {
+    if (!td) return true; // optional tensor: absent is fine
+    if (!td->mapped_ptr) {
+        err_msg = std::string("tensor '") + name + "' has no data pointer (truncated file?)";
+        return false;
+    }
+    if (td->n_dims == 0 || td->n_dims > 4) {
+        err_msg = std::string("tensor '") + name + "' has an invalid dimension count " +
+                  std::to_string(td->n_dims);
+        return false;
+    }
+    uint64_t numel = 1;
+    for (uint32_t d = 0; d < td->n_dims; ++d) {
+        if (td->dims[d] == 0) {
+            err_msg = std::string("tensor '") + name + "' has a zero dimension";
+            return false;
+        }
+        if (numel > UINT64_MAX / td->dims[d]) {
+            err_msg = std::string("tensor '") + name + "' dimensions overflow";
+            return false;
+        }
+        numel *= td->dims[d];
+    }
+    if (expected_numel != 0 && numel != expected_numel) {
+        err_msg = std::string("tensor '") + name + "' has " + std::to_string(numel) +
+                  " elements, expected " + std::to_string(expected_numel);
+        return false;
+    }
+    uint64_t expected_bytes = 0;
+    if (!checked_tensor_bytes(td->type, numel, expected_bytes)) {
+        err_msg = std::string("tensor '") + name + "' byte size overflows for dtype " +
+                  ggml_type_name(td->type);
+        return false;
+    }
+    if (expected_bytes != td->byte_size) {
+        err_msg = std::string("tensor '") + name + "' byte size mismatch: file says " +
+                  std::to_string(td->byte_size) + " bytes but dtype " +
+                  ggml_type_name(td->type) + " x " + std::to_string(numel) +
+                  " elements needs " + std::to_string(expected_bytes);
+        return false;
+    }
+    return true;
+}
+
+// Validate sampler parameters. Returns false + a human-readable reason on
+// the first invalid value. This is the authoritative check, called by the
+// public entry points (generate_stream, verify_speculative_batch); the
+// HTTP server MUST also validate (server.cpp is workstream B's file) so a
+// bad request is rejected with a 400 before it reaches the engine.
+bool validate_sampler_config(const SamplerConfig& cfg, std::string& err_msg) {
+    if (std::isnan(cfg.temperature) || std::isinf(cfg.temperature) || cfg.temperature < 0.0f) {
+        err_msg = "temperature must be a finite value >= 0 (0 = greedy)";
+        return false;
+    }
+    if (std::isnan(cfg.top_p) || cfg.top_p < 0.0f || cfg.top_p > 1.0f) {
+        err_msg = "top_p must be in [0, 1]";
+        return false;
+    }
+    if (std::isnan(cfg.repetition_penalty) || std::isinf(cfg.repetition_penalty) ||
+        cfg.repetition_penalty <= 0.0f) {
+        err_msg = "repetition_penalty must be finite and > 0 (1.0 = disabled)";
+        return false;
+    }
+    return true;
+}
 
 void KVCacheSlot::init(uint32_t id, const ModelHyperparams& hp) {
     slot_id = id;
@@ -17,6 +123,17 @@ void KVCacheSlot::init(uint32_t id, const ModelHyperparams& hp) {
     token_history.clear();
     size_t kv_dim = static_cast<size_t>(hp.kv_dim);
     uint32_t alloc_seq = std::max(1u, hp.kv_cache_capacity);
+    // Checked allocation: kv_dim/capacity come from model metadata via
+    // bind_tensors() (validated + RAM-guarded there), but init() must not
+    // trust them blindly — a wrapped size_t here used to allocate a
+    // too-small cache that forward_token would then write past.
+    if (kv_dim == 0 || hp.n_layers == 0 ||
+        alloc_seq > (SIZE_MAX / 2) / std::max<size_t>(kv_dim, 1)) {
+        throw std::runtime_error("KVCacheSlot::init: unreasonable KV dimensions (kv_dim=" +
+                                 std::to_string(kv_dim) + ", capacity=" +
+                                 std::to_string(alloc_seq) + ", layers=" +
+                                 std::to_string(hp.n_layers) + ")");
+    }
     size_t cap = static_cast<size_t>(alloc_seq) * kv_dim;
     k_cache.assign(hp.n_layers, std::vector<uint16_t>(cap, 0));
     v_cache.assign(hp.n_layers, std::vector<uint16_t>(cap, 0));
@@ -40,7 +157,17 @@ void KVCacheSlot::rollback(uint32_t new_seq_pos) {
 
 void KVCacheSlot::compact(const ModelHyperparams& hp, uint32_t keep_recent) {
     const uint32_t sink_tokens = 4;
+    // Clamp keep_recent to what actually exists: a caller passing
+    // max_seq_len/2 while the cache capacity is much smaller (RAM-guarded
+    // models) used to make `seq_pos - keep_recent` underflow to a huge
+    // uint32, and the memmove below then read/wrote far out of bounds.
+    // (generate_stream used to pass hp_.max_seq_len / 2; it now passes
+    // kv_cache_capacity / 2, and this clamp is the backstop.)
+    if (seq_pos > sink_tokens && keep_recent > seq_pos - sink_tokens) {
+        keep_recent = seq_pos - sink_tokens;
+    }
     if (seq_pos <= sink_tokens + keep_recent) return;
+    if (k_cache.size() < hp.n_layers || v_cache.size() < hp.n_layers) return;
 
     uint32_t new_len = sink_tokens + keep_recent;
     uint32_t src_start = seq_pos - keep_recent;
@@ -59,8 +186,16 @@ void KVCacheSlot::compact(const ModelHyperparams& hp, uint32_t keep_recent) {
         );
     }
     seq_pos = new_len;
+    // Keep token_history consistent with the KV window: the old code kept
+    // the FIRST new_len tokens (resize), while the KV cache kept the sink
+    // + the most RECENT tokens — so history and cache disagreed after a
+    // compaction (repetition penalty scored dropped tokens; the LCP
+    // prefix-reuse check could match tokens no longer cached).
     if (token_history.size() > new_len) {
-        token_history.resize(new_len);
+        size_t hist_src = token_history.size() - keep_recent;
+        if (hist_src < sink_tokens) hist_src = sink_tokens;
+        token_history.erase(token_history.begin() + sink_tokens,
+                            token_history.begin() + hist_src);
     }
     compactions++;
 }
@@ -1953,9 +2088,46 @@ bool MoETransformerEngine::load_model(const std::string& path, std::string& err_
 }
 
 bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
+    // --- Workstream C: architecture validation ---
+    // A missing general.architecture used to silently default to
+    // "qwen2moe" and load whatever tensors happened to be present, so a
+    // mislabeled or non-transformer file produced plausible-looking
+    // garbage instead of an error.
+    if (model_file_.metadata().find("general.architecture") == model_file_.metadata().end()) {
+        err_msg = "Model metadata is missing general.architecture — cannot determine the architecture (refusing to guess)";
+        return false;
+    }
     hp_.arch = model_file_.get_str("general.architecture", "qwen2moe");
     hp_.model_name = model_file_.get_str("general.name", "MoE-Stream-Model");
     const std::string pfx = hp_.arch;
+
+    if (!arch_is_known(hp_.arch)) {
+        err_msg = "Unsupported architecture '" + hp_.arch + "' — this engine only runs decoder "
+                  "transformers (see docs/SUPPORT_MATRIX.md for the tested list)";
+        return false;
+    }
+    // Known GGUF archs this decoder-only engine cannot run: mamba is a
+    // state-space model (no attention), bert/nomic-bert are encoders (no
+    // causal LM head). Loading one used to "succeed" and generate noise.
+    if (hp_.arch == "mamba" || hp_.arch == "bert" || hp_.arch == "nomic-bert") {
+        err_msg = "Architecture '" + hp_.arch + "' is not a causal decoder transformer — "
+                  "this engine cannot run it (see docs/SUPPORT_MATRIX.md)";
+        return false;
+    }
+    // Known but never chat-verified against a real model in this engine:
+    // load, but say so loudly. (Verified: qwen2, llama, qwen3, gemma3,
+    // phi3, mistral. True deepseek/deepseek2 arch is UNVERIFIED —
+    // DeepSeek-LLM-7B reports arch "llama" and runs as Llama.)
+    {
+        static const char* kVerified[] = {"qwen2", "qwen2moe", "llama", "qwen3", "gemma3", "phi3", "mistral"};
+        bool verified = false;
+        for (const char* v : kVerified) if (hp_.arch == v) { verified = true; break; }
+        if (!verified) {
+            std::cerr << "[BIND] WARNING: architecture '" << hp_.arch << "' is known but "
+                      << "UNVERIFIED in this engine — output correctness has not been "
+                      << "checked against a real model of this arch (see docs/SUPPORT_MATRIX.md).\n";
+        }
+    }
 
     hp_.vocab_size     = tokenizer_.vocab_size();
     hp_.dim            = model_file_.get_u32(pfx + ".embedding_length", model_file_.get_u32("llama.embedding_length", 128));
@@ -1991,6 +2163,33 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
     }
     hp_.rope_neox = arch_uses_neox_rope(hp_.arch);
 
+    // --- Workstream C: hyperparameter range validation ---
+    // Metadata values come from the file (or from silent defaults above);
+    // an out-of-range value used to flow into layers_.resize(),
+    // KVCacheSlot::init(), or the KV-capacity estimate and either throw
+    // bad_alloc or silently allocate a wrong-sized cache. Reject before
+    // anything is allocated. Bounds are generous (far above any real
+    // model) — they only catch corrupt/ hostile metadata.
+    {
+        auto bad = [&](const char* what, const std::string& detail) {
+            err_msg = std::string("Invalid hyperparameter ") + what + ": " + detail;
+            return false;
+        };
+        if (hp_.dim == 0 || hp_.dim > 65536) return bad("embedding_length", std::to_string(hp_.dim));
+        if (hp_.hidden_dim == 0 || hp_.hidden_dim > (1u << 20)) return bad("feed_forward_length", std::to_string(hp_.hidden_dim));
+        if (hp_.moe_expert_dim == 0 || hp_.moe_expert_dim > (1u << 20)) return bad("expert_feed_forward_length", std::to_string(hp_.moe_expert_dim));
+        if (hp_.n_layers == 0 || hp_.n_layers > 512) return bad("block_count", std::to_string(hp_.n_layers));
+        if (hp_.n_heads == 0 || hp_.n_heads > 256) return bad("attention.head_count", std::to_string(hp_.n_heads));
+        if (hp_.n_kv_heads == 0 || hp_.n_kv_heads > hp_.n_heads) return bad("attention.head_count_kv", std::to_string(hp_.n_kv_heads) + " (must be 1.." + std::to_string(hp_.n_heads) + ")");
+        if (hp_.n_experts == 0 || hp_.n_experts > 1024) return bad("expert_count", std::to_string(hp_.n_experts));
+        if (hp_.n_experts_used == 0 || hp_.n_experts_used > hp_.n_experts) return bad("expert_used_count", std::to_string(hp_.n_experts_used) + " (must be 1.." + std::to_string(hp_.n_experts) + ")");
+        if (hp_.max_seq_len == 0 || hp_.max_seq_len > (1u << 20)) return bad("context_length", std::to_string(hp_.max_seq_len));
+        if (!(hp_.rms_norm_eps > 0.0f) || !std::isfinite(hp_.rms_norm_eps)) return bad("attention.layer_norm_rms_epsilon", "must be finite and > 0");
+        if (!(hp_.rope_freq_base > 0.0f) || !std::isfinite(hp_.rope_freq_base)) return bad("rope.freq_base", "must be finite and > 0");
+        if (!std::isfinite(hp_.final_logit_softcapping) || !std::isfinite(hp_.attn_logit_softcapping)) return bad("logit softcapping", "must be finite");
+        if (hp_.ple_dim > 65536) return bad("embedding_length_per_layer_input", std::to_string(hp_.ple_dim));
+    }
+
     bool is_gemma_family = (hp_.arch == "gemma" || hp_.arch == "gemma2" || hp_.arch == "gemma3" || hp_.arch == "gemma4");
     hp_.use_gelu = is_gemma_family;
     hp_.scale_embeddings = is_gemma_family;
@@ -2006,6 +2205,38 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
     if (tok_emb_->n_dims >= 2) {
         hp_.dim = static_cast<uint32_t>(tok_emb_->dims[0]);
         hp_.vocab_size = static_cast<uint32_t>(tok_emb_->dims[1]);
+    }
+    if (!validate_bound_tensor(tok_emb_, "token_embd.weight", 0, err_msg)) return false;
+    if (tok_emb_->n_dims != 2 || tok_emb_->dims[0] == 0 || tok_emb_->dims[1] == 0) {
+        err_msg = "token_embd.weight must be a 2D tensor [dim, vocab]";
+        return false;
+    }
+    // Re-check dim AFTER the embedding override: the metadata value was
+    // validated above, but the embedding dims win and a huge dim here
+    // would truncate in the uint32 cast and mis-size every activation.
+    if (tok_emb_->dims[0] > 65536 || tok_emb_->dims[1] > (1u << 20)) {
+        err_msg = "token_embd.weight dims out of range: [" + std::to_string(tok_emb_->dims[0]) +
+                  ", " + std::to_string(tok_emb_->dims[1]) + "]";
+        return false;
+    }
+    // The embedding table defines the valid token-id range. A tokenizer
+    // larger than the table used to let encode() produce ids that read
+    // past the embedding (forward_token guarded with token_id <
+    // vocab_size and silently produced a zero embedding instead).
+    if (hp_.vocab_size == 0 || hp_.vocab_size > (1u << 20)) {
+        err_msg = "Invalid vocabulary size " + std::to_string(hp_.vocab_size);
+        return false;
+    }
+    if (tokenizer_.vocab_size() > hp_.vocab_size) {
+        err_msg = "Tokenizer vocabulary (" + std::to_string(tokenizer_.vocab_size()) +
+                  ") is larger than the embedding table (" + std::to_string(hp_.vocab_size) +
+                  " rows) — token ids from the tokenizer would read past the embedding";
+        return false;
+    }
+    if (tokenizer_.vocab_size() < hp_.vocab_size) {
+        std::cerr << "[BIND] WARNING: tokenizer vocabulary (" << tokenizer_.vocab_size()
+                  << ") is smaller than the embedding table (" << hp_.vocab_size
+                  << " rows) — the extra rows are unreachable.\n";
     }
     hp_.head_dim = model_file_.get_u32(
         pfx + ".attention.key_length",
@@ -2024,16 +2255,37 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
             hp_.kv_dim = static_cast<uint32_t>(wk0->dims[1]);
         }
     }
+    // q_dim/kv_dim must split evenly across heads: head_dim is recomputed
+    // by integer division, so a non-divisible q_dim used to silently
+    // truncate and the attention loop then read stale values from a
+    // previous layer's buffer (in-bounds of the buffer, wrong output).
+    if (hp_.q_dim % hp_.n_heads != 0 || hp_.kv_dim % hp_.n_kv_heads != 0) {
+        err_msg = "Attention dims do not split evenly across heads: q_dim=" +
+                  std::to_string(hp_.q_dim) + " / n_heads=" + std::to_string(hp_.n_heads) +
+                  ", kv_dim=" + std::to_string(hp_.kv_dim) + " / n_kv_heads=" +
+                  std::to_string(hp_.n_kv_heads);
+        return false;
+    }
     hp_.rope_dim = model_file_.get_u32(pfx + ".rope.dimension_count", hp_.head_dim);
 
     // KV cache capacity: up to min(max_seq_len, 32768), but never let the
     // FP16 K+V cache (n_layers * capacity * kv_dim * 2 arrays * 2 bytes)
     // exceed 25% of available RAM. Halve until it fits (floor 256 tokens).
+    // (n_layers/kv_dim are range-validated above, so the estimate below
+    // cannot overflow uint64.)
     {
         uint32_t cap = std::min<uint32_t>(hp_.max_seq_len, 32768);
         if (cap == 0) cap = 2048;
         uint64_t avail = hw_.avail_ram_bytes;
-        if (avail > 0 && hp_.n_layers > 0 && hp_.kv_dim > 0) {
+        if (avail == 0) {
+            // query_hardware_specs() could not determine RAM: assume a
+            // conservative 2 GiB instead of skipping the guard entirely
+            // (the old code allocated the full 32768-token cache, which
+            // is ~10 GB for an 80-layer kv_dim-1024 model).
+            std::cerr << "[BIND] WARNING: available RAM unknown — assuming 2 GiB for the KV-cache budget.\n";
+            avail = 2ull << 30;
+        }
+        if (hp_.n_layers > 0 && hp_.kv_dim > 0) {
             uint64_t budget = avail / 4;
             while (cap > 256) {
                 uint64_t est = static_cast<uint64_t>(hp_.n_layers) * cap *
@@ -2048,10 +2300,33 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
     out_norm_ = model_file_.find_tensor("output_norm.weight");
     lm_head_  = model_file_.find_tensor("output.weight");
     if (!lm_head_) lm_head_ = tok_emb_; // weight-tied fallback
+    // Output norm / LM head: the LM-head matmul trusts vocab_size x dim.
+    if (!validate_bound_tensor(out_norm_, "output_norm.weight", hp_.dim, err_msg)) return false;
+    if (out_norm_ && out_norm_->type != GGMLType::F32) {
+        std::cerr << "[BIND] WARNING: output_norm.weight is " << ggml_type_name(out_norm_->type)
+                  << ", not F32 — forward ignores non-F32 norms.\n";
+    }
+    if (lm_head_ && lm_head_ != tok_emb_) {
+        if (!validate_bound_tensor(lm_head_, "output.weight", 0, err_msg)) return false;
+        if (lm_head_->n_dims != 2 || lm_head_->dims[0] != hp_.dim ||
+            lm_head_->dims[1] != hp_.vocab_size) {
+            err_msg = "output.weight must be [dim, vocab]";
+            return false;
+        }
+    }
     per_layer_tok_emb_    = model_file_.find_tensor("per_layer_token_embd.weight");
     per_layer_model_proj_ = model_file_.find_tensor("per_layer_model_proj.weight");
     per_layer_proj_norm_  = model_file_.find_tensor("per_layer_proj_norm.weight");
     rope_freqs_           = model_file_.find_tensor("rope_freqs.weight");
+    // Gemma4 per-layer-embedding tensors: byte consistency always; the
+    // proj-norm length only matters when PLE is configured (ple_dim > 0 —
+    // when it is 0 the expected count is 0, i.e. "any").
+    if (!validate_bound_tensor(per_layer_tok_emb_, "per_layer_token_embd.weight", 0, err_msg) ||
+        !validate_bound_tensor(per_layer_model_proj_, "per_layer_model_proj.weight", 0, err_msg) ||
+        !validate_bound_tensor(per_layer_proj_norm_, "per_layer_proj_norm.weight", hp_.ple_dim, err_msg) ||
+        !validate_bound_tensor(rope_freqs_, "rope_freqs.weight", 0, err_msg)) {
+        return false;
+    }
 
     std::vector<int32_t> swa_pattern;
     auto swa_it = model_file_.metadata().find(pfx + ".attention.sliding_window_pattern");
@@ -2068,6 +2343,10 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
 
     uint32_t last_swa_kv_layer = 0;
     uint32_t last_full_kv_layer = 0;
+    // Workstream C: MoE layers must agree on the expert count (dense
+    // layers in a mixed model, e.g. DeepSeek's first layer, do not affect
+    // this — only MoE layers are tracked).
+    uint32_t moe_experts_seen = 0;
     const uint32_t first_shared_kv = (hp_.shared_kv_layers > 0 && hp_.n_layers > hp_.shared_kv_layers)
                                    ? (hp_.n_layers - hp_.shared_kv_layers) : hp_.n_layers;
 
@@ -2126,6 +2405,78 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
         lw.rope_dim = (lw.is_swa && hp_.rope_dim_swa > 0) ? hp_.rope_dim_swa
                     : std::min(lw.head_dim, hp_.rope_dim > 0 ? hp_.rope_dim : lw.head_dim);
 
+        // --- Workstream C: per-layer attention/norm/bias validation ---
+        // A missing attention weight used to reach matmul_quant_f32 as a
+        // null pointer (the kernels do not null-check) — a segfault. A
+        // short/wrong-sized bias used to be read out of bounds by the
+        // bias-add loops in forward_token. Non-F32 norms/biases are
+        // silently IGNORED by forward (it only applies F32 weights), so
+        // warn: an all-BF16 SafeTensors model runs with identity norms.
+        if (!lw.wq || !lw.wk || !lw.wv || !lw.wo) {
+            err_msg = "Layer " + std::to_string(l) + ": missing attention weight tensor(s):" +
+                      (!lw.wq ? " attn_q" : "") + (!lw.wk ? " attn_k" : "") +
+                      (!lw.wv ? " attn_v" : "") + (!lw.wo ? " attn_output" : "");
+            return false;
+        }
+        if (!validate_bound_tensor(lw.wq, "attn_q.weight", 0, err_msg) ||
+            !validate_bound_tensor(lw.wk, "attn_k.weight", 0, err_msg) ||
+            !validate_bound_tensor(lw.wv, "attn_v.weight", 0, err_msg) ||
+            !validate_bound_tensor(lw.wo, "attn_output.weight", 0, err_msg)) {
+            err_msg = "Layer " + std::to_string(l) + ": " + err_msg;
+            return false;
+        }
+        if (lw.q_dim % hp_.n_heads != 0 || lw.kv_dim % hp_.n_kv_heads != 0) {
+            err_msg = "Layer " + std::to_string(l) + ": q_dim/kv_dim do not split evenly across heads";
+            return false;
+        }
+        if (lw.wq->n_dims != 2 || lw.wq->dims[0] != hp_.dim || lw.wq->dims[1] != lw.q_dim ||
+            lw.wk->n_dims != 2 || lw.wk->dims[0] != hp_.dim || lw.wk->dims[1] != lw.kv_dim ||
+            lw.wv->n_dims != 2 || lw.wv->dims[0] != hp_.dim || lw.wv->dims[1] != lw.kv_dim ||
+            lw.wo->n_dims != 2 || lw.wo->dims[0] != lw.q_dim || lw.wo->dims[1] != hp_.dim) {
+            err_msg = "Layer " + std::to_string(l) + ": attention weight shapes do not match dim/q_dim/kv_dim";
+            return false;
+        }
+        // Biases: the forward bias-add loops trust the length, so require
+        // the exact element count (any shape with the right numel is OK).
+        if (!validate_bound_tensor(lw.bq, "attn_q.bias", lw.q_dim, err_msg) ||
+            !validate_bound_tensor(lw.bk, "attn_k.bias", lw.kv_dim, err_msg) ||
+            !validate_bound_tensor(lw.bv, "attn_v.bias", lw.kv_dim, err_msg) ||
+            !validate_bound_tensor(lw.bo, "attn_output.bias", hp_.dim, err_msg)) {
+            err_msg = "Layer " + std::to_string(l) + ": " + err_msg;
+            return false;
+        }
+        // Norms: exact length; warn when not F32 (ignored by forward).
+        if (!validate_bound_tensor(lw.attn_norm, "attn_norm.weight", hp_.dim, err_msg) ||
+            !validate_bound_tensor(lw.ffn_norm, "ffn_norm.weight", hp_.dim, err_msg) ||
+            !validate_bound_tensor(lw.post_attn_norm, "post_attention_norm.weight", hp_.dim, err_msg) ||
+            !validate_bound_tensor(lw.post_ffw_norm, "post_ffw_norm.weight", hp_.dim, err_msg) ||
+            !validate_bound_tensor(lw.post_norm, "post_norm.weight", hp_.dim, err_msg) ||
+            !validate_bound_tensor(lw.attn_q_norm, "attn_q_norm.weight", lw.head_dim, err_msg) ||
+            !validate_bound_tensor(lw.attn_k_norm, "attn_k_norm.weight", lw.head_dim, err_msg)) {
+            err_msg = "Layer " + std::to_string(l) + ": " + err_msg;
+            return false;
+        }
+        {
+            auto warn_non_f32 = [&](const TensorDescriptor* td, const char* name) {
+                if (td && td->type != GGMLType::F32) {
+                    std::cerr << "[BIND] WARNING: layer " << l << " " << name << " is "
+                              << ggml_type_name(td->type) << ", not F32 — forward ignores "
+                              << "non-F32 norms/biases, so this weight has no effect.\n";
+                }
+            };
+            warn_non_f32(lw.attn_norm, "attn_norm.weight");
+            warn_non_f32(lw.ffn_norm, "ffn_norm.weight");
+            warn_non_f32(lw.post_attn_norm, "post_attention_norm.weight");
+            warn_non_f32(lw.post_ffw_norm, "post_ffw_norm.weight");
+            warn_non_f32(lw.post_norm, "post_norm.weight");
+            warn_non_f32(lw.attn_q_norm, "attn_q_norm.weight");
+            warn_non_f32(lw.attn_k_norm, "attn_k_norm.weight");
+            warn_non_f32(lw.bq, "attn_q.bias");
+            warn_non_f32(lw.bk, "attn_k.bias");
+            warn_non_f32(lw.bv, "attn_v.bias");
+            warn_non_f32(lw.bo, "attn_output.bias");
+        }
+
         if (l < first_shared_kv) {
             lw.shares_kv = false;
             lw.kv_source_layer = l;
@@ -2144,12 +2495,45 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
         lw.shexp_up       = model_file_.find_tensor(bp + "ffn_up_shexp.weight");
         lw.shexp_down     = model_file_.find_tensor(bp + "ffn_down_shexp.weight");
         lw.shexp_gate_inp = model_file_.find_tensor(bp + "ffn_gate_inp_shexp.weight");
+        // Shared experts are all-or-nothing: a partially present trio
+        // used to be silently skipped, leaving the layer without the
+        // shared expert every other layer has.
+        {
+            int shexp_present = (lw.shexp_gate ? 1 : 0) + (lw.shexp_up ? 1 : 0) +
+                                (lw.shexp_down ? 1 : 0);
+            if (shexp_present != 0 && shexp_present != 3) {
+                err_msg = "Layer " + std::to_string(l) + ": partial shared-expert tensors "
+                          "(ffn_gate/up/down_shexp must be all present or all absent)";
+                return false;
+            }
+        }
+        if (lw.shexp_gate) {
+            if (!validate_bound_tensor(lw.shexp_gate, "ffn_gate_shexp.weight", 0, err_msg) ||
+                !validate_bound_tensor(lw.shexp_up, "ffn_up_shexp.weight", 0, err_msg) ||
+                !validate_bound_tensor(lw.shexp_down, "ffn_down_shexp.weight", 0, err_msg)) {
+                err_msg = "Layer " + std::to_string(l) + ": " + err_msg;
+                return false;
+            }
+            if (lw.shexp_gate->n_dims != 2 || lw.shexp_up->n_dims != 2 || lw.shexp_down->n_dims != 2 ||
+                lw.shexp_gate->dims[0] != hp_.dim || lw.shexp_up->dims[0] != hp_.dim ||
+                lw.shexp_gate->dims[1] != lw.shexp_up->dims[1] ||
+                lw.shexp_down->dims[0] != lw.shexp_gate->dims[1] ||
+                lw.shexp_down->dims[1] != hp_.dim) {
+                err_msg = "Layer " + std::to_string(l) + ": shared-expert tensor shapes are inconsistent";
+                return false;
+            }
+        }
 
         const TensorDescriptor* t_gate_exps = model_file_.find_tensor(bp + "ffn_gate_exps.weight");
         const TensorDescriptor* t_up_exps   = model_file_.find_tensor(bp + "ffn_up_exps.weight");
         const TensorDescriptor* t_down_exps = model_file_.find_tensor(bp + "ffn_down_exps.weight");
 
         lw.expert_slices.resize(hp_.n_experts);
+        // Workstream C: every layer must end up with a working FFN (MoE
+        // or dense). A layer whose experts could not be packed
+        // (SafeTensors warning in gguf.cpp) and that has no dense FFN
+        // used to run with a zero FFN — silent degradation, not an error.
+        bool layer_has_ffn = false;
         if (t_gate_exps && t_up_exps && t_down_exps) {
             // Packed 3D expert tensors [dim, expert_dim, n_experts]
             if (t_gate_exps->n_dims >= 2) {
@@ -2162,6 +2546,67 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
             lw.expert_gate_type = t_gate_exps->type;
             lw.expert_up_type   = t_up_exps->type;
             lw.expert_down_type = t_down_exps->type;
+
+            // --- Workstream C: expert tensor validation ---
+            // A non-divisible byte size used to give every expert a
+            // wrong-sized slice (the last slice ran past the tensor);
+            // n_experts == 0 divided by zero below.
+            if (!validate_bound_tensor(t_gate_exps, "ffn_gate_exps.weight", 0, err_msg) ||
+                !validate_bound_tensor(t_up_exps, "ffn_up_exps.weight", 0, err_msg) ||
+                !validate_bound_tensor(t_down_exps, "ffn_down_exps.weight", 0, err_msg)) {
+                err_msg = "Layer " + std::to_string(l) + ": " + err_msg;
+                return false;
+            }
+            if (t_gate_exps->n_dims != 3 || t_up_exps->n_dims != 3 || t_down_exps->n_dims != 3) {
+                err_msg = "Layer " + std::to_string(l) + ": packed expert tensors must be 3D [dim, expert_dim, n_experts]";
+                return false;
+            }
+            if (hp_.n_experts == 0 || hp_.n_experts > 1024 ||
+                t_gate_exps->dims[1] == 0 || t_gate_exps->dims[1] > (1u << 20)) {
+                err_msg = "Layer " + std::to_string(l) + ": invalid packed expert dims (n_experts=" +
+                          std::to_string(hp_.n_experts) + ", expert_dim=" +
+                          std::to_string(t_gate_exps->dims[1]) + ")";
+                return false;
+            }
+            if (moe_experts_seen == 0) moe_experts_seen = hp_.n_experts;
+            else if (moe_experts_seen != hp_.n_experts) {
+                err_msg = "Layer " + std::to_string(l) + ": expert count " +
+                          std::to_string(hp_.n_experts) + " differs from earlier MoE layers (" +
+                          std::to_string(moe_experts_seen) + ")";
+                return false;
+            }
+            if (t_gate_exps->byte_size % hp_.n_experts != 0 ||
+                t_up_exps->byte_size % hp_.n_experts != 0 ||
+                t_down_exps->byte_size % hp_.n_experts != 0) {
+                err_msg = "Layer " + std::to_string(l) + ": packed expert tensor byte sizes are not divisible by n_experts=" +
+                          std::to_string(hp_.n_experts);
+                return false;
+            }
+            // The three projections must agree on the expert count and
+            // the expert width, and on dim; otherwise slices from
+            // different tensors describe different experts.
+            if (t_up_exps->dims[2] != hp_.n_experts || t_down_exps->dims[2] != hp_.n_experts ||
+                t_gate_exps->dims[1] != t_up_exps->dims[1] ||
+                t_down_exps->dims[0] != t_gate_exps->dims[1] ||
+                t_gate_exps->dims[0] != hp_.dim || t_up_exps->dims[0] != hp_.dim ||
+                t_down_exps->dims[1] != hp_.dim) {
+                err_msg = "Layer " + std::to_string(l) + ": packed expert tensor dims are inconsistent";
+                return false;
+            }
+            // The router is required for MoE: without it forward routes
+            // every token to expert 0 (see forward_token) — silent.
+            if (!lw.router_gate) {
+                err_msg = "Layer " + std::to_string(l) + ": MoE layer has packed expert tensors but no ffn_gate_inp.weight router — cannot route tokens";
+                return false;
+            }
+            {
+                uint64_t router_numel = static_cast<uint64_t>(hp_.dim) * hp_.n_experts;
+                if (!validate_bound_tensor(lw.router_gate, "ffn_gate_inp.weight", router_numel, err_msg)) {
+                    err_msg = "Layer " + std::to_string(l) + ": " + err_msg;
+                    return false;
+                }
+            }
+            layer_has_ffn = true;
 
             uint64_t gate_slice_sz = t_gate_exps->byte_size / hp_.n_experts;
             uint64_t up_slice_sz   = t_up_exps->byte_size / hp_.n_experts;
@@ -2184,12 +2629,50 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
                     lw.expert_slices[e].down_mapped_ptr = static_cast<const uint8_t*>(t_down_exps->mapped_ptr) + e * down_slice_sz;
                 }
             }
+            // Every slice must be readable: via its mmap pointer, or via
+            // a file offset inside the model file. (Packed SafeTensors
+            // experts are synthetic — abs_file_offset 0 with a valid
+            // mapped_ptr — so neither check alone suffices. A slice that
+            // fails both would make read_expert_sync read garbage or
+            // short, and the old code admitted the result unchecked.)
+            {
+                uint64_t fsize = model_file_.file_size();
+                for (uint32_t e = 0; e < hp_.n_experts; ++e) {
+                    const auto& s = lw.expert_slices[e];
+                    auto slice_ok = [&](const void* mp, uint64_t off, uint64_t nbytes) {
+                        if (mp) return true;
+                        return off <= fsize && nbytes <= fsize - off;
+                    };
+                    if (!slice_ok(s.gate_mapped_ptr, s.gate_offset, s.gate_bytes) ||
+                        !slice_ok(s.up_mapped_ptr, s.up_offset, s.up_bytes) ||
+                        !slice_ok(s.down_mapped_ptr, s.down_offset, s.down_bytes)) {
+                        err_msg = "Layer " + std::to_string(l) + ": expert " + std::to_string(e) +
+                                  " slice is unreadable (no data pointer and offset outside the file)";
+                        return false;
+                    }
+                }
+            }
         } else {
             // Check for standard Dense MLP (Qwen2.5, LLaMA, Mistral)
             const TensorDescriptor* t_gate = model_file_.find_tensor(bp + "ffn_gate.weight");
             const TensorDescriptor* t_up   = model_file_.find_tensor(bp + "ffn_up.weight");
             const TensorDescriptor* t_down = model_file_.find_tensor(bp + "ffn_down.weight");
             if (t_gate && t_up && t_down) {
+                if (!validate_bound_tensor(t_gate, "ffn_gate.weight", 0, err_msg) ||
+                    !validate_bound_tensor(t_up, "ffn_up.weight", 0, err_msg) ||
+                    !validate_bound_tensor(t_down, "ffn_down.weight", 0, err_msg)) {
+                    err_msg = "Layer " + std::to_string(l) + ": " + err_msg;
+                    return false;
+                }
+                if (t_gate->n_dims != 2 || t_up->n_dims != 2 || t_down->n_dims != 2 ||
+                    t_gate->dims[0] != hp_.dim || t_up->dims[0] != hp_.dim ||
+                    t_gate->dims[1] != t_up->dims[1] || t_gate->dims[1] > (1u << 20) ||
+                    t_down->dims[0] != t_gate->dims[1] ||
+                    t_down->dims[1] != hp_.dim) {
+                    err_msg = "Layer " + std::to_string(l) + ": dense FFN tensor shapes are inconsistent";
+                    return false;
+                }
+                layer_has_ffn = true;
                 hp_.n_experts = 1;
                 hp_.n_experts_used = 1;
                 hp_.moe_expert_dim = (t_gate->n_dims >= 2) ? static_cast<uint32_t>(t_gate->dims[1]) : hp_.hidden_dim;
@@ -2223,8 +2706,31 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
                 // hp_.use_gelu is false for Phi-3). Requires the Q2_K/Q3_K
                 // block-struct fix (include/quant.h) to work — before that
                 // fix this model gave <unk> in both RoPE modes.
+                if (!validate_bound_tensor(t_up, "ffn_up.weight", 0, err_msg) ||
+                    !validate_bound_tensor(t_down, "ffn_down.weight", 0, err_msg)) {
+                    err_msg = "Layer " + std::to_string(l) + ": " + err_msg;
+                    return false;
+                }
+                if (t_down->dims[0] == 0 || t_down->dims[0] > (1u << 20) ||
+                    (t_down->n_dims >= 2 && t_down->dims[1] != hp_.dim)) {
+                    err_msg = "Layer " + std::to_string(l) + ": fused ffn_down shape is inconsistent";
+                    return false;
+                }
                 uint32_t inter = static_cast<uint32_t>(t_down->dims[0]);
-                uint64_t up_row_bytes = tensor_byte_size(t_up->type, t_up->dims[0]);
+                uint64_t up_row_bytes = 0;
+                if (!checked_tensor_bytes(t_up->type, t_up->dims[0], up_row_bytes) || up_row_bytes == 0) {
+                    err_msg = "Layer " + std::to_string(l) + ": fused ffn_up row size overflows";
+                    return false;
+                }
+                // The two halves of the fused tensor must exactly cover
+                // it: a short tensor used to make the up-half view read
+                // past the tensor into the next one.
+                if (up_row_bytes > UINT64_MAX / (2ull * inter) ||
+                    up_row_bytes * inter * 2 != t_up->byte_size) {
+                    err_msg = "Layer " + std::to_string(l) + ": fused ffn_up byte size does not match 2*intermediate rows";
+                    return false;
+                }
+                layer_has_ffn = true;
                 hp_.n_experts = 1;
                 hp_.n_experts_used = 1;
                 hp_.moe_expert_dim = inter;
@@ -2253,6 +2759,19 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
                 // 2026-11-17 on Phi-3-mini-4k-instruct Q2_K, before the
                 // fused gate_up form above was identified as the real
                 // Phi-3 layout).
+                if (!validate_bound_tensor(t_up, "ffn_up.weight", 0, err_msg) ||
+                    !validate_bound_tensor(t_down, "ffn_down.weight", 0, err_msg)) {
+                    err_msg = "Layer " + std::to_string(l) + ": " + err_msg;
+                    return false;
+                }
+                if (t_up->n_dims != 2 || t_down->n_dims != 2 ||
+                    t_up->dims[0] != hp_.dim || t_up->dims[1] != t_down->dims[0] ||
+                    t_down->dims[0] == 0 || t_down->dims[0] > (1u << 20) ||
+                    t_down->dims[1] != hp_.dim) {
+                    err_msg = "Layer " + std::to_string(l) + ": GELU FFN tensor shapes are inconsistent";
+                    return false;
+                }
+                layer_has_ffn = true;
                 hp_.n_experts = 1;
                 hp_.n_experts_used = 1;
                 // NOTE: take the intermediate size from ffn_down's input
@@ -2275,6 +2794,34 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
                 lw.expert_slices[0].down_mapped_ptr = t_down->mapped_ptr;
             }
         }
+        if (!layer_has_ffn) {
+            err_msg = "Layer " + std::to_string(l) + ": no usable FFN tensors (no packed MoE experts "
+                      "and no dense ffn_gate/up/down) — the layer would contribute nothing";
+            return false;
+        }
+    }
+
+    // Re-check the KV-capacity guard with the FINAL kv_dim: per-layer
+    // overrides above can raise kv_dim above the layer-0 value the first
+    // guard used, so the slots would allocate more than the budget.
+    {
+        uint64_t avail = hw_.avail_ram_bytes;
+        if (avail == 0) avail = 2ull << 30; // same fallback as above
+        uint64_t budget = avail / 4;
+        uint32_t cap = hp_.kv_cache_capacity;
+        while (cap > 256) {
+            uint64_t est = static_cast<uint64_t>(hp_.n_layers) * cap *
+                           static_cast<uint64_t>(hp_.kv_dim) * 2ull * 2ull;
+            if (est <= budget) break;
+            cap /= 2;
+        }
+        hp_.kv_cache_capacity = cap;
+    }
+    if (hp_.n_experts_used > hp_.n_experts) {
+        err_msg = "expert_used_count (" + std::to_string(hp_.n_experts_used) +
+                  ") exceeds expert_count (" + std::to_string(hp_.n_experts) +
+                  ") after layer binding";
+        return false;
     }
 
     return true;
@@ -2359,6 +2906,24 @@ std::vector<float> MoETransformerEngine::forward_token(
     std::vector<float>* out_hidden
 ) {
     std::lock_guard<std::mutex> lk(engine_mtx_);
+    // --- Workstream C: entry guards. An empty return means "no logits"
+    // (not loaded / bad slot / bad token / no KV room). Callers MUST
+    // check for empty logits (generate_stream does) instead of sampling
+    // token 0 from them.
+    if (!loaded_) {
+        std::cerr << "[FORWARD] rejected: engine not loaded\n";
+        return {};
+    }
+    if (!is_valid_slot_id(slot_id)) {
+        std::cerr << "[FORWARD] rejected: slot " << slot_id << " out of range (user slots 0.."
+                  << kMaxUserSlot << ", scratch 8888/9998/9999)\n";
+        return {};
+    }
+    if (token_id >= hp_.vocab_size) {
+        std::cerr << "[FORWARD] rejected: token_id " << token_id << " >= vocab_size "
+                  << hp_.vocab_size << "\n";
+        return {};
+    }
     const double t_start = now_ms();
     double io_wait_ms = 0.0;
     double matmul_ms  = 0.0;
@@ -2372,6 +2937,13 @@ std::vector<float> MoETransformerEngine::forward_token(
     KVCacheSlot& slot = get_or_create_slot(slot_id);
     if (slot.seq_pos >= hp_.kv_cache_capacity) {
         slot.compact(hp_, hp_.kv_cache_capacity / 2);
+    }
+    // Compaction must make room; if it could not, running would write
+    // past the KV cache (pos is used as a direct index into k/v_cache).
+    if (slot.seq_pos >= hp_.kv_cache_capacity) {
+        std::cerr << "[FORWARD] rejected: slot " << slot_id << " seq_pos " << slot.seq_pos
+                  << " >= KV capacity " << hp_.kv_cache_capacity << " after compaction\n";
+        return {};
     }
     const uint32_t pos = slot.seq_pos;
     slot.token_history.push_back(token_id);
@@ -2700,10 +3272,32 @@ std::vector<float> MoETransformerEngine::forward_token(
                     }
                     io_wait_ms += (now_ms() - tio0);
 
-                    // Attempt to admit to LFRU cache (respects 25% hysteresis threshold)
-                    const ExpertCacheEntry* admitted = tier_mgr_.admit_expert(
-                        l, e, std::move(scratch.gate), std::move(scratch.up), std::move(scratch.down)
-                    );
+                    // A short/failed disk read must not be admitted as
+                    // valid weights. read_expert_sync() reports it via
+                    // StreamedExpertWeights.ok (pilot_io loops pread to
+                    // completion and returns false on EOF/error); the size
+                    // check is kept as a second line of defense. A failed
+                    // read falls back to the slice's mmap pointer (or the
+                    // expert is skipped when there is none). Admitting a
+                    // short buffer would poison the cache — the
+                    // admitted-entry path below takes .data() without an
+                    // .empty() check.
+                    bool scratch_ok = scratch.ok &&
+                                      (scratch.gate.size() == slice.gate_bytes &&
+                                       scratch.up.size() == slice.up_bytes &&
+                                       scratch.down.size() == slice.down_bytes);
+                    if (!scratch_ok) {
+                        std::cerr << "[FORWARD] WARNING: expert read for layer " << l << " expert " << e
+                                  << " failed or returned a short buffer (gate " << scratch.gate.size() << "/"
+                                  << slice.gate_bytes << " bytes) — discarding, using mmap fallback\n";
+                    }
+                    const ExpertCacheEntry* admitted = nullptr;
+                    if (scratch_ok) {
+                        // Attempt to admit to LFRU cache (respects 25% hysteresis threshold)
+                        admitted = tier_mgr_.admit_expert(
+                            l, e, std::move(scratch.gate), std::move(scratch.up), std::move(scratch.down)
+                        );
+                    }
                     if (admitted) {
                         w_gate_ptr = admitted->weight_gate.data();
                         w_up_ptr   = admitted->weight_up.data();
@@ -2907,24 +3501,41 @@ uint32_t MoETransformerEngine::sample_next_token(
     const SamplerConfig& cfg
 ) {
     if (logits.empty()) return 0;
+    // Defensive sanitization (the authoritative check is
+    // validate_sampler_config(), called by generate_stream /
+    // verify_speculative_batch — but this function is also callable
+    // directly, and a NaN temperature or a zero repetition_penalty here
+    // used to produce NaN logits / a division by zero with no error).
+    // Invalid values fall back to the safe equivalent here; the entry
+    // points reject them instead of silently fixing them.
+    SamplerConfig safe = cfg;
+    if (std::isnan(safe.temperature) || std::isinf(safe.temperature) || safe.temperature < 0.0f) safe.temperature = 0.0f; // greedy
+    if (std::isnan(safe.top_p) || safe.top_p < 0.0f || safe.top_p > 1.0f) safe.top_p = 1.0f; // nucleus off
+    if (std::isnan(safe.repetition_penalty) || std::isinf(safe.repetition_penalty) || safe.repetition_penalty <= 0.0f) safe.repetition_penalty = 1.0f;
     const uint32_t vocab_sz = static_cast<uint32_t>(logits.size());
     std::vector<float> adj = logits;
+    // A NaN logit (corrupt weights / overflowed activations) used to make
+    // max_element / partial_sort / the softmax produce unspecified
+    // results. Treat NaN as -inf so it can never be sampled; if every
+    // logit is NaN there is no valid token to return.
+    for (auto& v : adj) if (std::isnan(v)) v = -std::numeric_limits<float>::infinity();
+    if (std::isinf(*std::max_element(adj.begin(), adj.end()))) return 0;
 
     // 1. Repetition Penalty over recent history
-    if (cfg.repetition_penalty != 1.0f && !history.empty()) {
+    if (safe.repetition_penalty != 1.0f && !history.empty()) {
         size_t start = (history.size() > 64) ? (history.size() - 64) : 0;
         for (size_t i = start; i < history.size(); ++i) {
             uint32_t tid = history[i];
             if (tid == 220 || tid == 198 || tid == 0) continue; // skip space, newline, unk
             if (tid < vocab_sz) {
-                if (adj[tid] > 0.0f) adj[tid] /= cfg.repetition_penalty;
-                else adj[tid] *= cfg.repetition_penalty;
+                if (adj[tid] > 0.0f) adj[tid] /= safe.repetition_penalty;
+                else adj[tid] *= safe.repetition_penalty;
             }
         }
     }
 
     // 2. Greedy Argmax when temperature <= 0
-    if (cfg.temperature <= 1e-5f || cfg.top_k == 1) {
+    if (safe.temperature <= 1e-5f || safe.top_k == 1) {
         return static_cast<uint32_t>(std::max_element(adj.begin(), adj.end()) - adj.begin());
     }
 
@@ -2935,10 +3546,10 @@ uint32_t MoETransformerEngine::sample_next_token(
     };
     std::vector<TokProb> cands(vocab_sz);
     for (uint32_t i = 0; i < vocab_sz; ++i) {
-        cands[i] = {i, adj[i] / cfg.temperature};
+        cands[i] = {i, adj[i] / safe.temperature};
     }
 
-    uint32_t k = (cfg.top_k > 0 && cfg.top_k < vocab_sz) ? cfg.top_k : vocab_sz;
+    uint32_t k = (safe.top_k > 0 && safe.top_k < vocab_sz) ? safe.top_k : vocab_sz;
     std::partial_sort(cands.begin(), cands.begin() + k, cands.end(),
         [](const TokProb& a, const TokProb& b) { return a.val > b.val; });
     cands.resize(k);
@@ -2952,7 +3563,7 @@ uint32_t MoETransformerEngine::sample_next_token(
     }
     for (auto& c : cands) c.val /= sum_exp;
 
-    if (cfg.top_p > 0.0f && cfg.top_p < 1.0f) {
+    if (safe.top_p > 0.0f && safe.top_p < 1.0f) {
         float cum = 0.0f;
         size_t cutoff = cands.size();
         for (size_t i = 0; i < cands.size(); ++i) {
@@ -2990,6 +3601,23 @@ std::vector<uint32_t> MoETransformerEngine::verify_speculative_batch(
 ) {
     std::vector<uint32_t> accepted;
     if (draft_tokens.empty()) return accepted;
+    // Workstream C: reject invalid inputs instead of verifying garbage.
+    if (!is_valid_slot_id(slot_id)) {
+        std::cerr << "[SPECULATIVE] rejected: slot " << slot_id << " out of range\n";
+        return accepted;
+    }
+    {
+        std::string cfg_err;
+        if (!validate_sampler_config(sampler_cfg, cfg_err)) {
+            std::cerr << "[SPECULATIVE] rejected: invalid sampler config: " << cfg_err << "\n";
+            return accepted;
+        }
+    }
+    if (draft_tokens.size() > kMaxDraftTokens) {
+        std::cerr << "[SPECULATIVE] rejected: " << draft_tokens.size()
+                  << " draft tokens exceeds the maximum of " << kMaxDraftTokens << "\n";
+        return accepted;
+    }
 
     uint32_t base_seq_pos = 0;
     {
@@ -3002,6 +3630,12 @@ std::vector<uint32_t> MoETransformerEngine::verify_speculative_batch(
         uint32_t draft_id = draft_tokens[i];
         ProfileSample prof{};
         auto logits = forward_token(draft_id, slot_id, &prof);
+        if (logits.empty()) {
+            // Out-of-vocab draft token (or another forward failure):
+            // do not accept the draft, stop verification here.
+            std::cerr << "[SPECULATIVE] stopping: forward failed for draft token " << draft_id << "\n";
+            return accepted;
+        }
         if (out_profile) *out_profile = prof;
         accepted.push_back(draft_id);
 
@@ -3035,8 +3669,44 @@ void MoETransformerEngine::generate_stream(
     bool enable_speculative,
     uint32_t draft_count
 ) {
+    // Workstream C: reject invalid inputs up front — a bad slot used to
+    // allocate an unbounded KV cache, a NaN temperature used to produce
+    // NaN logits, and a huge max_new_tokens ran until EOS (or forever).
+    // The HTTP server must ALSO validate (server.cpp, workstream B) so a
+    // bad request gets a 400 instead of an empty stream.
+    if (!loaded_) {
+        std::cerr << "[GENERATE] rejected: engine not loaded\n";
+        return;
+    }
+    if (!is_valid_slot_id(slot_id)) {
+        std::cerr << "[GENERATE] rejected: slot " << slot_id << " out of range (user slots 0.."
+                  << kMaxUserSlot << ", scratch 8888/9998/9999)\n";
+        return;
+    }
+    {
+        std::string cfg_err;
+        if (!validate_sampler_config(sampler_cfg, cfg_err)) {
+            std::cerr << "[GENERATE] rejected: invalid sampler config: " << cfg_err << "\n";
+            return;
+        }
+    }
+    if (max_new_tokens > kMaxNewTokens) {
+        std::cerr << "[GENERATE] rejected: max_new_tokens " << max_new_tokens
+                  << " exceeds the maximum of " << kMaxNewTokens << "\n";
+        return;
+    }
+    if (enable_speculative && draft_count > kMaxDraftTokens) {
+        std::cerr << "[GENERATE] rejected: draft_count " << draft_count
+                  << " exceeds the maximum of " << kMaxDraftTokens << "\n";
+        return;
+    }
+    if (!on_token) {
+        std::cerr << "[GENERATE] rejected: no token callback\n";
+        return;
+    }
     std::vector<float> logits;
     ProfileSample last_prof;
+    bool cancelled = false; // set when on_token returns false; suppresses the tail flush
 
     // (Re)seed the sampler for this generation: an explicit non-zero seed
     // is deterministic, seed 0 draws fresh entropy.
@@ -3104,6 +3774,14 @@ void MoETransformerEngine::generate_stream(
         logits = forward_token(last_token, slot_id, &last_prof);
     }
 
+    if (logits.empty()) {
+        // Prefill failed — there is nothing to sample from. Return here
+        // instead of sampling token 0 in a loop (the old behaviour when
+        // a forward returned empty logits).
+        std::cerr << "[GENERATE] stopping: prefill produced no logits\n";
+        return;
+    }
+
     StreamingUTF8Decoder utf8_dec(tokenizer_);
     bool in_thinking = false;
 
@@ -3111,8 +3789,13 @@ void MoETransformerEngine::generate_stream(
         if (enable_context_compaction) {
             std::lock_guard<std::mutex> lk(engine_mtx_);
             auto& slot = get_or_create_slot(slot_id);
-            if (slot.seq_pos + 16 >= hp_.max_seq_len) {
-                slot.compact(hp_, hp_.max_seq_len / 2);
+            // Compact against the KV-cache capacity, not max_seq_len:
+            // the capacity is what the slots actually allocate (RAM
+            // guard can halve it far below max_seq_len), and passing
+            // max_seq_len/2 as keep_recent used to underflow inside
+            // compact() when the capacity was smaller.
+            if (slot.seq_pos + 16 >= hp_.kv_cache_capacity) {
+                slot.compact(hp_, hp_.kv_cache_capacity / 2);
             }
         }
 
@@ -3120,6 +3803,12 @@ void MoETransformerEngine::generate_stream(
         {
             std::lock_guard<std::mutex> lk(engine_mtx_);
             hist = get_or_create_slot(slot_id).token_history;
+        }
+
+        if (logits.empty()) {
+            // A forward inside the loop failed: stop instead of sampling
+            // token 0 from empty logits until max_new_tokens.
+            break;
         }
 
         uint32_t next_id = sample_next_token(logits, hist, sampler_cfg);
@@ -3157,6 +3846,7 @@ void MoETransformerEngine::generate_stream(
                 in_thinking = false;
             } else {
                 if (!on_token(piece, in_thinking, next_id, last_prof)) {
+                    cancelled = true;
                     break;
                 }
             }
@@ -3199,6 +3889,7 @@ void MoETransformerEngine::generate_stream(
                     std::string acc_piece = utf8_dec.push(target_tok);
                     if (!acc_piece.empty() && acc_piece != "<think>" && acc_piece != "</think>") {
                         if (!on_token(acc_piece, in_thinking, target_tok, last_prof)) {
+                            cancelled = true;
                             step = max_new_tokens;
                             break;
                         }
@@ -3214,7 +3905,9 @@ void MoETransformerEngine::generate_stream(
     }
 
     std::string tail = utf8_dec.flush();
-    if (!tail.empty()) {
+    // After a cancellation the caller asked for no more tokens — do not
+    // flush the decoder tail into the callback (the old code did).
+    if (!cancelled && !tail.empty()) {
         on_token(tail, in_thinking, 0, last_prof);
     }
 }

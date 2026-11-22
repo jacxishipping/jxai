@@ -1,7 +1,9 @@
 #include "tokenizer.h"
 #include <algorithm>
+#include <cstdint>
 #include <cstdio>
 #include <fstream>
+#include <iostream>
 
 namespace moe {
 
@@ -55,7 +57,18 @@ static void ensure_byte_unicode_tables() {
     g_table_init = true;
 }
 
-static inline std::string codepoint_to_utf8(uint32_t cp) {
+// Maximum tokenizer vocabulary this engine will build: a vocab entry
+// with an id at or above this is rejected (the load fails and the caller
+// falls back to the synthetic vocab) instead of allocating a vector of
+// that size. Real vocabularies top out at 256k (Gemma); 1M is generous.
+constexpr uint32_t kMaxTokenizerVocab = 1u << 20;
+
+std::string codepoint_to_utf8(uint32_t cp) {
+    // Surrogates and values above U+10FFFF have no UTF-8 encoding: emit
+    // U+FFFD instead of the invalid bytes the old code produced (a lone
+    // surrogate used to encode as ED A0 xx — invalid UTF-8 that the BPE
+    // decoder then split unpredictably).
+    if (cp > 0x10FFFF || (cp >= 0xD800 && cp <= 0xDFFF)) cp = 0xFFFD;
     std::string s;
     if (cp < 0x80) {
         s.push_back(static_cast<char>(cp));
@@ -75,30 +88,113 @@ static inline std::string codepoint_to_utf8(uint32_t cp) {
     return s;
 }
 
-static inline uint32_t utf8_next_codepoint(const std::string& str, size_t& i) {
+uint32_t utf8_next_codepoint(const std::string& str, size_t& i) {
     if (i >= str.size()) return 0;
     unsigned char c = static_cast<unsigned char>(str[i]);
     if ((c & 0x80) == 0x00) {
         i += 1;
         return c;
-    } else if ((c & 0xE0) == 0xC0 && i + 1 < str.size()) {
-        uint32_t cp = ((c & 0x1F) << 6) | (static_cast<unsigned char>(str[i + 1]) & 0x3F);
+    }
+    // Continuation byte k (1-based) or -1 when missing/invalid.
+    auto cont = [&](size_t k) -> int {
+        if (i + k >= str.size()) return -1;
+        unsigned char b = static_cast<unsigned char>(str[i + k]);
+        return (b & 0xC0) == 0x80 ? (b & 0x3F) : -1;
+    };
+    // Any invalid sequence (bad continuation byte, overlong form,
+    // surrogate, > U+10FFFF, or a truncated sequence at the end of the
+    // string) yields U+FFFD and advances 1 byte. The old code accepted
+    // all of these and returned a bogus codepoint — e.g. a truncated
+    // 0xE2 at end-of-string came back as codepoint 226, and 0xC0 0x80
+    // decoded as U+0000. Valid UTF-8 decodes exactly as before.
+    if ((c & 0xE0) == 0xC0) {
+        int c1 = cont(1);
+        if (c1 < 0) { i += 1; return 0xFFFD; }
+        uint32_t cp = ((c & 0x1F) << 6) | static_cast<uint32_t>(c1);
+        if (cp < 0x80) { i += 1; return 0xFFFD; } // overlong
         i += 2;
         return cp;
-    } else if ((c & 0xF0) == 0xE0 && i + 2 < str.size()) {
-        uint32_t cp = ((c & 0x0F) << 12) | ((static_cast<unsigned char>(str[i + 1]) & 0x3F) << 6)
-                      | (static_cast<unsigned char>(str[i + 2]) & 0x3F);
+    } else if ((c & 0xF0) == 0xE0) {
+        int c1 = cont(1), c2 = cont(2);
+        if (c1 < 0 || c2 < 0) { i += 1; return 0xFFFD; }
+        uint32_t cp = ((c & 0x0F) << 12) | (static_cast<uint32_t>(c1) << 6) |
+                      static_cast<uint32_t>(c2);
+        if (cp < 0x800 || (cp >= 0xD800 && cp <= 0xDFFF)) { i += 1; return 0xFFFD; }
         i += 3;
         return cp;
-    } else if ((c & 0xF8) == 0xF0 && i + 3 < str.size()) {
-        uint32_t cp = ((c & 0x07) << 18) | ((static_cast<unsigned char>(str[i + 1]) & 0x3F) << 12)
-                      | ((static_cast<unsigned char>(str[i + 2]) & 0x3F) << 6)
-                      | (static_cast<unsigned char>(str[i + 3]) & 0x3F);
+    } else if ((c & 0xF8) == 0xF0) {
+        int c1 = cont(1), c2 = cont(2), c3 = cont(3);
+        if (c1 < 0 || c2 < 0 || c3 < 0) { i += 1; return 0xFFFD; }
+        uint32_t cp = ((c & 0x07) << 18) | (static_cast<uint32_t>(c1) << 12) |
+                      (static_cast<uint32_t>(c2) << 6) | static_cast<uint32_t>(c3);
+        if (cp < 0x10000 || cp > 0x10FFFF) { i += 1; return 0xFFFD; }
         i += 4;
         return cp;
     }
     i += 1;
-    return c;
+    return 0xFFFD;
+}
+
+// Validate a GGUF chat template's Jinja syntax. The renderer
+// (transformer.cpp render_jinja_segment) only understands {% if/elif/else/
+// endif %}, {% for/endfor %} and {% set %} — any other {% %} statement
+// is skipped and left LITERAL in the prompt, an unbalanced {% for %}
+// renders the rest of the template as literal text, and an unclosed
+// {{ / {% / {# is silently truncated. So a malformed template produces
+// wrong prompts instead of an error. This check runs at load; on failure
+// the caller clears the template (per-arch fallback) and warns. Returns
+// false + a reason on the first problem found.
+bool validate_chat_template(const std::string& tpl, std::string& reason) {
+    size_t pos = 0;
+    int for_depth = 0, if_depth = 0;
+    while (pos < tpl.size()) {
+        size_t v = tpl.find("{{", pos);
+        size_t s = tpl.find("{%", pos);
+        size_t c = tpl.find("{#", pos);
+        size_t tag = std::string::npos;
+        int kind = 0; // 1 = {{ }}, 2 = {% %}, 3 = {# #}
+        if (v != std::string::npos) { tag = v; kind = 1; }
+        if (s != std::string::npos && s < tag) { tag = s; kind = 2; }
+        if (c != std::string::npos && c < tag) { tag = c; kind = 3; }
+        if (tag == std::string::npos) break;
+        if (kind == 1) {
+            size_t en = tpl.find("}}", tag + 2);
+            if (en == std::string::npos) { reason = "unclosed '{{'"; return false; }
+            pos = en + 2;
+        } else if (kind == 3) {
+            size_t en = tpl.find("#}", tag + 2);
+            if (en == std::string::npos) { reason = "unclosed '{# comment'"; return false; }
+            pos = en + 2;
+        } else {
+            size_t en = tpl.find("%}", tag + 2);
+            if (en == std::string::npos) { reason = "unclosed '{%'"; return false; }
+            std::string body = tpl.substr(tag + 2, en - (tag + 2));
+            // First word, ignoring whitespace and the '-' markers.
+            size_t b = body.find_first_not_of(" \t\r\n-");
+            if (b == std::string::npos) { reason = "empty {% %} statement"; return false; }
+            size_t e = body.find_first_of(" \t\r\n-", b);
+            std::string kw = body.substr(b, e == std::string::npos ? e : e - b);
+            if (kw == "for") ++for_depth;
+            else if (kw == "endfor") {
+                if (--for_depth < 0) { reason = "{% endfor %} without {% for %}"; return false; }
+            } else if (kw == "if") ++if_depth;
+            else if (kw == "endif") {
+                if (--if_depth < 0) { reason = "{% endif %} without {% if %}"; return false; }
+            } else if (kw == "elif" || kw == "else") {
+                if (if_depth == 0) { reason = "{% " + kw + " %} outside {% if %}"; return false; }
+            } else if (kw == "set") {
+                // ok
+            } else {
+                reason = "unsupported statement '{% " + kw +
+                         " %}' — the renderer would leave it literal in the prompt";
+                return false;
+            }
+            pos = en + 2;
+        }
+    }
+    if (for_depth > 0) { reason = "unclosed {% for %}"; return false; }
+    if (if_depth > 0) { reason = "unclosed {% if %}"; return false; }
+    return true;
 }
 
 bool Tokenizer::load_from_model(const ModelFile& mf) {
@@ -120,6 +216,28 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
 
     const auto& meta = mf.metadata();
     chat_template_ = mf.get_str("tokenizer.chat_template", "");
+    if (!chat_template_.empty()) {
+        std::string tpl_reason;
+        if (!validate_chat_template(chat_template_, tpl_reason)) {
+            std::cerr << "[TOKENIZER] WARNING: GGUF chat template is malformed (" << tpl_reason
+                      << ") — ignoring it and using the per-architecture fallback template.\n";
+            chat_template_.clear();
+        }
+    }
+    // Apply a metadata BOS/EOS id only when it is in range; otherwise
+    // keep the id found by scanning the vocabulary and warn. An
+    // out-of-range id used to be stored and later emitted by encode(),
+    // where forward_token either rejected the token or the embedding
+    // lookup silently produced zeros.
+    auto apply_meta_id = [&](const char* key, uint32_t& current, const char* what) {
+        auto it = meta.find(key);
+        if (it == meta.end()) return; // absent: keep the scanned id
+        uint32_t v = static_cast<uint32_t>(it->second.u64);
+        if (v < vocab_.size()) { current = v; return; }
+        std::cerr << "[TOKENIZER] WARNING: metadata " << what << " (" << v
+                  << ") is outside the vocabulary (" << vocab_.size()
+                  << " tokens) — keeping the scanned id " << current << ".\n";
+    };
     {
         auto it_bos = meta.find("tokenizer.ggml.add_bos_token");
         if (it_bos != meta.end()) { has_add_bos_token_ = true; add_bos_token_ = it_bos->second.bval; }
@@ -172,8 +290,10 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
             if (probe.good()) {
                 probe.close();
                 if (load_tokenizer_json(tj_path) && !vocab_.empty()) {
-                    bos_id_ = mf.get_u32("tokenizer.ggml.bos_token_id", bos_id_);
-                    eos_id_ = mf.get_u32("tokenizer.ggml.eos_token_id", eos_id_);
+                    apply_meta_id("tokenizer.ggml.bos_token_id", bos_id_, "bos_token_id");
+                    apply_meta_id("tokenizer.ggml.eos_token_id", eos_id_, "eos_token_id");
+                    if (bos_id_ >= vocab_.size()) bos_id_ = 0;
+                    if (eos_id_ >= vocab_.size()) eos_id_ = 0;
                     return true;
                 }
                 // JSON load failed: fall through to the synthetic vocab below.
@@ -184,7 +304,10 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
         }
         uint32_t target_vocab = 512;
         const auto* emb = mf.find_tensor("token_embd.weight");
-        if (emb && emb->n_dims >= 2) {
+        // Bounded: a corrupt embedding dims[1] used to resize the vocab
+        // to an arbitrary (possibly truncated, possibly zero) size — zero
+        // made the vocab_[0] write below out of bounds.
+        if (emb && emb->n_dims >= 2 && emb->dims[1] > 0 && emb->dims[1] <= kMaxTokenizerVocab) {
             target_vocab = static_cast<uint32_t>(emb->dims[1]);
         }
         vocab_.resize(target_vocab);
@@ -214,8 +337,19 @@ bool Tokenizer::load_from_model(const ModelFile& mf) {
 
     rebuild_token_index();
 
-    bos_id_ = mf.get_u32("tokenizer.ggml.bos_token_id", bos_id_);
-    eos_id_ = mf.get_u32("tokenizer.ggml.eos_token_id", eos_id_);
+    apply_meta_id("tokenizer.ggml.bos_token_id", bos_id_, "bos_token_id");
+    apply_meta_id("tokenizer.ggml.eos_token_id", eos_id_, "eos_token_id");
+
+    // Final safety net: the vocabulary must be non-empty and BOS/EOS
+    // must be valid token ids even for a tiny vocabulary or absent
+    // metadata (the member defaults 1/2 are out of range for a vocab
+    // smaller than 3 entries).
+    if (vocab_.empty()) {
+        std::cerr << "[TOKENIZER] ERROR: no usable vocabulary after all fallbacks\n";
+        return false;
+    }
+    if (bos_id_ >= vocab_.size()) bos_id_ = 0;
+    if (eos_id_ >= vocab_.size()) eos_id_ = 0;
 
     return true;
 }
@@ -304,6 +438,34 @@ static bool tj_parse_string(const std::string& s, size_t& pos, std::string& out)
                         else if (h >= 'A' && h <= 'F') cp |= static_cast<unsigned>(h - 'A' + 10);
                         else return false;
                     }
+                    // JSON \u escapes come in surrogate pairs for astral
+                    // characters: a lone surrogate has no UTF-8 encoding
+                    // (the old code emitted the invalid ED A0 xx bytes).
+                    // Combine a high surrogate with a following low one;
+                    // anything else unpaired becomes U+FFFD.
+                    if (cp >= 0xD800 && cp <= 0xDBFF) {
+                        bool paired = false;
+                        if (pos + 6 <= s.size() && s[pos] == '\\' && s[pos + 1] == 'u') {
+                            unsigned lo = 0;
+                            bool ok = true;
+                            for (int k = 0; k < 4; ++k) {
+                                char h = s[pos + 2 + k];
+                                lo <<= 4;
+                                if (h >= '0' && h <= '9') lo |= static_cast<unsigned>(h - '0');
+                                else if (h >= 'a' && h <= 'f') lo |= static_cast<unsigned>(h - 'a' + 10);
+                                else if (h >= 'A' && h <= 'F') lo |= static_cast<unsigned>(h - 'A' + 10);
+                                else { ok = false; break; }
+                            }
+                            if (ok && lo >= 0xDC00 && lo <= 0xDFFF) {
+                                pos += 6;
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                                paired = true;
+                            }
+                        }
+                        if (!paired) cp = 0xFFFD;
+                    } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                        cp = 0xFFFD; // lone low surrogate
+                    }
                     out += codepoint_to_utf8(cp);
                     break;
                 }
@@ -324,6 +486,20 @@ static bool tj_find_key(const std::string& s, const std::string& key, size_t& po
     size_t colon = s.find(':', p + pat.size());
     if (colon == std::string::npos) return false;
     pos_out = colon + 1;
+    return true;
+}
+
+// Strict non-negative decimal parse: no sign, no junk, no overflow.
+// std::stoul throws out_of_range on huge inputs and wraps a leading '-'.
+static bool tj_parse_u32_strict(const std::string& s, uint32_t& out) {
+    if (s.empty()) return false;
+    uint64_t v = 0;
+    for (char ch : s) {
+        if (ch < '0' || ch > '9') return false;
+        v = v * 10 + static_cast<uint64_t>(ch - '0');
+        if (v > UINT32_MAX) return false;
+    }
+    out = static_cast<uint32_t>(v);
     return true;
 }
 
@@ -369,10 +545,15 @@ bool Tokenizer::load_tokenizer_json(const std::string& json_path) {
         ++vp;
         tj_skip_ws(js, vp);
         size_t num_start = vp;
-        if (vp < js.size() && (js[vp] == '-' || js[vp] == '+')) ++vp;
+        // Token ids are non-negative JSON numbers: a '-' (or '+') here is
+        // malformed, and std::stoul used to wrap a negative id into a
+        // huge uint32 (then vocab_.assign(max_id + 1) tried to allocate
+        // gigabytes). Strict-parse instead.
         while (vp < js.size() && js[vp] >= '0' && js[vp] <= '9') ++vp;
         if (num_start == vp) return false;
-        uint32_t id = static_cast<uint32_t>(std::stoul(js.substr(num_start, vp - num_start)));
+        uint32_t id = 0;
+        if (!tj_parse_u32_strict(js.substr(num_start, vp - num_start), id)) return false;
+        if (id >= kMaxTokenizerVocab) return false;
         by_id.emplace_back(id, tok);
         tj_skip_ws(js, vp);
         if (vp < js.size() && js[vp] == ',') { ++vp; continue; }
@@ -429,7 +610,7 @@ bool Tokenizer::load_tokenizer_json(const std::string& json_path) {
                     tj_skip_ws(obj, ip);
                     size_t ns = ip;
                     while (ip < obj.size() && obj[ip] >= '0' && obj[ip] <= '9') ++ip;
-                    if (ip > ns) { id = static_cast<uint32_t>(std::stoul(obj.substr(ns, ip - ns))); have_id = true; }
+                    if (ip > ns && tj_parse_u32_strict(obj.substr(ns, ip - ns), id)) have_id = true;
                 }
                 size_t cp = 0;
                 if (tj_find_key(obj, "content", cp)) {
@@ -437,8 +618,12 @@ bool Tokenizer::load_tokenizer_json(const std::string& json_path) {
                     if (tj_parse_string(obj, cp, content)) have_content = true;
                 }
                 if (have_id && have_content) {
-                    if (id >= vocab_.size()) vocab_.resize(id + 1, "<unk>");
-                    vocab_[id] = content;
+                    // Bounded: an added-token id above the vocab cap is
+                    // skipped instead of resizing the vocab to id + 1.
+                    if (id < kMaxTokenizerVocab) {
+                        if (id >= vocab_.size()) vocab_.resize(id + 1, "<unk>");
+                        vocab_[id] = content;
+                    }
                 }
                 ap = obj_end + 1;
                 tj_skip_ws(js, ap);

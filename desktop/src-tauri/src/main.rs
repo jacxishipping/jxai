@@ -8,7 +8,7 @@ struct EngineProcess(Mutex<Option<Child>>);
 
 #[tauri::command]
 fn get_engine_status() -> String {
-    "MoE Stream Engine running on port 8000".to_string()
+    "MoE Stream Engine running on port 8001".to_string()
 }
 
 fn main() {
@@ -18,7 +18,7 @@ fn main() {
         .setup(|app| {
             // Automatically launch native moe_engine server daemon if not already listening
             let child = Command::new("../../build/moe_engine.exe")
-                .args(["serve", "--port", "8000", "--web-dir", "../../web/dist"])
+                .args(["serve", "--port", "8001", "--web-dir", "../../web/dist"])
                 .spawn()
                 .ok();
 

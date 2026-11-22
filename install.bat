@@ -66,7 +66,11 @@ echo.
 echo You can now run MoE Studio from:
 echo   1. Desktop Shortcut: "MoE Studio"
 echo   2. Command Line:     .\build\moe_studio.exe
-echo   3. Background API:   .\build\moe_engine.exe serve --model models/test_qwen.gguf --port 8000
+echo   3. Native engine + built-in web UI (default path):
+echo      .\start_jxai.sh  (Linux)  -- serves the UI on http://127.0.0.1:8001/
+echo      or .\build\moe_engine.exe serve --model models\real\qwen2.5-0.5b-instruct-q4_0.gguf --port 8001 --web-dir web\dist
+echo      (Download a model first if models\real\ is empty:
+echo       .\build\moe_engine.exe pull Qwen/Qwen2.5-0.5B-Instruct-GGUF)
 echo.
 echo Launching MoE Studio First-Run Setup Wizard...
 start "" "%STUDIO_EXE%" --wizard 0

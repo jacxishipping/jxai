@@ -7,6 +7,26 @@
 
 namespace moe {
 
+// Strict UTF-8 helpers (workstream C). Both reject what the old code
+// silently accepted: codepoint_to_utf8() maps surrogates and values above
+// U+10FFFF to U+FFFD instead of emitting invalid bytes, and
+// utf8_next_codepoint() returns U+FFFD (advancing 1 byte) for a bad
+// continuation byte, an overlong form, a surrogate, a value above
+// U+10FFFF, or a truncated sequence at end-of-string. Valid UTF-8
+// decodes exactly as before. Exposed here (previously file-static in
+// tokenizer.cpp) so the verification suite can test the boundaries
+// directly; the tokenizer uses them for encode/decode.
+std::string codepoint_to_utf8(uint32_t cp);
+uint32_t utf8_next_codepoint(const std::string& str, size_t& i);
+
+// Validate a GGUF chat template's Jinja syntax. The renderer
+// (transformer.cpp render_jinja_segment) only understands {% if/elif/
+// else/endif %}, {% for/endfor %} and {% set %}; anything else is left
+// literal in the prompt, so load_from_model() rejects a malformed
+// template (and falls back to the per-arch template) instead of
+// rendering garbage. Returns false + a reason on the first problem.
+bool validate_chat_template(const std::string& tpl, std::string& reason);
+
 class Tokenizer {
 public:
     Tokenizer() = default;

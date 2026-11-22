@@ -24,10 +24,22 @@ set(SOURCES
 add_executable(moe_engine ${SOURCES})
 
 if (MSVC)
+    # MSVC has no per-function ISA attribute, so the Windows build still
+    # requires AVX2 (and FMA/F16C, which Haswell+ CPUs have). The engine
+    # reports this via `moe_engine doctor`; on a non-AVX2 machine the
+    # binary may fault (SIGILL) — the portable baseline + runtime dispatch
+    # in src/quant.cpp applies to the GCC/Clang build below.
     target_compile_options(moe_engine PRIVATE /O2 /arch:AVX2 /W3)
     target_link_libraries(moe_engine PRIVATE ws2_32 wininet)
 else()
-    target_compile_options(moe_engine PRIVATE -O3 -mavx2 -mfma -mf16c -fopenmp -Wall -Wextra)
+    # Portable baseline: NO -march/-mavx2/-mfma/-mf16c. The SIMD kernels
+    # in src/quant.cpp use function-level target("avx2,fma,f16c") /
+    # target("avx2,avx512f,avx512bw,avx512vl") attributes plus runtime
+    # CPUID + OS-state dispatch, so one binary runs on CPUs without AVX2
+    # (scalar fallback) and without AVX-512 (AVX2 kernels). Do NOT add a
+    # global -march flag here: it would make the whole binary execute
+    # unsupported instructions on older CPUs.
+    target_compile_options(moe_engine PRIVATE -O3 -fopenmp -Wall -Wextra)
     if (WIN32)
         target_link_libraries(moe_engine PRIVATE ws2_32 wininet -fopenmp)
     else()

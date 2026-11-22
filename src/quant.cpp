@@ -3,6 +3,7 @@
 #include <atomic>
 #include <cstdio>
 #include <cstdlib>
+#include <fstream>  // /proc/meminfo read for measured available RAM
 #include <limits>
 #include <thread>
 
@@ -13,6 +14,10 @@
 #else
 #include <cpuid.h>
 #endif
+#endif
+
+#if defined(__linux__)
+#include <sys/sysinfo.h>  // sysinfo() for measured available RAM
 #endif
 
 namespace moe {
@@ -804,49 +809,246 @@ static const uint64_t kIq1sGrid[2048] = {
     0x010101010101ffffULL, 0x010101010101ff01ULL, 0x01010101010101ffULL, 0x0101010101010101ULL,
 };
 
+// ---------------------------------------------------------------------------
+// Runtime SIMD dispatch.
+//
+// The translation unit is compiled with a portable baseline (no -march /
+// -mavx2; see CMakeLists.txt). AVX2/FMA/F16C code lives only in functions
+// marked MOE_TARGET_AVX2, AVX-512 code only in functions marked with the
+// avx512 target attribute (vec_dot_*_avx512). The public vec_dot_* /
+// dequantize_row_* entry points dispatch at runtime via the cpu_has_*
+// helpers, so one binary runs on CPUs without AVX2 (scalar fallback) and
+// without AVX-512 (AVX2 kernels). Never call an _avx2 / _avx512 function
+// except behind its cpu_has_* gate.
+//
+// The CPUID checks require OS support, not just the hardware bit:
+// executing AVX/AVX-512 instructions when the OS does not save the
+// corresponding register state faults. Hence OSXSAVE + XCR0 are checked:
+//   AVX2:    XCR0[1] (XMM) + XCR0[2] (YMM)
+//   AVX-512: XCR0[1,2,5,6,7] (XMM, YMM, opmask, ZMM_Hi256, Hi16_ZMM)
+//   F16C:    XCR0[1] (XMM)
+// MOE_AVX2=0 forces the scalar path; =1 forces the AVX2 path past the
+// CPUID hardware bits ONLY — the OS-state check still applies, because
+// forcing past a missing OS save area would crash. The AVX-512 kernels
+// are OFF by default (see cpu_has_avx512bw): MOE_AVX512=1 opts in, =0
+// is the default. The env vars are test hooks, not a supported
+// configuration.
+// ---------------------------------------------------------------------------
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+#define MOE_TARGET_AVX2 __attribute__((target("avx2,fma,f16c")))
+#else
+// MSVC has no per-function ISA attribute; the whole TU is built with
+// /arch:AVX2 there (see CMakeLists.txt), so the _avx2 functions are AVX2
+// unconditionally and the dispatchers below are a formality.
+#define MOE_TARGET_AVX2
+#endif
+
+// Fast fp16->fp32 for use INSIDE _avx2 functions only. The public
+// fp16_to_fp32() dispatcher must NOT be called from a hot loop: it is a
+// real (non-inlined) call, and a call inside the block loop costs the
+// call plus a spill/reload of the live ymm accumulator — measured ~2x on
+// matmul vs the old globally-AVX2 build, where the conversion was one
+// inlined vcvtph2ps per block. This helper has the same target attribute
+// as its callers, so it inlines to a single vcvtph2ps. F16C is guaranteed
+// here: cpu_has_avx2() (the gate for every _avx2 function) requires the
+// F16C CPUID bit, except under the explicit MOE_AVX2=1 force, which
+// assumes AVX2+FMA+F16C hardware. The _avx512 kernels still call the
+// dispatcher (they are not on any measured hot path; converting them
+// would need F16C added to their target attribute and gate).
+MOE_TARGET_AVX2
+static inline float fp16_to_fp32_fast(uint16_t h) {
+    return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(h))));
+}
+
+// XCR0 bits for the given mask are all set, via XGETBV. False when the OS
+// does not support XSAVE at all.
+static bool xcr0_mask_ok(uint64_t mask) {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+    unsigned int a, b, c, d;
+    if (!__get_cpuid(1, &a, &b, &c, &d)) return false;
+    if ((c & (1u << 27)) == 0) return false;  // no OSXSAVE
+    if ((c & (1u << 28)) == 0) return false;  // no AVX (YMM state)
+    uint32_t lo, hi;
+    __asm__ volatile("xgetbv" : "=a"(lo), "=d"(hi) : "c"(0));
+    const uint64_t xcr0 = (static_cast<uint64_t>(hi) << 32) | lo;
+    return (xcr0 & mask) == mask;
+#elif defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+    int cpu_info[4] = {0};
+    __cpuid(cpu_info, 1);
+    if ((cpu_info[2] & (1 << 27)) == 0) return false;
+    if ((cpu_info[2] & (1 << 28)) == 0) return false;
+    const uint64_t xcr0 = _xgetbv(0);
+    return (xcr0 & mask) == mask;
+#else
+    (void)mask;
+    return false;
+#endif
+}
+
+// Hardware + OS support, no env overrides. These are the ground truth for
+// the "Support" fields; cpu_has_* below adds the test overrides.
+static bool cpu_supports_avx2() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+    unsigned int eax, ebx, ecx, edx;
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
+    if ((ebx & (1u << 5)) == 0) return false;   // AVX2
+    unsigned int a1, b1, c1, d1;
+    if (!__get_cpuid_count(1, 0, &a1, &b1, &c1, &d1)) return false;
+    if ((c1 & (1u << 12)) == 0) return false;   // FMA (used by the _avx2 dots)
+    if ((c1 & (1u << 29)) == 0) return false;   // F16C (used by the f16 dots)
+    return xcr0_mask_ok(0x6);                    // XMM + YMM
+#elif defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+    int cpu_info[4] = {0};
+    __cpuidex(cpu_info, 7, 0);
+    if ((cpu_info[1] & (1 << 5)) == 0) return false;
+    __cpuid(cpu_info, 1);
+    if ((cpu_info[2] & (1 << 12)) == 0) return false;
+    if ((cpu_info[2] & (1 << 29)) == 0) return false;
+    return xcr0_mask_ok(0x6);
+#else
+    return false;
+#endif
+}
+
+static bool cpu_supports_f16c() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+    unsigned int eax, ebx, ecx, edx;
+    if (!__get_cpuid_count(1, 0, &eax, &ebx, &ecx, &edx)) return false;
+    if ((ecx & (1u << 29)) == 0) return false;  // F16C
+    return xcr0_mask_ok(0x2);                    // XMM
+#elif defined(_WIN32) && (defined(_M_X64) || defined(__x86_64__))
+    int cpu_info[4] = {0};
+    __cpuid(cpu_info, 1);
+    if ((cpu_info[2] & (1 << 29)) == 0) return false;
+    return xcr0_mask_ok(0x2);
+#else
+    return false;
+#endif
+}
+
+static bool cpu_supports_avx512() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+    unsigned int eax, ebx, ecx, edx;
+    if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
+    // AVX512F (bit 16) + AVX512BW (bit 30): the dot kernels need both.
+    if ((ebx & (1u << 16)) == 0 || (ebx & (1u << 30)) == 0) return false;
+    // F16C (CPUID.1:ECX bit 29): the kernels convert fp16 scales with
+    // vcvtph2ps (see fp16_to_fp32_fast), so F16C is a hard requirement.
+    unsigned int a1, b1, c1, d1;
+    if (!__get_cpuid_count(1, 0, &a1, &b1, &c1, &d1)) return false;
+    if ((c1 & (1u << 29)) == 0) return false;
+    return xcr0_mask_ok(0xE6);  // XMM, YMM, opmask, ZMM_Hi256, Hi16_ZMM
+#else
+    return false;
+#endif
+}
+
+// Active dispatch flags (cached once; env overrides are test hooks).
+static bool cpu_has_avx2() {
+    static const bool v = [] {
+        const char* env = std::getenv("MOE_AVX2");
+        if (env && std::string(env) == "0") return false;
+        if (env && std::string(env) == "1") return xcr0_mask_ok(0x6);
+        return cpu_supports_avx2();
+    }();
+    return v;
+}
+
+static bool cpu_has_f16c() {
+    static const bool v = cpu_supports_f16c();
+    return v;
+}
+
+// Runtime gate for the AVX-512 dot kernels. DEFAULT OFF (2026-11-21):
+// the kernels have no correctness coverage in Test 1 (its numbers are
+// byte-identical with MOE_AVX512=0 and =1, so no Test 1 assertion
+// exercises them), and on this VM they measure ~5x SLOWER than the AVX2
+// path on prefill (287.6 vs 57.0 ms/forward, Qwen2.5-0.5B Q4_0, pinned
+// single thread) — the zmm code plus per-block scale conversions cost
+// more than the AVX2 kernels save on this hardware. MOE_AVX512=1 opts
+// in explicitly (still requires the F16C bit + OS ZMM state, never just
+// the CPUID bits); MOE_AVX512=0 is the same as the default. Re-enable
+// by default only after a Test 1 case covers the kernels AND a bench
+// A/B shows them faster on the target hardware.
+static bool cpu_has_avx512bw() {
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
+    static const bool v = [] {
+        const char* env = std::getenv("MOE_AVX512");
+        if (env && std::string(env) == "1") {
+            unsigned int a1, b1, c1, d1;
+            if (!__get_cpuid_count(1, 0, &a1, &b1, &c1, &d1)) return false;
+            if ((c1 & (1u << 29)) == 0) return false;  // F16C
+            return xcr0_mask_ok(0xE6);
+        }
+        return false;  // default off (see above); =0 is the same
+    }();
+    return v;
+#else
+    return false;
+#endif
+}
+
 HardwareSpecs query_hardware_specs() {
     HardwareSpecs specs;
     specs.logical_cores = std::max(1u, std::thread::hardware_concurrency());
     specs.cpu_brand = "x86_64 Multi-Core Processor";
 
 #if defined(__x86_64__) || defined(_M_X64)
-    int cpuInfo[4] = {0};
+    // Brand string, CPUID leaves 0x80000002-4 (both Windows and Linux;
+    // the Linux branch previously never read it and always reported the
+    // "x86_64 Multi-Core Processor" placeholder).
+    {
+        char brand[0x40] = {0};
+        bool have_brand = false;
 #ifdef _WIN32
-    __cpuid(cpuInfo, 0x80000000);
-    unsigned int nExIds = cpuInfo[0];
-    char brand[0x40] = {0};
-    if (nExIds >= 0x80000004) {
-        __cpuid(reinterpret_cast<int*>(brand), 0x80000002);
-        __cpuid(reinterpret_cast<int*>(brand + 16), 0x80000003);
-        __cpuid(reinterpret_cast<int*>(brand + 32), 0x80000004);
-        specs.cpu_brand = brand;
-        // trim leading spaces
-        size_t first = specs.cpu_brand.find_first_not_of(' ');
-        if (first != std::string::npos) specs.cpu_brand = specs.cpu_brand.substr(first);
-    }
-    __cpuidex(cpuInfo, 7, 0);
-    specs.has_avx2 = (cpuInfo[1] & (1 << 5)) != 0;
-    specs.has_avx512 = (cpuInfo[1] & (1 << 16)) != 0;
+        int cpu_info[4] = {0};
+        __cpuid(cpu_info, 0x80000000);
+        if (static_cast<unsigned int>(cpu_info[0]) >= 0x80000004) {
+            __cpuid(reinterpret_cast<int*>(brand), 0x80000002);
+            __cpuid(reinterpret_cast<int*>(brand + 16), 0x80000003);
+            __cpuid(reinterpret_cast<int*>(brand + 32), 0x80000004);
+            have_brand = true;
+        }
 #else
-    unsigned int eax, ebx, ecx, edx;
-    if (__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) {
-        specs.has_avx2 = (ebx & (1 << 5)) != 0;
-        specs.has_avx512 = (ebx & (1 << 16)) != 0;
-    }
+        unsigned int a, b, c, d;
+        if (__get_cpuid(0x80000000, &a, &b, &c, &d) && a >= 0x80000004) {
+            uint32_t* words = reinterpret_cast<uint32_t*>(brand);
+            __get_cpuid(0x80000002, &a, &b, &c, &d);
+            words[0] = a; words[1] = b; words[2] = c; words[3] = d;
+            __get_cpuid(0x80000003, &a, &b, &c, &d);
+            words[4] = a; words[5] = b; words[6] = c; words[7] = d;
+            __get_cpuid(0x80000004, &a, &b, &c, &d);
+            words[8] = a; words[9] = b; words[10] = c; words[11] = d;
+            have_brand = true;
+        }
 #endif
+        if (have_brand) {
+            specs.cpu_brand = brand;
+            // trim leading spaces
+            size_t first = specs.cpu_brand.find_first_not_of(' ');
+            if (first != std::string::npos) specs.cpu_brand = specs.cpu_brand.substr(first);
+        }
+    }
+    // Usable hardware support (CPUID + OS state). The AVX-512 bit alone
+    // is not enough: the dot kernels also need AVX512BW and OS ZMM state.
+    specs.has_avx2 = cpu_supports_avx2();
+    specs.has_avx512 = cpu_supports_avx512();
 #endif
 
-    // Honest label: the general SIMD backend is AVX2. AVX-512 is only
-    // CPUID-detected here; the only AVX-512 code paths are the three dot
-    // kernels in quant.cpp (vec_dot_q4_0/q8_0/q4_K_q8_0_avx512, used for
-    // matmul rows when MOE_AVX512 is not 0). Do not label the backend
-    // "AVX-512" — see investigation report, "Claims vs. reality".
-    if (specs.has_avx512) {
+    // simd_backend names the ACTIVE dispatch path (including the
+    // MOE_AVX2 / MOE_AVX512 test overrides), while has_avx2 / has_avx512
+    // above report usable hardware. On a CPU without AVX2 the engine
+    // still runs via the scalar fallback — it is slower, not unusable.
+    // The only AVX-512 code paths are the three dot kernels
+    // (vec_dot_q4_0/q8_0/q4_K_q8_0_avx512, used for matmul rows when the
+    // AVX-512 gate passes). Do not label the backend "AVX-512" — see
+    // investigation report, "Claims vs. reality".
+    if (cpu_has_avx512bw()) {
         specs.simd_backend = "AVX2 + FMA3 Vectorized (AVX-512 dot kernels: Q4_0/Q4_K/Q8_0)";
-    } else if (specs.has_avx2) {
+    } else if (cpu_has_avx2()) {
         specs.simd_backend = "AVX2 + FMA3 Vectorized";
     } else {
-        specs.simd_backend = "Scalar IEEE-754";
+        specs.simd_backend = "Scalar IEEE-754 (no usable AVX2; scalar fallback)";
     }
 
 #ifdef _WIN32
@@ -865,18 +1067,55 @@ HardwareSpecs query_hardware_specs() {
     long page_size = sysconf(_SC_PAGE_SIZE);
     if (pages > 0 && page_size > 0) {
         specs.total_ram_bytes = static_cast<uint64_t>(pages) * static_cast<uint64_t>(page_size);
-        specs.avail_ram_bytes = specs.total_ram_bytes / 2;
     }
+    // Available RAM is MEASURED, not estimated. (Previously this was
+    // total/2, which overstated availability — e.g. 3.9 GB reported
+    // while the system had ~1.3 GB free.)
+#if defined(__linux__)
+    // Prefer /proc/meminfo MemAvailable (free + reclaimable cache — what
+    // the kernel says a new allocation can actually use) over sysinfo
+    // freeram, which excludes reclaimable cache and understates it
+    // (e.g. 0.4 GB freeram vs 0.8 GB MemAvailable on a loaded cell).
+    bool have_avail = false;
+    {
+        std::ifstream mi("/proc/meminfo");
+        std::string line;
+        while (std::getline(mi, line)) {
+            if (line.rfind("MemAvailable:", 0) == 0) {
+                specs.avail_ram_bytes = static_cast<uint64_t>(std::stoull(line.substr(13))) * 1024ULL;
+                have_avail = true;
+                break;
+            }
+        }
+    }
+    if (!have_avail) {
+        struct sysinfo si;
+        if (sysinfo(&si) == 0) {
+            specs.avail_ram_bytes = static_cast<uint64_t>(si.freeram) * static_cast<uint64_t>(si.mem_unit);
+        }
+    }
+#elif defined(_SC_AVPHYS_PAGES)
+    long avail_pages = sysconf(_SC_AVPHYS_PAGES);
+    if (avail_pages > 0 && page_size > 0) {
+        specs.avail_ram_bytes = static_cast<uint64_t>(avail_pages) * static_cast<uint64_t>(page_size);
+    }
+#endif
 #endif
     specs.vram_budget_bytes = std::min<uint64_t>(specs.total_ram_bytes / 4, 8ULL * 1024 * 1024 * 1024);
     return specs;
 }
 
-// IEEE 754 FP16 <-> FP32 conversion
-float fp16_to_fp32(uint16_t h) {
-#if defined(__F16C__)
+// IEEE 754 FP16 <-> FP32 conversion. The F16C intrinsic version is only
+// called behind the cpu_has_f16c() gate (see the dispatch helpers above);
+// the scalar version is bit-identical IEEE-754 conversion.
+#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
+__attribute__((target("f16c")))
+#endif
+static float fp16_to_fp32_f16c(uint16_t h) {
     return _mm_cvtss_f32(_mm_cvtph_ps(_mm_cvtsi32_si128(static_cast<int>(h))));
-#else
+}
+
+static float fp16_to_fp32_scalar(uint16_t h) {
     uint32_t sign = static_cast<uint32_t>(h & 0x8000) << 16;
     uint32_t exp  = (h >> 10) & 0x1F;
     uint32_t mant = h & 0x03FF;
@@ -903,7 +1142,11 @@ float fp16_to_fp32(uint16_t h) {
     float out;
     std::memcpy(&out, &fbits, sizeof(float));
     return out;
-#endif
+}
+
+float fp16_to_fp32(uint16_t h) {
+    if (cpu_has_f16c()) return fp16_to_fp32_f16c(h);
+    return fp16_to_fp32_scalar(h);
 }
 
 uint16_t fp32_to_fp16(float f) {
@@ -1013,6 +1256,7 @@ void quantize_row_q4_0(const float* x, void* vy, int64_t k) {
 
 void dequantize_row_q4_0(const void* vx, float* y, int64_t k) {
     const int64_t nb = k / 32;
+    const int64_t rem = k - nb * 32;
     const auto* x = static_cast<const block_q4_0*>(vx);
 
     for (int64_t i = 0; i < nb; ++i) {
@@ -1022,6 +1266,19 @@ void dequantize_row_q4_0(const void* vx, float* y, int64_t k) {
             const int x1 = (x[i].qs[j] >> 4) - 8;
             y[i * 32 + j]      = x0 * d;
             y[i * 32 + j + 16] = x1 * d;
+        }
+    }
+    if (rem > 0) {
+        // Final partial block: write only its `rem` valid elements.
+        // The block exists in memory (rows are stored block-aligned);
+        // without this the tail was silently dropped (k < 32 wrote
+        // nothing at all). Element j < 16 is the low nibble of qs[j],
+        // j >= 16 the high nibble of qs[j - 16] — same layout as above.
+        const float d = fp16_to_fp32(x[nb].d);
+        for (int64_t j = 0; j < rem; ++j) {
+            const int v = (j < 16) ? (x[nb].qs[j] & 0x0F) - 8
+                                   : (x[nb].qs[j - 16] >> 4) - 8;
+            y[nb * 32 + j] = v * d;
         }
     }
 }
@@ -1046,12 +1303,21 @@ void quantize_row_q8_0(const float* x, void* vy, int64_t k) {
 
 void dequantize_row_q8_0(const void* vx, float* y, int64_t k) {
     const int64_t nb = k / 32;
+    const int64_t rem = k - nb * 32;
     const auto* x = static_cast<const block_q8_0*>(vx);
 
     for (int64_t i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d);
         for (int j = 0; j < 32; ++j) {
             y[i * 32 + j] = x[i].qs[j] * d;
+        }
+    }
+    if (rem > 0) {
+        // Final partial block: write only its `rem` valid elements
+        // (same silent-tail-drop bug as dequantize_row_q4_0 above).
+        const float d = fp16_to_fp32(x[nb].d);
+        for (int64_t j = 0; j < rem; ++j) {
+            y[nb * 32 + j] = x[nb].qs[j] * d;
         }
     }
 }
@@ -2660,16 +2926,25 @@ void quantize_row_f16(const float* x, void* vy, int64_t k) {
     for (int64_t i = 0; i < k; ++i) y[i] = fp32_to_fp16(x[i]);
 }
 
-void dequantize_row_f16(const void* vx, float* y, int64_t k) {
+MOE_TARGET_AVX2
+static void dequantize_row_f16_avx2(const void* vx, float* y, int64_t k) {
     const auto* x = static_cast<const uint16_t*>(vx);
     int64_t i = 0;
-#if defined(__F16C__) && defined(__AVX2__)
     for (; i + 8 <= k; i += 8) {
         __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + i));
         _mm256_storeu_ps(y + i, _mm256_cvtph_ps(h));
     }
-#endif
-    for (; i < k; ++i) y[i] = fp16_to_fp32(x[i]);
+    for (; i < k; ++i) y[i] = fp16_to_fp32_fast(x[i]);
+}
+
+static void dequantize_row_f16_scalar(const void* vx, float* y, int64_t k) {
+    const auto* x = static_cast<const uint16_t*>(vx);
+    for (int64_t i = 0; i < k; ++i) y[i] = fp16_to_fp32(x[i]);
+}
+
+void dequantize_row_f16(const void* vx, float* y, int64_t k) {
+    if (cpu_has_avx2()) { dequantize_row_f16_avx2(vx, y, k); return; }
+    dequantize_row_f16_scalar(vx, y, k);
 }
 
 void quantize_row_bf16(const float* x, void* vy, int64_t k) {
@@ -2753,10 +3028,10 @@ void dequantize_row(GGMLType type, const void* vx, float* y, int64_t k) {
 // Vectorized SIMD Dot Products (AVX2 + FMA / Scalar fallback)
 // ============================================================================
 
-float vec_dot_f32(const float* a, const float* b, int64_t k) {
+MOE_TARGET_AVX2
+static float vec_dot_f32_avx2(const float* a, const float* b, int64_t k) {
     int64_t i = 0;
     float sum = 0.0f;
-#if defined(__AVX2__)
     __m256 acc0 = _mm256_setzero_ps();
     __m256 acc1 = _mm256_setzero_ps();
     for (; i + 16 <= k; i += 16) {
@@ -2770,25 +3045,35 @@ float vec_dot_f32(const float* a, const float* b, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc0);
     for (int j = 0; j < 8; ++j) sum += tmp[j];
-#endif
     for (; i < k; ++i) {
         sum += a[i] * b[i];
     }
     return sum;
 }
 
-float vec_dot_q4_0_f32(const void* vx, const float* y, int64_t k) {
+static float vec_dot_f32_scalar(const float* a, const float* b, int64_t k) {
+    float sum = 0.0f;
+    for (int64_t i = 0; i < k; ++i) sum += a[i] * b[i];
+    return sum;
+}
+
+float vec_dot_f32(const float* a, const float* b, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_f32_avx2(a, b, k);
+    return vec_dot_f32_scalar(a, b, k);
+}
+
+MOE_TARGET_AVX2
+static float vec_dot_q4_0_f32_avx2(const void* vx, const float* y, int64_t k) {
     const int64_t nb = k / 32;
     const auto* x = static_cast<const block_q4_0*>(vx);
     float total = 0.0f;
 
-#if defined(__AVX2__)
     __m256 acc = _mm256_setzero_ps();
     const __m128i mask_low = _mm_set1_epi8(0x0F);
     const __m256i offset_8 = _mm256_set1_epi32(8);
 
     for (int64_t i = 0; i < nb; ++i) {
-        const float d = fp16_to_fp32(x[i].d);
+        const float d = fp16_to_fp32_fast(x[i].d);
         const __m256 vd = _mm256_set1_ps(d);
         const __m128i qbytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x[i].qs));
 
@@ -2811,7 +3096,24 @@ float vec_dot_q4_0_f32(const void* vx, const float* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int j = 0; j < 8; ++j) total += tmp[j];
-#else
+    if (const int64_t rem = k - nb * 32; rem > 0) {
+        // Final partial block: same handling as vec_dot_deq_f32 for the
+        // K types — dequantize the whole block into scratch (it exists
+        // in memory; rows are stored block-aligned) and dot only its
+        // `rem` valid elements. Without this a trailing partial block
+        // was silently dropped (k < 32 gave a dot of exactly 0).
+        alignas(32) float deq[32];
+        dequantize_row_q4_0(&x[nb], deq, 32);
+        total += vec_dot_f32(deq, y + nb * 32, rem);
+    }
+    return total;
+}
+
+static float vec_dot_q4_0_f32_scalar(const void* vx, const float* y, int64_t k) {
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q4_0*>(vx);
+    float total = 0.0f;
+
     for (int64_t i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d);
         float bsum = 0.0f;
@@ -2822,19 +3124,29 @@ float vec_dot_q4_0_f32(const void* vx, const float* y, int64_t k) {
         }
         total += d * bsum;
     }
-#endif
+    if (const int64_t rem = k - nb * 32; rem > 0) {
+        // Final partial block (same vec_dot_deq_f32 pattern as above).
+        alignas(32) float deq[32];
+        dequantize_row_q4_0(&x[nb], deq, 32);
+        total += vec_dot_f32(deq, y + nb * 32, rem);
+    }
     return total;
 }
 
-float vec_dot_q8_0_f32(const void* vx, const float* y, int64_t k) {
+float vec_dot_q4_0_f32(const void* vx, const float* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_q4_0_f32_avx2(vx, y, k);
+    return vec_dot_q4_0_f32_scalar(vx, y, k);
+}
+
+MOE_TARGET_AVX2
+static float vec_dot_q8_0_f32_avx2(const void* vx, const float* y, int64_t k) {
     const int64_t nb = k / 32;
     const auto* x = static_cast<const block_q8_0*>(vx);
     float total = 0.0f;
 
-#if defined(__AVX2__)
     __m256 acc = _mm256_setzero_ps();
     for (int64_t i = 0; i < nb; ++i) {
-        const float d = fp16_to_fp32(x[i].d);
+        const float d = fp16_to_fp32_fast(x[i].d);
         const __m256 vd = _mm256_set1_ps(d);
         const float* yb = y + i * 32;
         __m256 bsum = _mm256_setzero_ps();
@@ -2848,7 +3160,22 @@ float vec_dot_q8_0_f32(const void* vx, const float* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int j = 0; j < 8; ++j) total += tmp[j];
-#else
+    if (const int64_t rem = k - nb * 32; rem > 0) {
+        // Final partial block: same vec_dot_deq_f32 pattern as the
+        // Q4_0 dots — dequantize the whole block into scratch and dot
+        // only its `rem` valid elements (k < 32 used to give exactly 0).
+        alignas(32) float deq[32];
+        dequantize_row_q8_0(&x[nb], deq, 32);
+        total += vec_dot_f32(deq, y + nb * 32, rem);
+    }
+    return total;
+}
+
+static float vec_dot_q8_0_f32_scalar(const void* vx, const float* y, int64_t k) {
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q8_0*>(vx);
+    float total = 0.0f;
+
     for (int64_t i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d);
         float bsum = 0.0f;
@@ -2857,22 +3184,32 @@ float vec_dot_q8_0_f32(const void* vx, const float* y, int64_t k) {
         }
         total += d * bsum;
     }
-#endif
+    if (const int64_t rem = k - nb * 32; rem > 0) {
+        // Final partial block (same vec_dot_deq_f32 pattern as above).
+        alignas(32) float deq[32];
+        dequantize_row_q8_0(&x[nb], deq, 32);
+        total += vec_dot_f32(deq, y + nb * 32, rem);
+    }
     return total;
 }
 
-float vec_dot_iq4_nl_f32(const void* vx, const float* y, int64_t k) {
+float vec_dot_q8_0_f32(const void* vx, const float* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_q8_0_f32_avx2(vx, y, k);
+    return vec_dot_q8_0_f32_scalar(vx, y, k);
+}
+
+MOE_TARGET_AVX2
+static float vec_dot_iq4_nl_f32_avx2(const void* vx, const float* y, int64_t k) {
     const int64_t nb = k / 32;
     const auto* x = static_cast<const block_iq4_nl*>(vx);
     float total = 0.0f;
 
-#if defined(__AVX2__)
     const __m128i lut = _mm_loadu_si128(reinterpret_cast<const __m128i*>(kvalues_iq4nl));
     const __m128i mask_low = _mm_set1_epi8(0x0F);
     __m256 acc = _mm256_setzero_ps();
 
     for (int64_t i = 0; i < nb; ++i) {
-        const float d = fp16_to_fp32(x[i].d);
+        const float d = fp16_to_fp32_fast(x[i].d);
         const __m256 vd = _mm256_set1_ps(d);
         const __m128i qbytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x[i].qs));
         const __m128i q_lo = _mm_and_si128(qbytes, mask_low);
@@ -2891,7 +3228,14 @@ float vec_dot_iq4_nl_f32(const void* vx, const float* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int j = 0; j < 8; ++j) total += tmp[j];
-#else
+    return total;
+}
+
+static float vec_dot_iq4_nl_f32_scalar(const void* vx, const float* y, int64_t k) {
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_iq4_nl*>(vx);
+    float total = 0.0f;
+
     for (int64_t i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d);
         float bsum = 0.0f;
@@ -2903,23 +3247,27 @@ float vec_dot_iq4_nl_f32(const void* vx, const float* y, int64_t k) {
         }
         total += d * bsum;
     }
-#endif
     return total;
 }
 
-float vec_dot_q4_K_f32(const void* vx, const float* y, int64_t k) {
+float vec_dot_iq4_nl_f32(const void* vx, const float* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_iq4_nl_f32_avx2(vx, y, k);
+    return vec_dot_iq4_nl_f32_scalar(vx, y, k);
+}
+
+MOE_TARGET_AVX2
+static float vec_dot_q4_K_f32_avx2(const void* vx, const float* y, int64_t k) {
     const int64_t nb = k / 256;
     const auto* x = static_cast<const block_q4_K*>(vx);
     float total = 0.0f;
 
-#if defined(__AVX2__)
     const __m128i mask_low = _mm_set1_epi8(0x0F);
     __m256 acc = _mm256_setzero_ps();
 
     for (int64_t i = 0; i < nb; ++i) {
         const uint8_t* q = x[i].qs;
-        const float d    = fp16_to_fp32(x[i].d);
-        const float dmin = fp16_to_fp32(x[i].dmin);
+        const float d    = fp16_to_fp32_fast(x[i].d);
+        const float dmin = fp16_to_fp32_fast(x[i].dmin);
         const float* yb  = y + i * 256;
 
         int is = 0;
@@ -2975,7 +3323,21 @@ float vec_dot_q4_K_f32(const void* vx, const float* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int t = 0; t < 8; ++t) total += tmp[t];
-#else
+    if (const int64_t rem = k - nb * 256; rem > 0) {
+        // Final partial block: dequantize it and dot only its `rem`
+        // valid elements (the rest of the block is padding).
+        alignas(32) float deq[256];
+        dequantize_row_q4_K(&x[nb], deq, 256);
+        total += vec_dot_f32(deq, y + nb * 256, rem);
+    }
+    return total;
+}
+
+static float vec_dot_q4_K_f32_scalar(const void* vx, const float* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_q4_K*>(vx);
+    float total = 0.0f;
+
     for (int64_t i = 0; i < nb; ++i) {
         const uint8_t* q = x[i].qs;
         const float d    = fp16_to_fp32(x[i].d);
@@ -3001,7 +3363,6 @@ float vec_dot_q4_K_f32(const void* vx, const float* y, int64_t k) {
             is += 2;
         }
     }
-#endif
     if (const int64_t rem = k - nb * 256; rem > 0) {
         // Final partial block: dequantize it and dot only its `rem`
         // valid elements (the rest of the block is padding).
@@ -3012,11 +3373,16 @@ float vec_dot_q4_K_f32(const void* vx, const float* y, int64_t k) {
     return total;
 }
 
-float vec_dot_f16_f32(const void* vx, const float* y, int64_t k) {
+float vec_dot_q4_K_f32(const void* vx, const float* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_q4_K_f32_avx2(vx, y, k);
+    return vec_dot_q4_K_f32_scalar(vx, y, k);
+}
+
+MOE_TARGET_AVX2
+static float vec_dot_f16_f32_avx2(const void* vx, const float* y, int64_t k) {
     const auto* x = static_cast<const uint16_t*>(vx);
     float total = 0.0f;
     int64_t i = 0;
-#if defined(__F16C__) && defined(__AVX2__)
     __m256 acc = _mm256_setzero_ps();
     for (; i + 8 <= k; i += 8) {
         __m128i h = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + i));
@@ -3027,18 +3393,29 @@ float vec_dot_f16_f32(const void* vx, const float* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int j = 0; j < 8; ++j) total += tmp[j];
-#endif
     for (; i < k; ++i) {
-        total += fp16_to_fp32(x[i]) * y[i];
+        total += fp16_to_fp32_fast(x[i]) * y[i];
     }
     return total;
 }
 
-float vec_dot_bf16_f32(const void* vx, const float* y, int64_t k) {
+static float vec_dot_f16_f32_scalar(const void* vx, const float* y, int64_t k) {
+    const auto* x = static_cast<const uint16_t*>(vx);
+    float total = 0.0f;
+    for (int64_t i = 0; i < k; ++i) total += fp16_to_fp32(x[i]) * y[i];
+    return total;
+}
+
+float vec_dot_f16_f32(const void* vx, const float* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_f16_f32_avx2(vx, y, k);
+    return vec_dot_f16_f32_scalar(vx, y, k);
+}
+
+MOE_TARGET_AVX2
+static float vec_dot_bf16_f32_avx2(const void* vx, const float* y, int64_t k) {
     const auto* x = static_cast<const uint16_t*>(vx);
     float total = 0.0f;
     int64_t i = 0;
-#if defined(__AVX2__)
     __m256 acc = _mm256_setzero_ps();
     for (; i + 8 <= k; i += 8) {
         __m128i b = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x + i));
@@ -3050,11 +3427,22 @@ float vec_dot_bf16_f32(const void* vx, const float* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int j = 0; j < 8; ++j) total += tmp[j];
-#endif
     for (; i < k; ++i) {
         total += bf16_to_fp32(x[i]) * y[i];
     }
     return total;
+}
+
+static float vec_dot_bf16_f32_scalar(const void* vx, const float* y, int64_t k) {
+    const auto* x = static_cast<const uint16_t*>(vx);
+    float total = 0.0f;
+    for (int64_t i = 0; i < k; ++i) total += bf16_to_fp32(x[i]) * y[i];
+    return total;
+}
+
+float vec_dot_bf16_f32(const void* vx, const float* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_bf16_f32_avx2(vx, y, k);
+    return vec_dot_bf16_f32_scalar(vx, y, k);
 }
 
 float vec_dot_fp8_f32(const void* vx, const float* y, int64_t k) {
@@ -3084,19 +3472,31 @@ float vec_dot_q5_K_f32(const void* vx, const float* y, int64_t k) {
     return sum;
 }
 
-float vec_dot_q6_K_f32(const void* vx, const float* y, int64_t k) {
+// Helper for vec_dot_q6_K_f32_avx2 below: dot of one 16-element nibble
+// group. A lambda cannot be used here: GCC lambdas do not inherit the
+// enclosing function's target attribute, so the _mm256 intrinsics fail
+// to inline ("target specific option mismatch").
+MOE_TARGET_AVX2
+static __m256 dot16_q6k(__m128i qv, const float* yp) {
+    __m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(qv));
+    __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(qv, 8)));
+    __m256 s0 = _mm256_mul_ps(f0, _mm256_loadu_ps(yp + 0));
+    return _mm256_fmadd_ps(f1, _mm256_loadu_ps(yp + 8), s0);
+}
+
+MOE_TARGET_AVX2
+static float vec_dot_q6_K_f32_avx2(const void* vx, const float* y, int64_t k) {
     const int64_t nb = k / 256;
     const auto* blocks = static_cast<const block_q6_K*>(vx);
     float sum = 0.0f;
 
-#if defined(__AVX2__)
     const __m128i mask_0f = _mm_set1_epi8(0x0F);
     const __m128i mask_03 = _mm_set1_epi8(0x03);
     const __m128i offset_32 = _mm_set1_epi8(32);
     __m256 acc = _mm256_setzero_ps();
 
     for (int64_t i = 0; i < nb; ++i) {
-        const float d = fp16_to_fp32(blocks[i].d);
+        const float d = fp16_to_fp32_fast(blocks[i].d);
         const uint8_t* ql = blocks[i].ql;
         const uint8_t* qh = blocks[i].qh;
         const int8_t* sc  = blocks[i].scales;
@@ -3126,18 +3526,11 @@ float vec_dot_q6_K_f32(const void* vx, const float* y, int64_t k) {
                     offset_32
                 );
 
-                auto dot16 = [](__m128i qv, const float* yp) -> __m256 {
-                    __m256 f0 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(qv));
-                    __m256 f1 = _mm256_cvtepi32_ps(_mm256_cvtepi8_epi32(_mm_srli_si128(qv, 8)));
-                    __m256 s0 = _mm256_mul_ps(f0, _mm256_loadu_ps(yp + 0));
-                    return _mm256_fmadd_ps(f1, _mm256_loadu_ps(yp + 8), s0);
-                };
-
                 const float* y_base = yb + n + l_off;
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d * static_cast<float>(sc[is + 0])), dot16(q1, y_base +  0), acc);
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d * static_cast<float>(sc[is + 2])), dot16(q2, y_base + 32), acc);
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d * static_cast<float>(sc[is + 4])), dot16(q3, y_base + 64), acc);
-                acc = _mm256_fmadd_ps(_mm256_set1_ps(d * static_cast<float>(sc[is + 6])), dot16(q4, y_base + 96), acc);
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d * static_cast<float>(sc[is + 0])), dot16_q6k(q1, y_base +  0), acc);
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d * static_cast<float>(sc[is + 2])), dot16_q6k(q2, y_base + 32), acc);
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d * static_cast<float>(sc[is + 4])), dot16_q6k(q3, y_base + 64), acc);
+                acc = _mm256_fmadd_ps(_mm256_set1_ps(d * static_cast<float>(sc[is + 6])), dot16_q6k(q4, y_base + 96), acc);
             }
             ql += 64;
             qh += 32;
@@ -3147,13 +3540,6 @@ float vec_dot_q6_K_f32(const void* vx, const float* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int j = 0; j < 8; ++j) sum += tmp[j];
-#else
-    alignas(32) float deq[256];
-    for (int64_t i = 0; i < nb; ++i) {
-        dequantize_row_q6_K(&blocks[i], deq, 256);
-        sum += vec_dot_f32(deq, y + i * 256, 256);
-    }
-#endif
     if (const int64_t rem = k - nb * 256; rem > 0) {
         // Final partial block: see vec_dot_q4_K_f32.
         alignas(32) float deq_tail[256];
@@ -3161,6 +3547,30 @@ float vec_dot_q6_K_f32(const void* vx, const float* y, int64_t k) {
         sum += vec_dot_f32(deq_tail, y + nb * 256, rem);
     }
     return sum;
+}
+
+static float vec_dot_q6_K_f32_scalar(const void* vx, const float* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* blocks = static_cast<const block_q6_K*>(vx);
+    float sum = 0.0f;
+
+    alignas(32) float deq[256];
+    for (int64_t i = 0; i < nb; ++i) {
+        dequantize_row_q6_K(&blocks[i], deq, 256);
+        sum += vec_dot_f32(deq, y + i * 256, 256);
+    }
+    if (const int64_t rem = k - nb * 256; rem > 0) {
+        // Final partial block: see vec_dot_q4_K_f32.
+        alignas(32) float deq_tail[256];
+        dequantize_row_q6_K(&blocks[nb], deq_tail, 256);
+        sum += vec_dot_f32(deq_tail, y + nb * 256, rem);
+    }
+    return sum;
+}
+
+float vec_dot_q6_K_f32(const void* vx, const float* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_q6_K_f32_avx2(vx, y, k);
+    return vec_dot_q6_K_f32_scalar(vx, y, k);
 }
 
 float vec_dot_iq2_s_f32(const void* vx, const float* y, int64_t k) {
@@ -3304,19 +3714,19 @@ float vec_dot_quant_f32(GGMLType type, const void* vx, const float* y, int64_t k
     }
 }
 
-float vec_dot_q4_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+MOE_TARGET_AVX2
+static float vec_dot_q4_0_q8_0_avx2(const void* vx, const block_q8_0* y, int64_t k) {
     const int64_t nb = k / 32;
     const auto* x = static_cast<const block_q4_0*>(vx);
     float total = 0.0f;
 
-#if defined(__AVX2__)
     const __m128i mask_0f = _mm_set1_epi8(0x0F);
     const __m256i offset_8 = _mm256_set1_epi8(8);
     const __m256i ones_16 = _mm256_set1_epi16(1);
     __m256 acc = _mm256_setzero_ps();
 
     for (int64_t i = 0; i < nb; ++i) {
-        const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
+        const float d = fp16_to_fp32_fast(x[i].d) * fp16_to_fp32_fast(y[i].d);
         const __m128i qbytes = _mm_loadu_si128(reinterpret_cast<const __m128i*>(x[i].qs));
         const __m128i q_lo = _mm_and_si128(qbytes, mask_0f);
         const __m128i q_hi = _mm_and_si128(_mm_srli_epi16(qbytes, 4), mask_0f);
@@ -3332,7 +3742,14 @@ float vec_dot_q4_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int j = 0; j < 8; ++j) total += tmp[j];
-#else
+    return total;
+}
+
+static float vec_dot_q4_0_q8_0_scalar(const void* vx, const block_q8_0* y, int64_t k) {
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q4_0*>(vx);
+    float total = 0.0f;
+
     for (int64_t i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
         int32_t bsum = 0;
@@ -3343,8 +3760,12 @@ float vec_dot_q4_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
         }
         total += d * static_cast<float>(bsum);
     }
-#endif
     return total;
+}
+
+float vec_dot_q4_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_q4_0_q8_0_avx2(vx, y, k);
+    return vec_dot_q4_0_q8_0_scalar(vx, y, k);
 }
 
 // AVX-512 (BW) widening of vec_dot_q4_0_q8_0: two 32-element blocks per
@@ -3354,10 +3775,12 @@ float vec_dot_q4_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
 // separate scales in the float scale vector (lanes 0-7 use d0, 8-15
 // use d1). Integer partial sums are exact; only the float accumulation
 // order changes (16 lanes vs 8), so results agree to <1 ulp.
-// Function-level target attribute keeps the translation unit at -mavx2:
-// this is only called after the CPUID gate in vec_dot_row_with_q8().
+// Function-level target attribute: the translation unit is compiled
+// portable (no -mavx2); this function alone is compiled with AVX-512
+// enabled, and is only called after the CPUID+OS gate in
+// vec_dot_row_with_q8().
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-__attribute__((target("avx2,avx512f,avx512bw,avx512vl")))
+__attribute__((target("avx2,avx512f,avx512bw,avx512vl,f16c")))
 static float vec_dot_q4_0_q8_0_avx512(const void* vx, const block_q8_0* y, int64_t k) {
     const int64_t nb = k / 32;
     const auto* x = static_cast<const block_q4_0*>(vx);
@@ -3367,8 +3790,8 @@ static float vec_dot_q4_0_q8_0_avx512(const void* vx, const block_q8_0* y, int64
     const __m512i zero = _mm512_setzero_si512();
     int64_t i = 0;
     for (; i + 1 < nb; i += 2) {
-        const float d0 = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
-        const float d1 = fp16_to_fp32(x[i + 1].d) * fp16_to_fp32(y[i + 1].d);
+        const float d0 = fp16_to_fp32_fast(x[i].d) * fp16_to_fp32_fast(y[i].d);
+        const float d1 = fp16_to_fp32_fast(x[i + 1].d) * fp16_to_fp32_fast(y[i + 1].d);
         const __m256i qb = _mm256_set_m128i(
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(x[i + 1].qs)),
             _mm_loadu_si128(reinterpret_cast<const __m128i*>(x[i].qs)));
@@ -3402,17 +3825,17 @@ static float vec_dot_q4_0_q8_0_avx512(const void* vx, const block_q8_0* y, int64
 }
 #endif
 
-float vec_dot_q8_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+MOE_TARGET_AVX2
+static float vec_dot_q8_0_q8_0_avx2(const void* vx, const block_q8_0* y, int64_t k) {
     const int64_t nb = k / 32;
     const auto* x = static_cast<const block_q8_0*>(vx);
     float total = 0.0f;
 
-#if defined(__AVX2__)
     const __m256i ones_16 = _mm256_set1_epi16(1);
     __m256 acc = _mm256_setzero_ps();
 
     for (int64_t i = 0; i < nb; ++i) {
-        const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
+        const float d = fp16_to_fp32_fast(x[i].d) * fp16_to_fp32_fast(y[i].d);
         const __m256i xv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[i].qs));
         const __m256i yv = _mm256_loadu_si256(reinterpret_cast<const __m256i*>(y[i].qs));
 
@@ -3425,7 +3848,14 @@ float vec_dot_q8_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int j = 0; j < 8; ++j) total += tmp[j];
-#else
+    return total;
+}
+
+static float vec_dot_q8_0_q8_0_scalar(const void* vx, const block_q8_0* y, int64_t k) {
+    const int64_t nb = k / 32;
+    const auto* x = static_cast<const block_q8_0*>(vx);
+    float total = 0.0f;
+
     for (int64_t i = 0; i < nb; ++i) {
         const float d = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
         int32_t bsum = 0;
@@ -3434,14 +3864,18 @@ float vec_dot_q8_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
         }
         total += d * static_cast<float>(bsum);
     }
-#endif
     return total;
+}
+
+float vec_dot_q8_0_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_q8_0_q8_0_avx2(vx, y, k);
+    return vec_dot_q8_0_q8_0_scalar(vx, y, k);
 }
 
 // AVX-512 (BW) widening of vec_dot_q8_0_q8_0: two 32-element blocks per
 // step, same pairing and scale layout as the Q4_0 variant above.
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-__attribute__((target("avx2,avx512f,avx512bw,avx512vl")))
+__attribute__((target("avx2,avx512f,avx512bw,avx512vl,f16c")))
 static float vec_dot_q8_0_q8_0_avx512(const void* vx, const block_q8_0* y, int64_t k) {
     const int64_t nb = k / 32;
     const auto* x = static_cast<const block_q8_0*>(vx);
@@ -3450,8 +3884,8 @@ static float vec_dot_q8_0_q8_0_avx512(const void* vx, const block_q8_0* y, int64
     const __m512i zero = _mm512_setzero_si512();
     int64_t i = 0;
     for (; i + 1 < nb; i += 2) {
-        const float d0 = fp16_to_fp32(x[i].d) * fp16_to_fp32(y[i].d);
-        const float d1 = fp16_to_fp32(x[i + 1].d) * fp16_to_fp32(y[i + 1].d);
+        const float d0 = fp16_to_fp32_fast(x[i].d) * fp16_to_fp32_fast(y[i].d);
+        const float d1 = fp16_to_fp32_fast(x[i + 1].d) * fp16_to_fp32_fast(y[i + 1].d);
         const __m512i q = _mm512_inserti64x4(
             _mm512_castsi256_si512(_mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[i].qs))),
             _mm256_loadu_si256(reinterpret_cast<const __m256i*>(x[i + 1].qs)), 1);
@@ -3474,12 +3908,12 @@ static float vec_dot_q8_0_q8_0_avx512(const void* vx, const block_q8_0* y, int64
 }
 #endif
 
-float vec_dot_q4_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+MOE_TARGET_AVX2
+static float vec_dot_q4_K_q8_0_avx2(const void* vx, const block_q8_0* y, int64_t k) {
     const int64_t nb = k / 256;
     const auto* x = static_cast<const block_q4_K*>(vx);
     float total = 0.0f;
 
-#if defined(__AVX2__)
     const __m256i mask_0f = _mm256_set1_epi8(0x0F);
     const __m256i ones_u8 = _mm256_set1_epi8(1);
     const __m256i ones_16 = _mm256_set1_epi16(1);
@@ -3487,8 +3921,8 @@ float vec_dot_q4_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
 
     for (int64_t i = 0; i < nb; ++i) {
         const uint8_t* q = x[i].qs;
-        const float d    = fp16_to_fp32(x[i].d);
-        const float dmin = fp16_to_fp32(x[i].dmin);
+        const float d    = fp16_to_fp32_fast(x[i].d);
+        const float dmin = fp16_to_fp32_fast(x[i].dmin);
         const block_q8_0* yb = y + i * 8;
 
         int is = 0;
@@ -3513,8 +3947,8 @@ float vec_dot_q4_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
             const __m256i dot1 = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(q_hi, y1));
             const __m256i sum1 = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_u8, y1));
 
-            const float dy0 = fp16_to_fp32(yb[j * 2 + 0].d);
-            const float dy1 = fp16_to_fp32(yb[j * 2 + 1].d);
+            const float dy0 = fp16_to_fp32_fast(yb[j * 2 + 0].d);
+            const float dy1 = fp16_to_fp32_fast(yb[j * 2 + 1].d);
 
             acc = _mm256_fmadd_ps(_mm256_set1_ps(d1 * dy0), _mm256_cvtepi32_ps(dot0), acc);
             acc = _mm256_fnmadd_ps(_mm256_set1_ps(m1 * dy0), _mm256_cvtepi32_ps(sum0), acc);
@@ -3528,7 +3962,25 @@ float vec_dot_q4_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int t = 0; t < 8; ++t) total += tmp[t];
-#else
+    if (const int64_t rem = k - nb * 256; rem > 0) {
+        // Final partial block (only reachable by direct callers: the
+        // matmul path gates these kernels on cols % 256 == 0). The
+        // caller must provide ceil(k/256)*8 Q8_0 activation blocks;
+        // dequantize both sides to scratch and dot only the valid
+        // elements.
+        alignas(32) float deq[256], yf[256];
+        dequantize_row_q4_K(&x[nb], deq, 256);
+        dequantize_row_q8_0(y + nb * 8, yf, 256);
+        total += vec_dot_f32(deq, yf, rem);
+    }
+    return total;
+}
+
+static float vec_dot_q4_K_q8_0_scalar(const void* vx, const block_q8_0* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* x = static_cast<const block_q4_K*>(vx);
+    float total = 0.0f;
+
     for (int64_t i = 0; i < nb; ++i) {
         const uint8_t* q = x[i].qs;
         const float d    = fp16_to_fp32(x[i].d);
@@ -3557,7 +4009,6 @@ float vec_dot_q4_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
             is += 2;
         }
     }
-#endif
     if (const int64_t rem = k - nb * 256; rem > 0) {
         // Final partial block (only reachable by direct callers: the
         // matmul path gates these kernels on cols % 256 == 0). The
@@ -3572,6 +4023,11 @@ float vec_dot_q4_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
     return total;
 }
 
+float vec_dot_q4_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_q4_K_q8_0_avx2(vx, y, k);
+    return vec_dot_q4_K_q8_0_scalar(vx, y, k);
+}
+
 // AVX-512 (BW) widening of vec_dot_q4_K_q8_0: each j-iteration's two
 // independent 256-bit dots (dot0 over sub-block is+0, dot1 over is+1)
 // become one 512-bit op — lanes 0-31 carry q_lo/y0, lanes 32-63 carry
@@ -3579,7 +4035,7 @@ float vec_dot_q4_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
 // are unsigned (0..15) with the min handled by the sum terms, so no
 // sign trick is needed here, exactly as in the AVX2 version.
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
-__attribute__((target("avx2,avx512f,avx512bw,avx512vl")))
+__attribute__((target("avx2,avx512f,avx512bw,avx512vl,f16c")))
 static float vec_dot_q4_K_q8_0_avx512(const void* vx, const block_q8_0* y, int64_t k) {
     const int64_t nb = k / 256;
     const auto* x = static_cast<const block_q4_K*>(vx);
@@ -3589,8 +4045,8 @@ static float vec_dot_q4_K_q8_0_avx512(const void* vx, const block_q8_0* y, int64
 
     for (int64_t i = 0; i < nb; ++i) {
         const uint8_t* q = x[i].qs;
-        const float d    = fp16_to_fp32(x[i].d);
-        const float dmin = fp16_to_fp32(x[i].dmin);
+        const float d    = fp16_to_fp32_fast(x[i].d);
+        const float dmin = fp16_to_fp32_fast(x[i].dmin);
         const block_q8_0* yb = y + i * 8;
 
         int is = 0;
@@ -3617,8 +4073,8 @@ static float vec_dot_q4_K_q8_0_avx512(const void* vx, const block_q8_0* y, int64
             const __m512i sum16 = _mm512_maddubs_epi16(ones_u8, yv);
             const __m512i sum32 = _mm512_madd_epi16(ones_16, sum16);
 
-            const float dy0 = fp16_to_fp32(yb[j * 2 + 0].d);
-            const float dy1 = fp16_to_fp32(yb[j * 2 + 1].d);
+            const float dy0 = fp16_to_fp32_fast(yb[j * 2 + 0].d);
+            const float dy1 = fp16_to_fp32_fast(yb[j * 2 + 1].d);
             // int32 lanes 0-7: sub-block is+0, lanes 8-15: is+1.
             const __m512 s_dot = _mm512_set_ps(
                 d2 * dy1, d2 * dy1, d2 * dy1, d2 * dy1, d2 * dy1, d2 * dy1, d2 * dy1, d2 * dy1,
@@ -3645,12 +4101,12 @@ static float vec_dot_q4_K_q8_0_avx512(const void* vx, const block_q8_0* y, int64
 }
 #endif
 
-float vec_dot_q5_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+MOE_TARGET_AVX2
+static float vec_dot_q5_K_q8_0_avx2(const void* vx, const block_q8_0* y, int64_t k) {
     const int64_t nb = k / 256;
     const auto* blocks = static_cast<const block_q5_K*>(vx);
     float total = 0.0f;
 
-#if defined(__AVX2__)
     const __m256i ones_u8 = _mm256_set1_epi8(1);
     const __m256i ones_16 = _mm256_set1_epi16(1);
     __m256 acc = _mm256_setzero_ps();
@@ -3660,8 +4116,8 @@ float vec_dot_q5_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
     for (int64_t i = 0; i < nb; ++i) {
         const uint8_t* ql = blocks[i].qs;
         const uint8_t* qh = blocks[i].qh;
-        const float d    = fp16_to_fp32(blocks[i].d);
-        const float dmin = fp16_to_fp32(blocks[i].dmin);
+        const float d    = fp16_to_fp32_fast(blocks[i].d);
+        const float dmin = fp16_to_fp32_fast(blocks[i].dmin);
         const block_q8_0* yb = y + i * 8;
 
         int is = 0;
@@ -3690,8 +4146,8 @@ float vec_dot_q5_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
             const __m256i dot1 = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(qv1, y1));
             const __m256i sum1 = _mm256_madd_epi16(ones_16, _mm256_maddubs_epi16(ones_u8, y1));
 
-            const float dy0 = fp16_to_fp32(yb[j * 2 + 0].d);
-            const float dy1 = fp16_to_fp32(yb[j * 2 + 1].d);
+            const float dy0 = fp16_to_fp32_fast(yb[j * 2 + 0].d);
+            const float dy1 = fp16_to_fp32_fast(yb[j * 2 + 1].d);
 
             acc = _mm256_fmadd_ps(_mm256_set1_ps(d1 * dy0), _mm256_cvtepi32_ps(dot0), acc);
             acc = _mm256_fnmadd_ps(_mm256_set1_ps(m1 * dy0), _mm256_cvtepi32_ps(sum0), acc);
@@ -3707,9 +4163,6 @@ float vec_dot_q5_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int t = 0; t < 8; ++t) total += tmp[t];
-#else
-    (void)blocks; (void)y; (void)nb;
-#endif
     if (const int64_t rem = k - nb * 256; rem > 0) {
         // Final partial block: see vec_dot_q4_K_q8_0.
         alignas(32) float deq[256], yf[256];
@@ -3720,26 +4173,56 @@ float vec_dot_q5_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
     return total;
 }
 
-float vec_dot_q6_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+static float vec_dot_q5_K_q8_0_scalar(const void* vx, const block_q8_0* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* blocks = static_cast<const block_q5_K*>(vx);
+    float total = 0.0f;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        alignas(32) float deq[256], yf[256];
+        dequantize_row_q5_K(&blocks[i], deq, 256);
+        dequantize_row_q8_0(y + i * 8, yf, 256);
+        total += vec_dot_f32(deq, yf, 256);
+    }
+    if (const int64_t rem = k - nb * 256; rem > 0) {
+        // Final partial block: see vec_dot_q4_K_q8_0.
+        alignas(32) float deq[256], yf[256];
+        dequantize_row_q5_K(&blocks[nb], deq, 256);
+        dequantize_row_q8_0(y + nb * 8, yf, 256);
+        total += vec_dot_f32(deq, yf, rem);
+    }
+    return total;
+}
+
+float vec_dot_q5_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_q5_K_q8_0_avx2(vx, y, k);
+    return vec_dot_q5_K_q8_0_scalar(vx, y, k);
+}
+
+// Helper for vec_dot_q6_K_q8_0_avx2 below (same lambda-attribute reason
+// as dot16_q6k above; this one only uses SSSE3 intrinsics, which happen
+// to compile in a plain lambda today, but must not rely on that).
+MOE_TARGET_AVX2
+static __m128i dot16_q6k_q8(__m128i qv, __m128i yv, int8_t sc_val) {
+    __m128i ax = _mm_sign_epi8(qv, qv);
+    __m128i sy = _mm_sign_epi8(yv, qv);
+    __m128i dot16 = _mm_maddubs_epi16(ax, sy);
+    return _mm_madd_epi16(dot16, _mm_set1_epi16(static_cast<int16_t>(sc_val)));
+}
+
+MOE_TARGET_AVX2
+static float vec_dot_q6_K_q8_0_avx2(const void* vx, const block_q8_0* y, int64_t k) {
     const int64_t nb = k / 256;
     const auto* blocks = static_cast<const block_q6_K*>(vx);
     float sum = 0.0f;
 
-#if defined(__AVX2__)
     const __m128i mask_0f = _mm_set1_epi8(0x0F);
     const __m128i mask_03 = _mm_set1_epi8(0x03);
     const __m128i offset_32 = _mm_set1_epi8(32);
     __m256 acc = _mm256_setzero_ps();
 
-    auto dot16_q8 = [](__m128i qv, __m128i yv, int8_t sc_val) -> __m128i {
-        __m128i ax = _mm_sign_epi8(qv, qv);
-        __m128i sy = _mm_sign_epi8(yv, qv);
-        __m128i dot16 = _mm_maddubs_epi16(ax, sy);
-        return _mm_madd_epi16(dot16, _mm_set1_epi16(static_cast<int16_t>(sc_val)));
-    };
-
     for (int64_t i = 0; i < nb; ++i) {
-        const float d = fp16_to_fp32(blocks[i].d);
+        const float d = fp16_to_fp32_fast(blocks[i].d);
         const uint8_t* ql = blocks[i].ql;
         const uint8_t* qh = blocks[i].qh;
         const int8_t* sc  = blocks[i].scales;
@@ -3780,16 +4263,16 @@ float vec_dot_q6_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
                 const __m128i y2 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(yh[2].qs + l_off));
                 const __m128i y3 = _mm_loadu_si128(reinterpret_cast<const __m128i*>(yh[3].qs + l_off));
 
-                s0 = _mm_add_epi32(s0, dot16_q8(q1, y0, sc[is + 0]));
-                s1 = _mm_add_epi32(s1, dot16_q8(q2, y1, sc[is + 2]));
-                s2 = _mm_add_epi32(s2, dot16_q8(q3, y2, sc[is + 4]));
-                s3 = _mm_add_epi32(s3, dot16_q8(q4, y3, sc[is + 6]));
+                s0 = _mm_add_epi32(s0, dot16_q6k_q8(q1, y0, sc[is + 0]));
+                s1 = _mm_add_epi32(s1, dot16_q6k_q8(q2, y1, sc[is + 2]));
+                s2 = _mm_add_epi32(s2, dot16_q6k_q8(q3, y2, sc[is + 4]));
+                s3 = _mm_add_epi32(s3, dot16_q6k_q8(q4, y3, sc[is + 6]));
             }
 
-            const float dy0 = d * fp16_to_fp32(yh[0].d);
-            const float dy1 = d * fp16_to_fp32(yh[1].d);
-            const float dy2 = d * fp16_to_fp32(yh[2].d);
-            const float dy3 = d * fp16_to_fp32(yh[3].d);
+            const float dy0 = d * fp16_to_fp32_fast(yh[0].d);
+            const float dy1 = d * fp16_to_fp32_fast(yh[1].d);
+            const float dy2 = d * fp16_to_fp32_fast(yh[2].d);
+            const float dy3 = d * fp16_to_fp32_fast(yh[3].d);
 
             __m256 scale01 = _mm256_set_m128(_mm_set1_ps(dy1), _mm_set1_ps(dy0));
             __m256 scale23 = _mm256_set_m128(_mm_set1_ps(dy3), _mm_set1_ps(dy2));
@@ -3804,9 +4287,6 @@ float vec_dot_q6_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
     alignas(32) float tmp[8];
     _mm256_store_ps(tmp, acc);
     for (int j = 0; j < 8; ++j) sum += tmp[j];
-#else
-    (void)vx; (void)y; (void)k;
-#endif
     if (const int64_t rem = k - nb * 256; rem > 0) {
         // Final partial block: see vec_dot_q4_K_q8_0.
         alignas(32) float deq[256], yf[256];
@@ -3817,26 +4297,35 @@ float vec_dot_q6_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
     return sum;
 }
 
-// Runtime gate for the AVX-512 dot kernels. Cached once; MOE_AVX512=0
-// forces the AVX2 path (A/B testing), MOE_AVX512=1 forces AVX-512 even
-// without the CPUID bit (only for testing on known-good hardware).
-static bool cpu_has_avx512bw() {
-#if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__)) && !defined(_WIN32)
-    static const bool v = [] {
-        const char* env = std::getenv("MOE_AVX512");
-        if (env && std::string(env) == "0") return false;
-        unsigned int eax, ebx, ecx, edx;
-        if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
-        // EBX bit 16 = AVX512F, bit 30 = AVX512BW.
-        const bool hw = (ebx & (1u << 16)) != 0 && (ebx & (1u << 30)) != 0;
-        if (env && std::string(env) == "1") return true;
-        return hw;
-    }();
-    return v;
-#else
-    return false;
-#endif
+static float vec_dot_q6_K_q8_0_scalar(const void* vx, const block_q8_0* y, int64_t k) {
+    const int64_t nb = k / 256;
+    const auto* blocks = static_cast<const block_q6_K*>(vx);
+    float sum = 0.0f;
+
+    for (int64_t i = 0; i < nb; ++i) {
+        alignas(32) float deq[256], yf[256];
+        dequantize_row_q6_K(&blocks[i], deq, 256);
+        dequantize_row_q8_0(y + i * 8, yf, 256);
+        sum += vec_dot_f32(deq, yf, 256);
+    }
+    if (const int64_t rem = k - nb * 256; rem > 0) {
+        // Final partial block: see vec_dot_q4_K_q8_0.
+        alignas(32) float deq[256], yf[256];
+        dequantize_row_q6_K(&blocks[nb], deq, 256);
+        dequantize_row_q8_0(y + nb * 8, yf, 256);
+        sum += vec_dot_f32(deq, yf, rem);
+    }
+    return sum;
 }
+
+float vec_dot_q6_K_q8_0(const void* vx, const block_q8_0* y, int64_t k) {
+    if (cpu_has_avx2()) return vec_dot_q6_K_q8_0_avx2(vx, y, k);
+    return vec_dot_q6_K_q8_0_scalar(vx, y, k);
+}
+
+// The AVX-512 runtime gate (cpu_has_avx512bw) lives with the other
+// dispatch helpers near the top of this file; it now also requires OS
+// ZMM state (XCR0), not just the CPUID bits.
 
 static inline float vec_dot_row_with_q8(
     GGMLType type,
@@ -3845,8 +4334,11 @@ static inline float vec_dot_row_with_q8(
     const block_q8_0* x_q8,
     int64_t cols
 ) {
-#if defined(__AVX2__)
-    if (x_q8) {
+    // Runtime dispatch: the Q8-activation kernels are AVX2 (or AVX-512)
+    // code; without usable AVX2 fall through to the scalar quant dot.
+    // x_q8 is null when the caller did not quantize the activation (e.g.
+    // rows < 8), which also falls through.
+    if (cpu_has_avx2() && x_q8) {
         if (type == GGMLType::Q4_0 && (cols % 32 == 0)) {
 #if defined(__x86_64__) && (defined(__GNUC__) || defined(__clang__))
             if (cpu_has_avx512bw()) return vec_dot_q4_0_q8_0_avx512(row_ptr, x_q8, cols);
@@ -3872,9 +4364,6 @@ static inline float vec_dot_row_with_q8(
             return vec_dot_q6_K_q8_0(row_ptr, x_q8, cols);
         }
     }
-#else
-    (void)x_q8;
-#endif
     return vec_dot_quant_f32(type, row_ptr, x, cols);
 }
 
@@ -3905,13 +4394,11 @@ void matmul_quant_f32(
 
     std::vector<block_q8_0> x_q8;
     const block_q8_0* x_q8_ptr = nullptr;
-#if defined(__AVX2__)
-    if (rows >= 8 && supports_q8_activation(type, cols)) {
+    if (cpu_has_avx2() && rows >= 8 && supports_q8_activation(type, cols)) {
         x_q8.resize(static_cast<size_t>(cols / 32));
         quantize_row_q8_0(x, x_q8.data(), cols);
         x_q8_ptr = x_q8.data();
     }
-#endif
 
 #if defined(_OPENMP)
     #pragma omp parallel for if(rows >= 64) schedule(static)
@@ -3940,13 +4427,11 @@ void matmul_qkv_quant_f32(
 
     std::vector<block_q8_0> x_q8;
     const block_q8_0* x_q8_ptr = nullptr;
-#if defined(__AVX2__)
-    if (total_rows >= 8 && (cols % 32 == 0)) {
+    if (cpu_has_avx2() && total_rows >= 8 && (cols % 32 == 0)) {
         x_q8.resize(static_cast<size_t>(cols / 32));
         quantize_row_q8_0(x, x_q8.data(), cols);
         x_q8_ptr = x_q8.data();
     }
-#endif
 
     const int64_t q_end = Wq ? q_rows : 0;
     const int64_t k_end = q_end + (Wk ? k_rows : 0);
@@ -3983,13 +4468,11 @@ void matmul_swiglu_quant_f32(
 
     std::vector<block_q8_0> x_q8;
     const block_q8_0* x_q8_ptr = nullptr;
-#if defined(__AVX2__)
-    if (exp_dim >= 8 && (cols % 32 == 0)) {
+    if (cpu_has_avx2() && exp_dim >= 8 && (cols % 32 == 0)) {
         x_q8.resize(static_cast<size_t>(cols / 32));
         quantize_row_q8_0(x, x_q8.data(), cols);
         x_q8_ptr = x_q8.data();
     }
-#endif
 
 #if defined(_OPENMP)
     #pragma omp parallel for if(exp_dim >= 64) schedule(static)

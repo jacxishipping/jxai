@@ -15,7 +15,11 @@
 #include "server.h"
 #include "model_pull.h"
 #include "vulkan_backend.h"
+#include <cctype>
+#include <cmath>
 #include <cstdlib>
+#include <csignal>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <sstream>
@@ -49,6 +53,13 @@ bool send_all(uintptr_t s, const char* data, size_t len) {
     return true;
 }
 
+// Request limits (DoS bounds). A request larger than the body cap is
+// rejected with 413 before its bytes are buffered; a header block larger
+// than the header cap is dropped. Concurrency is capped in start().
+constexpr size_t kMaxHeaderBytes = 64 * 1024;        // 64 KiB request line + headers
+constexpr size_t kMaxBodyBytes = 1 * 1024 * 1024;    // 1 MiB JSON bodies
+constexpr uint32_t kMaxConcurrentRequests = 64;      // simultaneous connections
+
 std::string json_escape(const std::string& s) {
     std::string out;
     out.reserve(s.size() + 8);
@@ -74,100 +85,272 @@ std::string json_escape(const std::string& s) {
     return out;
 }
 
-// Lightweight JSON field extractors
-std::string extract_json_string(const std::string& body, const std::string& key, const std::string& def = "") {
-    std::string pat = "\"" + key + "\"";
-    size_t pos = body.find(pat);
-    if (pos == std::string::npos) return def;
-    size_t colon = body.find(':', pos + pat.size());
-    if (colon == std::string::npos) return def;
-    size_t q1 = body.find('"', colon + 1);
-    if (q1 == std::string::npos) return def;
-    std::string out;
-    for (size_t i = q1 + 1; i < body.size(); ++i) {
-        if (body[i] == '\\' && i + 1 < body.size()) {
-            char next = body[++i];
-            if (next == 'n') out.push_back('\n');
-            else if (next == 'r') out.push_back('\r');
-            else if (next == 't') out.push_back('\t');
-            else out.push_back(next);
-        } else if (body[i] == '"') {
-            break;
-        } else {
-            out.push_back(body[i]);
-        }
+// ---------------------------------------------------------------------------
+// Strict, small JSON parser (no third-party JSON library in this codebase).
+// Every request body and every field extractor below goes through it.
+//
+// Why: the old substring extractors matched the FIRST `"key"` anywhere in
+// the body, so a key appearing inside a string value or a nested object
+// shadowed the real field (e.g. a message containing `"temperature": 99`
+// overrode the top-level temperature, and a `"role": "system"` inside
+// message content could smuggle a role). They also mishandled \uXXXX and
+// \b \f escapes and accepted NaN/Infinity as numbers. This parser is
+// strict on purpose: trailing garbage, unclosed strings, bad escapes,
+// NaN/Infinity and over-deep nesting are rejected instead of misread.
+// Each value records its [start, end) span in the source text so the tools
+// parser can keep the client's verbatim tool JSON.
+// ---------------------------------------------------------------------------
+struct JsonValue {
+    enum Type { kNull, kBool, kNumber, kString, kArray, kObject } type = kNull;
+    bool b = false;
+    double num = 0.0;
+    std::string str;
+    std::vector<JsonValue> arr;
+    std::vector<std::pair<std::string, JsonValue>> obj;
+    size_t start = 0, end = 0; // span in the source text
+    const JsonValue* find(const std::string& key) const {
+        if (type != kObject) return nullptr;
+        for (const auto& kv : obj) if (kv.first == key) return &kv.second;
+        return nullptr;
     }
-    return out;
+};
+
+void append_utf8(std::string& out, uint32_t cp) {
+    if (cp < 0x80) {
+        out.push_back(static_cast<char>(cp));
+    } else if (cp < 0x800) {
+        out.push_back(static_cast<char>(0xC0 | (cp >> 6)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else if (cp < 0x10000) {
+        out.push_back(static_cast<char>(0xE0 | (cp >> 12)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    } else {
+        out.push_back(static_cast<char>(0xF0 | (cp >> 18)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 12) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | ((cp >> 6) & 0x3F)));
+        out.push_back(static_cast<char>(0x80 | (cp & 0x3F)));
+    }
 }
 
-// Extract last "content" string in "messages" array
-std::string extract_last_message_content(const std::string& body) {
-    size_t last_pos = body.rfind("\"content\"");
-    if (last_pos == std::string::npos) return extract_json_string(body, "prompt", "Explain MoE streaming architecture.");
-    size_t colon = body.find(':', last_pos + 9);
-    if (colon == std::string::npos) return "Hello";
-    size_t q1 = body.find('"', colon + 1);
-    if (q1 == std::string::npos) return "Hello";
-    std::string out;
-    for (size_t i = q1 + 1; i < body.size(); ++i) {
-        if (body[i] == '\\' && i + 1 < body.size()) {
-            char next = body[++i];
-            if (next == 'n') out.push_back('\n');
-            else if (next == 't') out.push_back('\t');
-            else out.push_back(next);
-        } else if (body[i] == '"') {
-            break;
-        } else {
-            out.push_back(body[i]);
+struct JsonParser {
+    const std::string& s;
+    size_t i = 0;
+    explicit JsonParser(const std::string& text) : s(text) {}
+
+    void skip_ws() {
+        while (i < s.size() && (s[i] == ' ' || s[i] == '\t' || s[i] == '\n' || s[i] == '\r')) ++i;
+    }
+
+    bool parse(JsonValue& out, int depth) {
+        if (depth > 64) return false;
+        skip_ws();
+        if (i >= s.size()) return false;
+        out.start = i;
+        char c = s[i];
+        bool ok = false;
+        if (c == '{') ok = parse_object(out, depth);
+        else if (c == '[') ok = parse_array(out, depth);
+        else if (c == '"') {
+            std::string v;
+            ok = parse_string_raw(v);
+            if (ok) { out.type = JsonValue::kString; out.str = std::move(v); }
+        }
+        else if (c == 't') ok = parse_literal("true", JsonValue::kBool, true, out);
+        else if (c == 'f') ok = parse_literal("false", JsonValue::kBool, false, out);
+        else if (c == 'n') ok = parse_literal("null", JsonValue::kNull, false, out);
+        else ok = parse_number(out);
+        if (!ok) return false;
+        out.end = i;
+        return true;
+    }
+
+    bool parse_hex4(uint32_t& out) {
+        if (i + 4 > s.size()) return false;
+        uint32_t v = 0;
+        for (int k = 0; k < 4; ++k) {
+            char c = s[i++];
+            v <<= 4;
+            if (c >= '0' && c <= '9') v |= static_cast<uint32_t>(c - '0');
+            else if (c >= 'a' && c <= 'f') v |= static_cast<uint32_t>(c - 'a' + 10);
+            else if (c >= 'A' && c <= 'F') v |= static_cast<uint32_t>(c - 'A' + 10);
+            else return false;
+        }
+        out = v;
+        return true;
+    }
+
+    // Parse a JSON string starting at s[i] == '"'. Full escape decoding
+    // (\" \\ \/ \b \f \n \r \t \uXXXX with surrogate pairs -> UTF-8).
+    // Rejects raw control characters, bad escapes and unterminated strings.
+    bool parse_string_raw(std::string& out) {
+        if (i >= s.size() || s[i] != '"') return false;
+        ++i;
+        out.clear();
+        while (i < s.size()) {
+            unsigned char c = static_cast<unsigned char>(s[i]);
+            if (c == '"') { ++i; return true; }
+            if (c < 0x20) return false; // raw control character in string
+            if (c == '\\') {
+                ++i;
+                if (i >= s.size()) return false;
+                char e = s[i++];
+                switch (e) {
+                    case '"': out.push_back('"'); break;
+                    case '\\': out.push_back('\\'); break;
+                    case '/': out.push_back('/'); break;
+                    case 'b': out.push_back('\b'); break;
+                    case 'f': out.push_back('\f'); break;
+                    case 'n': out.push_back('\n'); break;
+                    case 'r': out.push_back('\r'); break;
+                    case 't': out.push_back('\t'); break;
+                    case 'u': {
+                        uint32_t cp = 0;
+                        if (!parse_hex4(cp)) return false;
+                        if (cp >= 0xD800 && cp <= 0xDBFF) {
+                            // High surrogate: must be followed by \uDC00-\uDFFF.
+                            if (i + 1 < s.size() && s[i] == '\\' && s[i + 1] == 'u') {
+                                i += 2;
+                                uint32_t lo = 0;
+                                if (!parse_hex4(lo)) return false;
+                                if (lo < 0xDC00 || lo > 0xDFFF) return false;
+                                cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
+                            } else return false;
+                        } else if (cp >= 0xDC00 && cp <= 0xDFFF) {
+                            return false; // lone low surrogate
+                        }
+                        append_utf8(out, cp);
+                        break;
+                    }
+                    default: return false;
+                }
+            } else {
+                out.push_back(static_cast<char>(c));
+                ++i;
+            }
+        }
+        return false; // unterminated string
+    }
+
+    // Strict JSON number grammar (no NaN/Infinity/hex, no leading '+',
+    // no leading zeros). Overflow to +/-inf is rejected.
+    bool parse_number(JsonValue& out) {
+        size_t start = i;
+        if (i < s.size() && s[i] == '-') ++i;
+        if (i >= s.size()) return false;
+        if (s[i] == '0') ++i;
+        else if (s[i] >= '1' && s[i] <= '9') {
+            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+        } else return false;
+        if (i < s.size() && s[i] == '.') {
+            ++i;
+            if (i >= s.size() || !std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+        }
+        if (i < s.size() && (s[i] == 'e' || s[i] == 'E')) {
+            ++i;
+            if (i < s.size() && (s[i] == '+' || s[i] == '-')) ++i;
+            if (i >= s.size() || !std::isdigit(static_cast<unsigned char>(s[i]))) return false;
+            while (i < s.size() && std::isdigit(static_cast<unsigned char>(s[i]))) ++i;
+        }
+        try {
+            size_t used = 0;
+            double v = std::stod(s.substr(start, i - start), &used);
+            if (used != i - start) return false;
+            if (!std::isfinite(v)) return false;
+            out.type = JsonValue::kNumber;
+            out.num = v;
+            return true;
+        } catch (...) {
+            return false;
         }
     }
-    return out;
+
+    bool parse_literal(const char* word, JsonValue::Type t, bool b, JsonValue& out) {
+        size_t len = std::strlen(word);
+        if (s.compare(i, len, word) != 0) return false;
+        i += len;
+        out.type = t;
+        out.b = b;
+        return true;
+    }
+
+    bool parse_array(JsonValue& out, int depth) {
+        ++i; // '['
+        out.type = JsonValue::kArray;
+        out.arr.clear();
+        skip_ws();
+        if (i < s.size() && s[i] == ']') { ++i; return true; }
+        while (true) {
+            JsonValue v;
+            if (!parse(v, depth + 1)) return false;
+            out.arr.push_back(std::move(v));
+            skip_ws();
+            if (i >= s.size()) return false;
+            if (s[i] == ',') { ++i; continue; }
+            if (s[i] == ']') { ++i; return true; }
+            return false;
+        }
+    }
+
+    bool parse_object(JsonValue& out, int depth) {
+        ++i; // '{'
+        out.type = JsonValue::kObject;
+        out.obj.clear();
+        skip_ws();
+        if (i < s.size() && s[i] == '}') { ++i; return true; }
+        while (true) {
+            skip_ws();
+            if (i >= s.size() || s[i] != '"') return false;
+            std::string key;
+            if (!parse_string_raw(key)) return false;
+            skip_ws();
+            if (i >= s.size() || s[i] != ':') return false;
+            ++i;
+            JsonValue v;
+            if (!parse(v, depth + 1)) return false;
+            out.obj.emplace_back(std::move(key), std::move(v));
+            skip_ws();
+            if (i >= s.size()) return false;
+            if (s[i] == ',') { ++i; continue; }
+            if (s[i] == '}') { ++i; return true; }
+            return false;
+        }
+    }
+};
+
+// Parse a complete JSON document (exactly one value, nothing trailing).
+// False on any malformed input.
+bool json_parse_value(const std::string& text, JsonValue& out) {
+    JsonParser p(text);
+    if (!p.parse(out, 0)) return false;
+    p.skip_ws();
+    return p.i == text.size();
+}
+
+// Extract last "content" string in "messages" array (parsed properly, so a
+// "content" key inside a nested string cannot shadow the real one).
+// Falls back to a top-level "prompt" string, then the default.
+std::string extract_last_message_content(const std::string& body) {
+    auto msgs = parse_chat_messages(body);
+    if (!msgs.empty()) return msgs.back().content;
+    return extract_json_string(body, "prompt", "Explain MoE streaming architecture.");
 }
 
 // Find the balanced JSON value that follows "key": at the top level of
 // `body` (object / array / string / literal). Returns the [start, end)
 // span in `body`, or false when the key is absent or the value is malformed.
+// Implemented on the strict parser, so a key inside a nested string or
+// object can never match.
 bool extract_json_value_span(const std::string& body, const std::string& key,
                              size_t& val_start, size_t& val_end) {
-    std::string pat = "\"" + key + "\"";
-    size_t pos = body.find(pat);
-    if (pos == std::string::npos) return false;
-    size_t colon = body.find(':', pos + pat.size());
-    if (colon == std::string::npos) return false;
-    size_t i = colon + 1;
-    while (i < body.size() && (body[i] == ' ' || body[i] == '\t' || body[i] == '\n' || body[i] == '\r')) ++i;
-    if (i >= body.size()) return false;
-    if (body[i] == '{' || body[i] == '[') {
-        char open = body[i], close = (body[i] == '{') ? '}' : ']';
-        int depth = 0;
-        bool in_str = false;
-        for (size_t j = i; j < body.size(); ++j) {
-            char c = body[j];
-            if (in_str) {
-                if (c == '\\' && j + 1 < body.size()) ++j;
-                else if (c == '"') in_str = false;
-            } else if (c == '"') {
-                in_str = true;
-            } else if (c == open) {
-                ++depth;
-            } else if (c == close) {
-                if (--depth == 0) { val_start = i; val_end = j + 1; return true; }
-            }
-        }
-        return false;
-    }
-    if (body[i] == '"') {
-        size_t j = i + 1;
-        while (j < body.size()) {
-            if (body[j] == '\\' && j + 1 < body.size()) { j += 2; continue; }
-            if (body[j] == '"') { val_start = i; val_end = j + 1; return true; }
-            ++j;
-        }
-        return false;
-    }
-    size_t j = i;
-    while (j < body.size() && body[j] != ',' && body[j] != '}' && body[j] != ']') ++j;
-    val_start = i; val_end = j;
+    JsonValue root;
+    if (!json_parse_value(body, root)) return false;
+    if (root.type != JsonValue::kObject) return false;
+    const JsonValue* v = root.find(key);
+    if (v == nullptr) return false;
+    val_start = v->start;
+    val_end = v->end;
     return true;
 }
 
@@ -418,109 +601,8 @@ std::string tool_calls_message_json(const std::vector<ParsedToolCall>& calls) {
     return js.str();
 }
 
-// Parse the "messages" array of an OpenAI-style request body into
-// {role, content} pairs. Quote-aware and brace-depth-aware so messages
-// containing code or JSON braces {} never break parsing. Returns an empty
-// vector when there is no usable messages array.
-std::vector<ChatMessage> parse_chat_messages(const std::string& body) {
-    std::vector<ChatMessage> msgs;
-    size_t m_pos = body.find("\"messages\"");
-    if (m_pos == std::string::npos) return msgs;
-    size_t arr_start = body.find('[', m_pos);
-    if (arr_start == std::string::npos) return msgs;
-
-    // Find matching ']' for the messages array while respecting string literals
-    size_t arr_end = std::string::npos;
-    {
-        int bracket_depth = 0;
-        bool in_str = false;
-        for (size_t i = arr_start; i < body.size(); ++i) {
-            char c = body[i];
-            if (in_str) {
-                if (c == '\\' && i + 1 < body.size()) {
-                    ++i;
-                } else if (c == '"') {
-                    in_str = false;
-                }
-            } else {
-                if (c == '"') in_str = true;
-                else if (c == '[') bracket_depth++;
-                else if (c == ']') {
-                    bracket_depth--;
-                    if (bracket_depth == 0) {
-                        arr_end = i;
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    if (arr_end == std::string::npos || arr_end <= arr_start) return msgs;
-
-    std::string arr_str = body.substr(arr_start, arr_end - arr_start + 1);
-
-    size_t i = 0;
-    while (i < arr_str.size()) {
-        // Find start of next message object '{' outside quotes
-        bool in_str = false;
-        size_t obj_start = std::string::npos;
-        for (; i < arr_str.size(); ++i) {
-            char c = arr_str[i];
-            if (in_str) {
-                if (c == '\\' && i + 1 < arr_str.size()) ++i;
-                else if (c == '"') in_str = false;
-            } else {
-                if (c == '"') in_str = true;
-                else if (c == '{') {
-                    obj_start = i;
-                    break;
-                }
-            }
-        }
-        if (obj_start == std::string::npos) break;
-
-        // Find matching '}' for this message object while respecting quotes and nested braces
-        int brace_depth = 0;
-        in_str = false;
-        size_t obj_end = std::string::npos;
-        for (size_t j = obj_start; j < arr_str.size(); ++j) {
-            char c = arr_str[j];
-            if (in_str) {
-                if (c == '\\' && j + 1 < arr_str.size()) ++j;
-                else if (c == '"') in_str = false;
-            } else {
-                if (c == '"') in_str = true;
-                else if (c == '{') brace_depth++;
-                else if (c == '}') {
-                    brace_depth--;
-                    if (brace_depth == 0) {
-                        obj_end = j;
-                        break;
-                    }
-                }
-            }
-        }
-        if (obj_end == std::string::npos) break;
-
-        std::string obj_str = arr_str.substr(obj_start, obj_end - obj_start + 1);
-        i = obj_end + 1;
-
-        std::string role = extract_json_string(obj_str, "role", "user");
-        std::string content = extract_json_string(obj_str, "content", "");
-
-        if (content.empty()) {
-            size_t text_pos = obj_str.find("\"text\"");
-            if (text_pos != std::string::npos) {
-                content = extract_json_string(obj_str.substr(text_pos - 1), "text", "");
-            }
-        }
-
-        if (!content.empty()) {
-            msgs.push_back({role, content});
-        }
-    }
-    return msgs;
-}
+// (parse_chat_messages now lives at moe scope, implemented on the strict
+// JSON parser; see below the anonymous namespace.)
 
 // Build the generation prompt for a chat request, using the SAME shared
 // helper as CLI chat (generate_stream): the GGUF tokenizer.chat_template
@@ -540,66 +622,9 @@ std::string format_chat_prompt_for_arch(const std::string& body, const MoETransf
     return format_chat_messages(msgs, hp.arch, tok.chat_template(), tok, true, nullptr, tools);
 }
 
-double extract_json_number(const std::string& body, const std::string& key, double def) {
-    std::string pat = "\"" + key + "\"";
-    size_t pos = body.find(pat);
-    if (pos == std::string::npos) return def;
-    size_t colon = body.find(':', pos + pat.size());
-    if (colon == std::string::npos) return def;
-    size_t start = colon + 1;
-    while (start < body.size() && (body[start] == ' ' || body[start] == '\t' || body[start] == '\n' || body[start] == '\r')) start++;
-    try {
-        return std::stod(body.substr(start));
-    } catch (...) {
-        return def;
-    }
-}
-
-bool extract_json_bool(const std::string& body, const std::string& key, bool def) {
-    std::string pat = "\"" + key + "\"";
-    size_t pos = body.find(pat);
-    if (pos == std::string::npos) return def;
-    size_t colon = body.find(':', pos + pat.size());
-    if (colon == std::string::npos) return def;
-    size_t start = colon + 1;
-    while (start < body.size() && (body[start] == ' ' || body[start] == '\t')) start++;
-    if (body.compare(start, 4, "true") == 0) return true;
-    if (body.compare(start, 5, "false") == 0) return false;
-    return def;
-}
-
-std::vector<std::string> extract_json_string_array(const std::string& body, const std::string& key) {
-    std::vector<std::string> res;
-    std::string pat = "\"" + key + "\"";
-    size_t pos = body.find(pat);
-    if (pos == std::string::npos) return res;
-    size_t b1 = body.find('[', pos + pat.size());
-    if (b1 == std::string::npos) return res;
-    size_t b2 = body.find(']', b1 + 1);
-    if (b2 == std::string::npos) return res;
-    std::string arr = body.substr(b1 + 1, b2 - b1 - 1);
-
-    size_t i = 0;
-    while (i < arr.size()) {
-        size_t q1 = arr.find('"', i);
-        if (q1 == std::string::npos) break;
-        std::string item;
-        size_t j = q1 + 1;
-        while (j < arr.size()) {
-            if (arr[j] == '\\' && j + 1 < arr.size()) {
-                item.push_back(arr[++j]);
-            } else if (arr[j] == '"') {
-                break;
-            } else {
-                item.push_back(arr[j]);
-            }
-            j++;
-        }
-        res.push_back(item);
-        i = j + 1;
-    }
-    return res;
-}
+// (extract_json_number / extract_json_bool / extract_json_string_array now
+// live at moe scope, implemented on the strict JSON parser; see below the
+// anonymous namespace.)
 
 const char* semantic_topic_for_expert(uint32_t layer, uint32_t expert) {
     static const char* kTopics[] = {
@@ -626,13 +651,26 @@ std::string mime_type_for_path(const std::string& path) {
     return "application/octet-stream";
 }
 
+// Per-connection CORS origin, set by handle_client from the request's
+// Origin header and the configured allow-list (thread_local: one connection
+// per thread, never shared). send_http_json / the SSE and static responses
+// read it so the header is emitted only for allowed origins — the default
+// is same-origin only (no Access-Control-Allow-Origin header at all).
+// Previously every response sent `Access-Control-Allow-Origin: *`, which
+// let any website call the engine's mutating API from a browser.
+thread_local std::string g_allowed_origin;
+
+std::string cors_response_header() {
+    if (g_allowed_origin.empty()) return "";
+    return "Access-Control-Allow-Origin: " + g_allowed_origin + "\r\n"
+           "Vary: Origin\r\n";
+}
+
 void send_http_json(uintptr_t sock, int status_code, const std::string& status_text, const std::string& json_body) {
     std::ostringstream hdr;
     hdr << "HTTP/1.1 " << status_code << " " << status_text << "\r\n"
         << "Content-Type: application/json; charset=utf-8\r\n"
-        << "Access-Control-Allow-Origin: *\r\n"
-        << "Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\n"
-        << "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key, User-Agent\r\n"
+        << cors_response_header()
         << "Content-Length: " << json_body.size() << "\r\n"
         << "Connection: close\r\n\r\n";
     std::string h = hdr.str();
@@ -673,46 +711,8 @@ bool constant_time_equal(const std::string& a, const std::string& b) {
     return diff == 0;
 }
 
-// Case-insensitive single header lookup in the raw request header block.
-std::string header_value(const std::string& headers, const std::string& name) {
-    std::string lower_h = headers;
-    std::transform(lower_h.begin(), lower_h.end(), lower_h.begin(), ::tolower);
-    std::string lower_name = name;
-    std::transform(lower_name.begin(), lower_name.end(), lower_name.begin(), ::tolower);
-    size_t pos = lower_h.find(lower_name + ":");
-    if (pos == std::string::npos) return "";
-    size_t start = pos + lower_name.size() + 1;
-    while (start < headers.size() && (headers[start] == ' ' || headers[start] == '\t')) ++start;
-    size_t end = headers.find("\r\n", start);
-    if (end == std::string::npos) end = headers.size();
-    std::string val = headers.substr(start, end - start);
-    while (!val.empty() && (val.back() == ' ' || val.back() == '\t' || val.back() == '\r')) val.pop_back();
-    return val;
-}
-
-// Mutating routes that require a key whenever one is configured. Read-only
-// GETs (including GET /health, the liveness probe) stay open.
-bool route_requires_auth(const std::string& method, const std::string& path) {
-    if (method == "POST" || method == "DELETE") {
-        if (path == "/v1/models/load" || path == "/v1/models/pull") return true;
-        if (path == "/v1/config" || path == "/api/config") return true;
-        if (path == "/v1/slots/clear" || path.starts_with("/v1/slots/")) return true;
-        if (path == "/v1/chat/completions" || path == "/v1/completions" ||
-            path == "/api/chat" || path == "/api/generate") return true;
-        if (path == "/v1/embeddings" || path == "/v1/systemone" ||
-            path == "/v1/images/generations") return true;
-    }
-    return false;
-}
-
-// Check Authorization: Bearer <key> or x-api-key: <key> against `key`.
-bool request_authorized(const std::string& headers, const std::string& key) {
-    std::string auth = header_value(headers, "Authorization");
-    if (auth.rfind("Bearer ", 0) == 0 && constant_time_equal(auth.substr(7), key)) return true;
-    std::string xkey = header_value(headers, "x-api-key");
-    if (!xkey.empty() && constant_time_equal(xkey, key)) return true;
-    return false;
-}
+// (header_value / route_requires_auth / request_authorized now live at
+// moe scope; see below the anonymous namespace.)
 
 // Replace the value of "api_key" in a JSON blob with "***" so a key stored in
 // moe_config.json is never leaked through GET /v1/config.
@@ -733,6 +733,241 @@ std::string redact_api_key(const std::string& json) {
 
 } // namespace
 
+// ---------------------------------------------------------------------------
+// Public JSON / auth / validation helpers (declared in server.h, defined
+// here at moe scope so the unit tests can call them). All field extraction
+// goes through the strict parser above: only depth-1 keys of the outermost
+// object match, so nested/string-embedded keys can never shadow a field.
+// ---------------------------------------------------------------------------
+
+bool json_is_valid_object(const std::string& text) {
+    JsonValue v;
+    return json_parse_value(text, v) && v.type == JsonValue::kObject;
+}
+
+std::string extract_json_string(const std::string& body, const std::string& key,
+                                const std::string& def) {
+    JsonValue root;
+    if (!json_parse_value(body, root)) return def;
+    const JsonValue* v = root.find(key);
+    if (v == nullptr || v->type != JsonValue::kString) return def;
+    return v->str;
+}
+
+double extract_json_number(const std::string& body, const std::string& key, double def) {
+    JsonValue root;
+    if (!json_parse_value(body, root)) return def;
+    const JsonValue* v = root.find(key);
+    if (v == nullptr || v->type != JsonValue::kNumber) return def;
+    return v->num;
+}
+
+bool extract_json_bool(const std::string& body, const std::string& key, bool def) {
+    JsonValue root;
+    if (!json_parse_value(body, root)) return def;
+    const JsonValue* v = root.find(key);
+    if (v == nullptr || v->type != JsonValue::kBool) return def;
+    return v->b;
+}
+
+std::vector<std::string> extract_json_string_array(const std::string& body,
+                                                   const std::string& key) {
+    std::vector<std::string> res;
+    JsonValue root;
+    if (!json_parse_value(body, root)) return res;
+    const JsonValue* v = root.find(key);
+    if (v == nullptr || v->type != JsonValue::kArray) return res;
+    for (const auto& el : v->arr) {
+        if (el.type == JsonValue::kString) res.push_back(el.str);
+    }
+    return res;
+}
+
+// Parse the OpenAI-style "messages" array into {role, content} pairs.
+// Roles/contents come from each message object's own depth-1 fields, so a
+// "role" string embedded in message content cannot smuggle a role. Content
+// may also be an array of parts ({"type":"text","text":"..."}) — the text
+// parts are concatenated. Returns an empty vector when there is no usable
+// messages array.
+std::vector<ChatMessage> parse_chat_messages(const std::string& body) {
+    std::vector<ChatMessage> msgs;
+    JsonValue root;
+    if (!json_parse_value(body, root)) return msgs;
+    const JsonValue* arr = root.find("messages");
+    if (arr == nullptr || arr->type != JsonValue::kArray) return msgs;
+    for (const auto& el : arr->arr) {
+        if (el.type != JsonValue::kObject) continue;
+        std::string role = "user";
+        if (const JsonValue* r = el.find("role")) {
+            if (r->type == JsonValue::kString && !r->str.empty()) role = r->str;
+        }
+        std::string content;
+        if (const JsonValue* c = el.find("content")) {
+            if (c->type == JsonValue::kString) {
+                content = c->str;
+            } else if (c->type == JsonValue::kArray) {
+                for (const auto& part : c->arr) {
+                    if (part.type != JsonValue::kObject) continue;
+                    if (const JsonValue* t = part.find("text")) {
+                        if (t->type == JsonValue::kString) content += t->str;
+                    }
+                }
+            }
+        }
+        if (!content.empty()) msgs.push_back({role, content});
+    }
+    return msgs;
+}
+
+// Case-insensitive single header lookup in a raw header block. Matches
+// header names at line starts only: the old substring search could match
+// "x-api-key:" inside another header's VALUE and treat it as the key.
+std::string header_value(const std::string& headers, const std::string& name) {
+    std::string lname = name;
+    std::transform(lname.begin(), lname.end(), lname.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    size_t pos = 0;
+    while (pos < headers.size()) {
+        size_t eol = headers.find("\r\n", pos);
+        size_t line_end = (eol == std::string::npos) ? headers.size() : eol;
+        std::string line = headers.substr(pos, line_end - pos);
+        size_t colon = line.find(':');
+        if (colon != std::string::npos) {
+            std::string hname = line.substr(0, colon);
+            size_t a = hname.find_first_not_of(" \t");
+            size_t b = hname.find_last_not_of(" \t");
+            if (a != std::string::npos) hname = hname.substr(a, b - a + 1);
+            std::transform(hname.begin(), hname.end(), hname.begin(),
+                           [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+            if (hname == lname) {
+                std::string val = line.substr(colon + 1);
+                size_t va = val.find_first_not_of(" \t");
+                if (va == std::string::npos) return "";
+                size_t vb = val.find_last_not_of(" \t\r");
+                return val.substr(va, vb - va + 1);
+            }
+        }
+        if (eol == std::string::npos) break;
+        pos = eol + 2;
+    }
+    return "";
+}
+
+// Mutating routes that require a key whenever one is configured. Read-only
+// GETs (including GET /health, the liveness probe) stay open.
+bool route_requires_auth(const std::string& method, const std::string& path) {
+    if (method == "POST" || method == "DELETE") {
+        if (path == "/v1/models/load" || path == "/v1/models/pull") return true;
+        if (path == "/v1/config" || path == "/api/config") return true;
+        if (path == "/v1/slots/clear" || path.starts_with("/v1/slots/")) return true;
+        if (path == "/v1/chat/completions" || path == "/v1/completions" ||
+            path == "/api/chat" || path == "/api/generate") return true;
+        if (path == "/v1/embeddings" || path == "/v1/systemone" ||
+            path == "/v1/images/generations") return true;
+    }
+    return false;
+}
+
+// Check Authorization: Bearer <key> or x-api-key: <key> against `key`.
+// The scheme is case-insensitive per RFC 9110 ("bearer" is accepted too).
+bool request_authorized(const std::string& headers, const std::string& key) {
+    std::string auth = header_value(headers, "Authorization");
+    if (auth.size() > 7) {
+        std::string scheme = auth.substr(0, 7);
+        std::transform(scheme.begin(), scheme.end(), scheme.begin(),
+                       [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        if (scheme == "bearer " && constant_time_equal(auth.substr(7), key)) return true;
+    }
+    std::string xkey = header_value(headers, "x-api-key");
+    if (!xkey.empty() && constant_time_equal(xkey, key)) return true;
+    return false;
+}
+
+std::string cors_allowed_origin(const std::string& origin,
+                                const std::string& allowed_origins_csv) {
+    if (origin.empty() || allowed_origins_csv.empty()) return "";
+    std::string o = origin;
+    while (!o.empty() && (o.back() == ' ' || o.back() == '\t' || o.back() == '/')) o.pop_back();
+    std::istringstream ss(allowed_origins_csv);
+    std::string item;
+    while (std::getline(ss, item, ',')) {
+        size_t a = item.find_first_not_of(" \t");
+        if (a == std::string::npos) continue;
+        size_t b = item.find_last_not_of(" \t/");
+        if (item.substr(a, b - a + 1) == o) return origin;
+    }
+    return "";
+}
+
+bool validate_sampler_params(double temperature, double top_p, double top_k,
+                             double repetition_penalty, std::string& err) {
+    if (!std::isfinite(temperature) || temperature < 0.0 || temperature > 5.0) {
+        err = "temperature must be a number in [0, 5]";
+        return false;
+    }
+    if (!std::isfinite(top_p) || top_p <= 0.0 || top_p > 1.0) {
+        err = "top_p must be a number in (0, 1]";
+        return false;
+    }
+    if (!std::isfinite(top_k) || top_k < 0.0 || top_k > 1000.0 ||
+        std::floor(top_k) != top_k) {
+        err = "top_k must be an integer in [0, 1000]";
+        return false;
+    }
+    if (!std::isfinite(repetition_penalty) || repetition_penalty < 0.0 ||
+        repetition_penalty > 2.0) {
+        err = "repetition_penalty must be a number in [0, 2]";
+        return false;
+    }
+    return true;
+}
+
+bool validate_server_config(int paged_blocks, int active_slots, int max_context,
+                            int api_port, int spec_tokens, double temperature,
+                            double top_p, const std::string& api_host,
+                            std::string& err) {
+    if (paged_blocks < 1 || paged_blocks > 65536) {
+        err = "paged_attention_blocks must be an integer in [1, 65536]";
+        return false;
+    }
+    if (active_slots < 1 || active_slots > 64) {
+        err = "active_slots must be an integer in [1, 64]";
+        return false;
+    }
+    if (max_context < 256 || max_context > 262144) {
+        err = "max_context must be an integer in [256, 262144]";
+        return false;
+    }
+    if (api_port < 1 || api_port > 65535) {
+        err = "api_port must be an integer in [1, 65535]";
+        return false;
+    }
+    if (spec_tokens < 0 || spec_tokens > 16) {
+        err = "speculative_draft_tokens must be an integer in [0, 16]";
+        return false;
+    }
+    std::string serr;
+    if (!validate_sampler_params(temperature, top_p, 40.0, 1.0, serr)) {
+        err = serr;
+        return false;
+    }
+    if (api_host.empty() || api_host.size() > 253) {
+        err = "api_host must be a non-empty hostname or IP (max 253 chars)";
+        return false;
+    }
+    for (char c : api_host) {
+        unsigned char u = static_cast<unsigned char>(c);
+        bool ok = (u >= 'a' && u <= 'z') || (u >= 'A' && u <= 'Z') ||
+                  (u >= '0' && u <= '9') || c == '.' || c == '-' || c == ':' ||
+                  c == '[' || c == ']';
+        if (!ok) {
+            err = "api_host contains an invalid character";
+            return false;
+        }
+    }
+    return true;
+}
+
 HttpServer::HttpServer(MoETransformerEngine& engine, const std::string& web_root)
     : engine_(engine), web_root_(web_root) {}
 
@@ -743,6 +978,14 @@ HttpServer::~HttpServer() {
 void HttpServer::stop() {
     running_ = false;
     if (listen_sock_ != ~static_cast<uintptr_t>(0)) {
+#ifndef _WIN32
+        // shutdown() wakes a thread blocked in accept(); close() alone
+        // does not on Linux (the socket object stays alive while accept
+        // holds a reference), so without this the accept thread never
+        // exits and a join() after stop() hangs forever. This also
+        // matters for a clean `serve` shutdown.
+        ::shutdown(static_cast<int>(listen_sock_), SHUT_RDWR);
+#endif
         close_sock(listen_sock_);
         listen_sock_ = ~static_cast<uintptr_t>(0);
     }
@@ -753,6 +996,23 @@ bool HttpServer::start(uint16_t port, std::string& err_msg,
     port_ = port;
     host_ = host;
     api_key_ = resolve_api_key();
+#ifndef _WIN32
+    // A client hanging up mid-stream used to kill the whole engine with
+    // SIGPIPE (exit 141): send() on a closed socket raises SIGPIPE by
+    // default, and the streaming callbacks' send_all() failure return
+    // never got the chance to end just that connection. Ignoring SIGPIPE
+    // process-wide makes send() fail with EPIPE instead, so a disconnect
+    // ends only its own connection. (Windows has no SIGPIPE.)
+    std::signal(SIGPIPE, SIG_IGN);
+#endif
+    // CORS allow-list: MOE_CORS_ORIGINS env wins, else moe_config.json
+    // "cors_origins" (comma-separated exact origins). Empty = same-origin
+    // only: no Access-Control-Allow-Origin header is emitted at all.
+    {
+        const char* env_cors = std::getenv("MOE_CORS_ORIGINS");
+        if (env_cors != nullptr && env_cors[0] != '\0') cors_origins_ = env_cors;
+        else cors_origins_ = read_config_string("cors_origins", "");
+    }
 
     // Refuse a non-loopback bind with no key unless the operator explicitly
     // opts out. Listening on all interfaces unauthenticated is how the old
@@ -853,6 +1113,14 @@ bool HttpServer::start(uint16_t port, std::string& err_msg,
         }
         uintptr_t client_sock = static_cast<uintptr_t>(cs);
 #endif
+        // Bounded concurrency: each connection gets a detached thread, so
+        // an unbounded accept loop is a thread-exhaustion DoS. Past the
+        // cap the socket is closed immediately (the client sees a reset,
+        // not a hang). active_requests_ is incremented in handle_client.
+        if (active_requests_.load() >= kMaxConcurrentRequests) {
+            close_sock(client_sock);
+            continue;
+        }
         std::thread([this, client_sock]() {
             handle_client(client_sock);
         }).detach();
@@ -872,15 +1140,23 @@ void HttpServer::handle_client(uintptr_t client_sock) {
 #ifdef _WIN32
     DWORD rcv_timeout_ms = 5000;
     setsockopt(static_cast<SOCKET>(client_sock), SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&rcv_timeout_ms), sizeof(rcv_timeout_ms));
+    DWORD snd_timeout_ms = 30000;
+    setsockopt(static_cast<SOCKET>(client_sock), SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&snd_timeout_ms), sizeof(snd_timeout_ms));
 #else
     struct timeval tv{5, 0};
     setsockopt(static_cast<int>(client_sock), SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    struct timeval snd_tv{30, 0};
+    setsockopt(static_cast<int>(client_sock), SOL_SOCKET, SO_SNDTIMEO, &snd_tv, sizeof(snd_tv));
 #endif
 
     std::string req;
     char buf[8192];
     size_t header_end = std::string::npos;
     size_t content_len = 0;
+    bool header_too_large = false;
+    bool body_too_large = false;
+    bool bad_length = false;
+    bool has_transfer_encoding = false;
 
     while (true) {
 #ifdef _WIN32
@@ -891,28 +1167,92 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         if (n <= 0) break;
         req.append(buf, static_cast<size_t>(n));
         if (header_end == std::string::npos) {
+            // Header block cap: a client that never sends \r\n\r\n cannot
+            // make us buffer forever.
+            if (req.size() > kMaxHeaderBytes) { header_too_large = true; break; }
             header_end = req.find("\r\n\r\n");
             if (header_end != std::string::npos) {
                 std::string headers = req.substr(0, header_end);
-                // Case-insensitive search for Content-Length
+                // Safe Content-Length parse: digits only, single header.
+                // The old code used std::stoull on raw header text, which
+                // throws std::invalid_argument on "Content-Length: abc" —
+                // an uncaught throw in a detached thread terminates the
+                // whole process. Duplicate / chunked framing is rejected.
                 std::string lower_h = headers;
-                std::transform(lower_h.begin(), lower_h.end(), lower_h.begin(), ::tolower);
+                std::transform(lower_h.begin(), lower_h.end(), lower_h.begin(),
+                               [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+                if (lower_h.find("transfer-encoding:") != std::string::npos) {
+                    has_transfer_encoding = true;
+                }
                 size_t cl = lower_h.find("content-length:");
                 if (cl != std::string::npos) {
-                    content_len = std::stoull(lower_h.substr(cl + 15));
+                    if (lower_h.find("content-length:", cl + 15) != std::string::npos) {
+                        bad_length = true;
+                    } else {
+                        size_t vstart = cl + 15;
+                        while (vstart < lower_h.size() && (lower_h[vstart] == ' ' || lower_h[vstart] == '\t')) ++vstart;
+                        size_t vend = vstart;
+                        while (vend < lower_h.size() && std::isdigit(static_cast<unsigned char>(lower_h[vend]))) ++vend;
+                        if (vend == vstart) {
+                            bad_length = true;
+                        } else {
+                            try {
+                                content_len = std::stoull(lower_h.substr(vstart, vend - vstart));
+                            } catch (...) {
+                                bad_length = true;
+                            }
+                            if (content_len > kMaxBodyBytes) body_too_large = true;
+                        }
+                    }
                 }
             }
         }
         if (header_end != std::string::npos && req.size() >= header_end + 4 + content_len) {
             break;
         }
+        // Never buffer more than the declared body plus the header cap.
+        if (header_end != std::string::npos && req.size() > header_end + 4 + content_len) break;
+        if (req.size() > kMaxHeaderBytes + kMaxBodyBytes) { body_too_large = true; break; }
     }
 
+    if (header_too_large) {
+        send_http_json(client_sock, 431, "Request Header Fields Too Large",
+                       "{\"error\":\"header_too_large\",\"message\":\"Request headers exceed 64 KiB.\"}");
+        return;
+    }
     if (req.empty() || header_end == std::string::npos) return;
+    if (has_transfer_encoding) {
+        send_http_json(client_sock, 400, "Bad Request",
+                       "{\"error\":\"unsupported_transfer_encoding\",\"message\":\"Transfer-Encoding is not supported; send a Content-Length body.\"}");
+        return;
+    }
+    if (bad_length) {
+        send_http_json(client_sock, 400, "Bad Request",
+                       "{\"error\":\"invalid_content_length\",\"message\":\"Content-Length must be a single non-negative integer.\"}");
+        return;
+    }
+    if (body_too_large) {
+        send_http_json(client_sock, 413, "Content Too Large",
+                       "{\"error\":\"request_too_large\",\"message\":\"Request body exceeds the 1 MiB limit.\"}");
+        return;
+    }
+    if (req.size() < header_end + 4 + content_len) {
+        // Client disconnected or stalled mid-body: never act on a partial
+        // request.
+        send_http_json(client_sock, 400, "Bad Request",
+                       "{\"error\":\"incomplete_body\",\"message\":\"Request body ended before Content-Length bytes arrived.\"}");
+        return;
+    }
 
     std::istringstream req_stream(req.substr(0, header_end));
     std::string method, raw_path, http_ver;
     req_stream >> method >> raw_path >> http_ver;
+    if (method.empty() || raw_path.empty() || http_ver.empty() ||
+        http_ver.rfind("HTTP/", 0) != 0) {
+        send_http_json(client_sock, 400, "Bad Request",
+                       "{\"error\":\"malformed_request\",\"message\":\"Request line must be METHOD PATH HTTP/x.\"}");
+        return;
+    }
 
     std::string path = raw_path;
     size_t qpos = path.find('?');
@@ -920,8 +1260,34 @@ void HttpServer::handle_client(uintptr_t client_sock) {
 
     std::string body = (req.size() > header_end + 4) ? req.substr(header_end + 4, content_len) : "";
 
+    // CORS origin for this connection (thread_local, read by the response
+    // helpers). Same-origin requests send no Origin header and get no
+    // Access-Control-Allow-Origin header; that is the default policy.
+    {
+        std::string headers = req.substr(0, header_end);
+        g_allowed_origin = cors_allowed_origin(header_value(headers, "Origin"), cors_origins_);
+    }
+
     if (method == "OPTIONS") {
-        send_http_json(client_sock, 200, "OK", "{}");
+        // Preflight: only allowed origins get the CORS headers. A
+        // disallowed origin gets a plain 403 (no ACAO), so the browser
+        // blocks the cross-origin call.
+        std::string headers = req.substr(0, header_end);
+        std::string origin = header_value(headers, "Origin");
+        if (!origin.empty() && g_allowed_origin.empty()) {
+            send_http_json(client_sock, 403, "Forbidden",
+                           "{\"error\":\"cors_forbidden\",\"message\":\"This origin is not allowed to call this server.\"}");
+            return;
+        }
+        std::ostringstream hdr;
+        hdr << "HTTP/1.1 200 OK\r\n"
+            << cors_response_header()
+            << "Access-Control-Allow-Methods: GET, POST, OPTIONS, DELETE\r\n"
+            << "Access-Control-Allow-Headers: Content-Type, Authorization, x-api-key\r\n"
+            << "Content-Length: 2\r\n"
+            << "Connection: close\r\n\r\n{}";
+        std::string h = hdr.str();
+        send_all(client_sock, h.data(), h.size());
         return;
     }
 
@@ -938,6 +1304,18 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                            "Send Authorization: Bearer <key> or x-api-key: <key>.\"}");
             return;
         }
+    }
+
+    // Malformed-JSON gate: every POST/DELETE endpoint takes a JSON object.
+    // A body that is not a well-formed JSON object is rejected with a
+    // structured 400 here, before any handler's field extractors run, so
+    // truncated or hostile bodies can never produce a half-parsed request.
+    // (An empty body is allowed: handlers treat missing fields as absent.)
+    if ((method == "POST" || method == "DELETE") && !body.empty() &&
+        !json_is_valid_object(body)) {
+        send_http_json(client_sock, 400, "Bad Request",
+                       "{\"error\":\"invalid_json\",\"message\":\"Request body must be a well-formed JSON object.\"}");
+        return;
     }
 
     // ------------------------------------------------------------------------
@@ -1059,7 +1437,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                 << "Content-Type: text/event-stream; charset=utf-8\r\n"
                 << "Cache-Control: no-cache\r\n"
                 << "Connection: close\r\n"
-                << "Access-Control-Allow-Origin: *\r\n\r\n";
+                << cors_response_header() << "\r\n";
         std::string hstr = sse_hdr.str();
         if (!send_all(client_sock, hstr.data(), hstr.size())) return;
 
@@ -1303,6 +1681,10 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         } else {
             slot_id = static_cast<uint32_t>(extract_json_number(body, "slot_id", 0.0));
         }
+        // Clear under the slot's generation mutex when it is a user slot,
+        // so a clear cannot land mid-generation on that slot.
+        std::unique_lock<std::mutex> clear_lock;
+        if (slot_id < 64) clear_lock = std::unique_lock<std::mutex>(slot_mutexes_[slot_id]);
         bool cleared = engine_.clear_slot(slot_id);
         std::ostringstream js;
         js << "{\"status\":\"ok\",\"slot_id\":" << slot_id << ",\"cleared\":" << (cleared ? "true" : "false") << "}";
@@ -1364,25 +1746,70 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         std::string keep_key = read_config_string("api_key", "");
         std::string keep_host = extract_json_string(body, "api_host", read_config_string("api_host", "127.0.0.1"));
 
-        std::ofstream ofs("moe_config.json", std::ios::trunc | std::ios::binary);
-        if (ofs.is_open()) {
+        // Validate ranges instead of persisting arbitrary numbers (a
+        // negative active_slots or a 0 api_port used to be written verbatim
+        // and break the next start).
+        {
+            std::string cfg_err;
+            if (model_path.size() > 1024) cfg_err = "model_path must be at most 1024 characters";
+            else validate_server_config(paged_blocks, active_slots, max_ctx, api_port,
+                                        spec_tokens, temp, top_p, keep_host, cfg_err);
+            if (!cfg_err.empty()) {
+                std::ostringstream ej;
+                ej << "{\"error\":\"invalid_parameter\",\"message\":\"" << json_escape(cfg_err) << "\"}";
+                send_http_json(client_sock, 400, "Bad Request", ej.str());
+                return;
+            }
+        }
+
+        // Write atomically (temp file + rename) and JSON-escape every
+        // caller-controlled string. The old code interpolated model_path
+        // and api_host raw into moe_config.json, so a body like
+        // {"model_path": "x\", \"api_key\": \"pwned"} injected arbitrary
+        // JSON into the config — including an api_key the endpoint claims
+        // never to accept from a request body.
+        std::string cfg_tmp = "moe_config.json.tmp";
+        {
+            std::ofstream ofs(cfg_tmp, std::ios::trunc | std::ios::binary);
+            if (!ofs.is_open()) {
+                send_http_json(client_sock, 500, "Internal Server Error",
+                               "{\"error\":\"config_write_failed\",\"message\":\"Could not write moe_config.json.\"}");
+                return;
+            }
             ofs << "{\n"
                 << "  \"engine\": \"MoE-Stream-Engine-v2\",\n"
                 << "  \"first_run_completed\": true,\n"
-                << "  \"model_path\": \"" << model_path << "\",\n"
+                << "  \"model_path\": \"" << json_escape(model_path) << "\",\n"
                 << "  \"bypass_io\": " << (bypass_io ? "true" : "false") << ",\n"
                 << "  \"direct_dma\": " << (direct_dma ? "true" : "false") << ",\n"
                 << "  \"paged_attention_blocks\": " << paged_blocks << ",\n"
                 << "  \"active_slots\": " << active_slots << ",\n"
                 << "  \"max_context\": " << max_ctx << ",\n"
                 << "  \"api_port\": " << api_port << ",\n"
-                << "  \"api_host\": \"" << keep_host << "\",\n";
-            if (!keep_key.empty()) ofs << "  \"api_key\": \"" << keep_key << "\",\n";
+                << "  \"api_host\": \"" << json_escape(keep_host) << "\",\n";
+            if (!keep_key.empty()) ofs << "  \"api_key\": \"" << json_escape(keep_key) << "\",\n";
             ofs << "  \"speculative_draft_tokens\": " << spec_tokens << ",\n"
                 << "  \"temperature\": " << temp << ",\n"
                 << "  \"top_p\": " << top_p << "\n"
                 << "}\n";
             ofs.close();
+            if (!ofs) {
+                std::error_code ec;
+                std::filesystem::remove(cfg_tmp, ec);
+                send_http_json(client_sock, 500, "Internal Server Error",
+                               "{\"error\":\"config_write_failed\",\"message\":\"Could not write moe_config.json.\"}");
+                return;
+            }
+        }
+        {
+            std::error_code ec;
+            std::filesystem::rename(cfg_tmp, "moe_config.json", ec);
+            if (ec) {
+                std::filesystem::remove(cfg_tmp, ec);
+                send_http_json(client_sock, 500, "Internal Server Error",
+                               "{\"error\":\"config_write_failed\",\"message\":\"Could not write moe_config.json.\"}");
+                return;
+            }
         }
 
         std::ostringstream js;
@@ -1390,14 +1817,14 @@ void HttpServer::handle_client(uintptr_t client_sock) {
            << "  \"status\": \"ok\",\n"
            << "  \"message\": \"System configuration updated and written to moe_config.json\",\n"
            << "  \"config\": {\n"
-           << "    \"model_path\": \"" << model_path << "\",\n"
+           << "    \"model_path\": \"" << json_escape(model_path) << "\",\n"
            << "    \"bypass_io\": " << (bypass_io ? "true" : "false") << ",\n"
            << "    \"direct_dma\": " << (direct_dma ? "true" : "false") << ",\n"
            << "    \"paged_attention_blocks\": " << paged_blocks << ",\n"
            << "    \"active_slots\": " << active_slots << ",\n"
            << "    \"max_context\": " << max_ctx << ",\n"
            << "    \"api_port\": " << api_port << ",\n"
-           << "    \"api_host\": \"" << keep_host << "\",\n"
+           << "    \"api_host\": \"" << json_escape(keep_host) << "\",\n"
            << "    \"speculative_draft_tokens\": " << spec_tokens << ",\n"
            << "    \"temperature\": " << temp << ",\n"
            << "    \"top_p\": " << top_p << "\n"
@@ -1419,7 +1846,21 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         std::string user_prompt = format_chat_prompt_for_arch(body, engine_, tools_ptr);
         bool stream = extract_json_bool(body, "stream", true);
         uint32_t max_tokens = static_cast<uint32_t>(std::clamp(extract_json_number(body, "max_tokens", 1024.0), 1.0, 4096.0));
-        uint32_t slot_id = static_cast<uint32_t>(std::max(0.0, extract_json_number(body, "cache_slot", 0.0)));
+        // Slot ids are validated, not silently wrapped: a huge or negative
+        // cache_slot used to cast to an arbitrary uint32_t.
+        double slot_raw = extract_json_number(body, "cache_slot", 0.0);
+        if (!std::isfinite(slot_raw) || slot_raw < 0.0 || slot_raw > 63.0 ||
+            std::floor(slot_raw) != slot_raw) {
+            send_http_json(client_sock, 400, "Bad Request",
+                           "{\"error\":\"invalid_parameter\",\"message\":\"cache_slot must be an integer in [0, 63].\"}");
+            return;
+        }
+        uint32_t slot_id = static_cast<uint32_t>(slot_raw);
+        // Serialize generations on this KV slot (see slot_mutexes_ in
+        // server.h): two concurrent chats on one slot corrupt each other's
+        // KV state and both return garbled text. Held for the whole
+        // handler — all three generate_stream call sites below.
+        std::lock_guard<std::mutex> slot_lock(slot_mutexes_[slot_id]);
         bool compaction = extract_json_bool(body, "context_compaction", true);
         bool continue_asst = extract_json_bool(body, "continue_assistant", false);
         bool speculative = extract_json_bool(body, "speculative", false);
@@ -1433,6 +1874,20 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         // Seed 0 (default) = fresh entropy per request; an explicit seed is
         // deterministic across requests.
         scfg.seed = static_cast<uint64_t>(extract_json_number(body, "seed", 0.0));
+
+        // Reject invalid sampler values instead of silently feeding NaN /
+        // out-of-range parameters to the sampler (the old extractors
+        // accepted NaN, negative top_p and huge top_k without complaint).
+        {
+            std::string samp_err;
+            if (!validate_sampler_params(scfg.temperature, scfg.top_p, scfg.top_k,
+                                         scfg.repetition_penalty, samp_err)) {
+                std::ostringstream ej;
+                ej << "{\"error\":\"invalid_parameter\",\"message\":\"" << json_escape(samp_err) << "\"}";
+                send_http_json(client_sock, 400, "Bad Request", ej.str());
+                return;
+            }
+        }
 
         // --- Tool-calling path: generation is buffered, because the
         // content-vs-tool_calls decision is atomic — nothing is sent before
@@ -1494,7 +1949,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                     << "Content-Type: text/event-stream; charset=utf-8\r\n"
                     << "Cache-Control: no-cache\r\n"
                     << "Connection: keep-alive\r\n"
-                    << "Access-Control-Allow-Origin: *\r\n\r\n";
+                    << cors_response_header() << "\r\n";
             std::string hstr = sse_hdr.str();
             if (!send_all(client_sock, hstr.data(), hstr.size())) return;
             std::ostringstream ev;
@@ -1574,7 +2029,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
                 << "Content-Type: text/event-stream; charset=utf-8\r\n"
                 << "Cache-Control: no-cache\r\n"
                 << "Connection: keep-alive\r\n"
-                << "Access-Control-Allow-Origin: *\r\n\r\n";
+                << cors_response_header() << "\r\n";
         std::string hstr = sse_hdr.str();
         if (!send_all(client_sock, hstr.data(), hstr.size())) return;
 
@@ -1688,10 +2143,24 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     // ------------------------------------------------------------------------
     if (method == "POST" && path == "/v1/images/generations") {
         std::string prompt = extract_json_string(body, "prompt", "Cybernetic cortical MoE neural network");
-        uint32_t width  = static_cast<uint32_t>(extract_json_number(body, "width", 512.0));
-        uint32_t height = static_cast<uint32_t>(extract_json_number(body, "height", 512.0));
-        uint32_t steps  = static_cast<uint32_t>(extract_json_number(body, "steps", 12.0));
-        float guidance  = static_cast<float>(extract_json_number(body, "guidance_scale", 7.5));
+        double w_raw = extract_json_number(body, "width", 512.0);
+        double h_raw = extract_json_number(body, "height", 512.0);
+        double s_raw = extract_json_number(body, "steps", 12.0);
+        double g_raw = extract_json_number(body, "guidance_scale", 7.5);
+        // Unclamped dimensions used to cast straight to uint32_t, so a
+        // huge/negative width wrapped to an arbitrary size.
+        if (!std::isfinite(w_raw) || w_raw < 16.0 || w_raw > 2048.0 || std::floor(w_raw) != w_raw ||
+            !std::isfinite(h_raw) || h_raw < 16.0 || h_raw > 2048.0 || std::floor(h_raw) != h_raw ||
+            !std::isfinite(s_raw) || s_raw < 1.0 || s_raw > 50.0 || std::floor(s_raw) != s_raw ||
+            !std::isfinite(g_raw) || g_raw < 0.0 || g_raw > 30.0) {
+            send_http_json(client_sock, 400, "Bad Request",
+                           "{\"error\":\"invalid_parameter\",\"message\":\"width/height must be integers in [16, 2048], steps in [1, 50], guidance_scale in [0, 30].\"}");
+            return;
+        }
+        uint32_t width  = static_cast<uint32_t>(w_raw);
+        uint32_t height = static_cast<uint32_t>(h_raw);
+        uint32_t steps  = static_cast<uint32_t>(s_raw);
+        float guidance  = static_cast<float>(g_raw);
         uint64_t seed   = static_cast<uint64_t>(extract_json_number(body, "seed", 42.0));
 
         auto img = NeuralLatentSynthesizer::generate(engine_, prompt, width, height, steps, guidance, seed);
@@ -1749,7 +2218,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
             std::ostringstream hdr;
             hdr << "HTTP/1.1 200 OK\r\n"
                 << "Content-Type: " << mime << "\r\n"
-                << "Access-Control-Allow-Origin: *\r\n"
+                << cors_response_header()
                 << "Content-Length: " << content.size() << "\r\n"
                 << "Connection: close\r\n\r\n";
             std::string h = hdr.str();

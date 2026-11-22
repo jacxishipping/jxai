@@ -30,12 +30,25 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   onSaveSamplerSettings
 }) => {
   // API key for the engine (required when MOE_API_KEY is set server-side).
-  // Stored in this browser's localStorage as `jxai_api_key` and sent as
-  // `Authorization: Bearer <key>` by apiFetch. Clear the field and save
-  // to remove it. Never hardcoded.
+  // MEMORY-ONLY: kept in this page's JS memory and sent as
+  // `Authorization: Bearer <key>` by apiFetch. It is never written to
+  // localStorage, sessionStorage, a cookie, or disk — it is cleared when
+  // the page reloads, so re-enter it each session. Clear the field and
+  // save to remove it. Never hardcoded. (In-page scripts could still read
+  // it from memory while the page is loaded — see README Security.)
   const [apiKey, setApiKeyInput] = useState(() => getApiKey());
   const [currentPrompt, setCurrentPrompt] = useState(systemPrompt);
   const [localSampler, setLocalSampler] = useState<SamplerSettings>(samplerSettings);
+
+  // Close on Escape (the header button is labelled "Esc").
+  useEffect(() => {
+    if (!isOpen) return;
+    const onKeyDown = (e: KeyboardEvent) => {
+      if (e.key === 'Escape') onClose();
+    };
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [isOpen, onClose]);
 
   useEffect(() => {
     setCurrentPrompt(systemPrompt);
@@ -67,7 +80,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
   if (!isOpen) return null;
 
   const handleSave = async () => {
-    setApiKey(apiKey); // persist (or clear) before the config call below
+    setApiKey(apiKey); // set in memory for this session (or clear)
     onSaveSystemPrompt(currentPrompt);
     onSaveSamplerSettings(localSampler);
     try {
@@ -97,35 +110,38 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
           </div>
           <button
             onClick={onClose}
-            className="text-slate-400 hover:text-slate-200 text-sm font-mono px-2 py-1 rounded"
+            aria-label="Close settings"
+            className="text-slate-400 hover:text-slate-200 text-sm font-mono px-2 py-1 rounded focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/70"
           >
             Esc
           </button>
         </div>
 
         <div className="space-y-4">
-          {/* API Key (stored in this browser's localStorage) */}
+          {/* API Key (memory-only — cleared when the page reloads) */}
           <div>
-            <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono flex items-center space-x-2">
+            <label htmlFor="jxai-api-key" className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono flex items-center space-x-2">
               <Key className="w-3.5 h-3.5 text-amber-400" />
               <span>{t.apiKeyLabel}</span>
             </label>
             <input
+              id="jxai-api-key"
               type="password"
               value={apiKey}
               onChange={e => setApiKeyInput(e.target.value)}
               placeholder={t.apiKeyPlaceholder}
+              autoComplete="off"
               className="w-full bg-slate-950/80 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs font-mono text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
             />
             <span className="text-[10px] text-slate-500 font-mono mt-1 block">
-              Saved in this browser only (localStorage key `jxai_api_key`). Clear the field and save to remove it.
+              Memory-only: kept in this page only, never saved to the browser or disk. Cleared on reload — re-enter it each session. Clear the field and save to remove it.
             </span>
           </div>
 
           {/* System Prompt with Quick Presets */}
           <div>
             <div className="flex items-center justify-between mb-2">
-              <label className="text-xs font-semibold text-slate-300 uppercase tracking-wider font-mono flex items-center space-x-2">
+              <label htmlFor="jxai-system-prompt" className="text-xs font-semibold text-slate-300 uppercase tracking-wider font-mono flex items-center space-x-2">
                 <Terminal className="w-3.5 h-3.5 text-indigo-400" />
                 <span>{t.sysPromptLabel}</span>
               </label>
@@ -146,6 +162,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
             </div>
 
             <textarea
+              id="jxai-system-prompt"
               rows={3}
               value={currentPrompt}
               onChange={e => setCurrentPrompt(e.target.value)}
@@ -171,6 +188,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
                 <input
                   type="range"
+                  aria-label="Temperature"
                   min={0}
                   max={1.5}
                   step={0.05}
@@ -187,6 +205,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
                 <input
                   type="range"
+                  aria-label="Top-P (nucleus)"
                   min={0.1}
                   max={1.0}
                   step={0.05}
@@ -203,6 +222,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
                 <input
                   type="range"
+                  aria-label="Top-K"
                   min={1}
                   max={100}
                   step={1}
@@ -219,6 +239,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
                 <input
                   type="range"
+                  aria-label="Repetition penalty"
                   min={1.0}
                   max={1.5}
                   step={0.02}
@@ -235,6 +256,7 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
                 </div>
                 <input
                   type="range"
+                  aria-label="Max tokens"
                   min={64}
                   max={4096}
                   step={64}
@@ -276,11 +298,12 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
 
           {/* Language Selection */}
           <div>
-            <label className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono flex items-center space-x-2">
+            <label htmlFor="jxai-language" className="block text-xs font-semibold text-slate-300 uppercase tracking-wider mb-2 font-mono flex items-center space-x-2">
               <Globe className="w-3.5 h-3.5 text-emerald-400" />
               <span>{t.languageLabel}</span>
             </label>
             <select
+              id="jxai-language"
               value={language}
               onChange={e => onSelectLanguage(e.target.value as SupportedLanguage)}
               className="w-full bg-slate-950/80 border border-slate-800 rounded-xl px-3.5 py-2.5 text-xs font-mono text-slate-100 focus:outline-none focus:ring-2 focus:ring-blue-500/50"
@@ -293,6 +316,40 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
               <option value="id">Bahasa Indonesia (ID)</option>
               <option value="pt-BR">Português (BR)</option>
             </select>
+          </div>
+
+          {/* Connection & Backend — what this UI is actually talking to */}
+          <div className="p-4 rounded-xl border border-slate-800 bg-slate-950/60 text-xs font-mono space-y-2">
+            <div className="text-slate-300 font-bold flex items-center space-x-1.5 border-b border-slate-800 pb-1.5">
+              <Cpu className="w-3.5 h-3.5 text-emerald-400" />
+              <span>Connection &amp; Backend</span>
+            </div>
+            {health ? (
+              <>
+                <div className="text-slate-400">
+                  Status: <span className="text-emerald-400 font-bold">Connected</span>
+                </div>
+                <div className="text-slate-400">
+                  Backend: <span className="text-slate-200">Native C++ engine (moe_engine serve)</span>
+                </div>
+                <div className="text-slate-400">
+                  Endpoint: <span className="text-slate-200">same-origin — served by the engine itself</span>
+                </div>
+                <div className="text-slate-400">
+                  Loaded model: <span className="text-slate-200">{health.model_name} ({health.architecture})</span>
+                </div>
+                <div className="text-slate-400">
+                  Max context: <span className="text-slate-200">{health.hparams.max_seq_len.toLocaleString()} tokens</span>
+                </div>
+                <div className="text-slate-400">
+                  Active slots: <span className="text-slate-200">{health.active_slots}</span>
+                </div>
+              </>
+            ) : (
+              <div className="text-amber-400">
+                Not connected — start the engine with ./start_jxai.sh, then reload this page.
+              </div>
+            )}
           </div>
 
           {/* Hardware & Tier Residency Telemetry Card */}
@@ -324,13 +381,13 @@ export const SettingsModal: React.FC<SettingsModalProps> = ({
         <div className="pt-2 flex justify-end space-x-3">
           <button
             onClick={onClose}
-            className="px-4 py-2 rounded-xl text-xs font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors"
+            className="px-4 py-2 rounded-xl text-xs font-medium text-slate-400 hover:text-slate-200 hover:bg-slate-800 transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-500/70"
           >
             {t.cancel}
           </button>
           <button
             onClick={handleSave}
-            className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors shadow-lg shadow-blue-500/20 flex items-center space-x-1.5"
+            className="px-5 py-2 rounded-xl bg-blue-600 hover:bg-blue-500 text-white text-xs font-medium transition-colors shadow-lg shadow-blue-500/20 flex items-center space-x-1.5 focus:outline-none focus-visible:ring-2 focus-visible:ring-blue-400"
           >
             <Save className="w-3.5 h-3.5" />
             <span>{t.saveSettings}</span>

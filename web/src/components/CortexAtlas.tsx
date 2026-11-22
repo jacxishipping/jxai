@@ -13,6 +13,7 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
   const [experts, setExperts] = useState<ExpertTelemetry[]>([]);
   const [selectedExpert, setSelectedExpert] = useState<ExpertTelemetry | null>(null);
   const [isLoading, setIsLoading] = useState(false);
+  const [error, setError] = useState<string | null>(null);
   const [yaw, setYaw] = useState(0.4);
   const [pitch, setPitch] = useState(0.2);
   const [zoom, setZoom] = useState(1.0);
@@ -27,9 +28,12 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
       if (res.ok) {
         const data = await res.json();
         setExperts(data.experts || []);
+        setError(null);
+      } else {
+        setError(`Server returned ${res.status} — telemetry unavailable.`);
       }
     } catch (e) {
-      console.error(e);
+      setError(e instanceof Error ? e.message : 'Telemetry request failed — is the engine running?');
     } finally {
       setIsLoading(false);
     }
@@ -59,6 +63,16 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
 
   const handleMouseUp = () => {
     isDraggingRef.current = false;
+  };
+
+  // Keyboard camera control: arrows rotate yaw/pitch, +/- zooms.
+  const handleCanvasKeyDown = (e: React.KeyboardEvent<HTMLCanvasElement>) => {
+    if (e.key === 'ArrowLeft') { e.preventDefault(); setYaw(prev => prev - 0.1); }
+    else if (e.key === 'ArrowRight') { e.preventDefault(); setYaw(prev => prev + 0.1); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setPitch(prev => Math.max(-1.2, Math.min(1.2, prev - 0.1))); }
+    else if (e.key === 'ArrowDown') { e.preventDefault(); setPitch(prev => Math.max(-1.2, Math.min(1.2, prev + 0.1))); }
+    else if (e.key === '+' || e.key === '=') { e.preventDefault(); setZoom(z => Math.min(2.0, +(z + 0.1).toFixed(1))); }
+    else if (e.key === '-') { e.preventDefault(); setZoom(z => Math.max(0.5, +(z - 0.1).toFixed(1))); }
   };
 
   // 3D Canvas Rendering of Cortical Hemispheres & Expert Nodes
@@ -179,9 +193,9 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
   }, [experts, yaw, pitch, zoom, selectedExpert, isLiveRouting]);
 
   return (
-    <div className="flex h-full w-full bg-[#080b13] overflow-hidden">
+    <div className="flex h-full w-full bg-[#080b13] overflow-hidden flex-col lg:flex-row">
       {/* 3D Interactive Canvas */}
-      <div className="flex-1 h-full relative flex flex-col">
+      <div className="flex-1 h-full relative flex flex-col min-h-[50vh]">
         {/* Header Bar */}
         <div className="h-14 px-6 border-b border-slate-800/80 flex items-center justify-between bg-slate-900/40 backdrop-blur-md z-10">
           <div className="flex items-center space-x-3">
@@ -189,7 +203,7 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
             <div>
               <h2 className="text-sm font-bold text-slate-100">{t.atlasTitle}</h2>
               <p className="text-[11px] text-slate-400 font-mono">
-                Interactive 3D Cortical Mantle & Sparse MoE Expert Routing
+                Interactive 3D Cortical Mantle &amp; Sparse MoE Expert Routing
               </p>
             </div>
           </div>
@@ -198,7 +212,8 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
             {/* Live Routing Mode Toggle */}
             <button
               onClick={() => setIsLiveRouting(prev => !prev)}
-              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono transition-colors ${
+              aria-pressed={isLiveRouting}
+              className={`flex items-center space-x-1.5 px-3 py-1.5 rounded-lg border text-xs font-mono transition-colors focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 ${
                 isLiveRouting
                   ? 'bg-cyan-950/60 border-cyan-500 text-cyan-300'
                   : 'bg-slate-900 border-slate-800 text-slate-400 hover:text-slate-200'
@@ -212,21 +227,24 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
             <div className="flex items-center space-x-1 bg-slate-900 border border-slate-800 rounded-lg p-0.5">
               <button
                 onClick={() => setZoom(z => Math.min(2.0, +(z + 0.1).toFixed(1)))}
-                className="p-1.5 text-slate-400 hover:text-slate-200"
+                aria-label="Zoom in"
+                className="p-1.5 text-slate-400 hover:text-slate-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 rounded"
                 title="Zoom In"
               >
                 <ZoomIn className="w-3.5 h-3.5" />
               </button>
               <button
                 onClick={() => setZoom(z => Math.max(0.5, +(z - 0.1).toFixed(1)))}
-                className="p-1.5 text-slate-400 hover:text-slate-200"
+                aria-label="Zoom out"
+                className="p-1.5 text-slate-400 hover:text-slate-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 rounded"
                 title="Zoom Out"
               >
                 <ZoomOut className="w-3.5 h-3.5" />
               </button>
               <button
                 onClick={() => { setYaw(0.4); setPitch(0.2); setZoom(1.0); }}
-                className="p-1.5 text-slate-400 hover:text-slate-200"
+                aria-label="Reset camera"
+                className="p-1.5 text-slate-400 hover:text-slate-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 rounded"
                 title="Reset Camera"
               >
                 <RotateCw className="w-3.5 h-3.5" />
@@ -236,7 +254,8 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
             <button
               onClick={fetchExperts}
               disabled={isLoading}
-              className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200"
+              aria-label="Refresh telemetry"
+              className="p-2 rounded-lg bg-slate-900 border border-slate-800 text-slate-400 hover:text-slate-200 focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400"
               title="Refresh Telemetry"
             >
               <RefreshCw className={`w-3.5 h-3.5 ${isLoading ? 'animate-spin' : ''}`} />
@@ -250,23 +269,44 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
             ref={canvasRef}
             width={800}
             height={600}
+            tabIndex={0}
+            role="img"
+            aria-label="3D expert routing map. Drag with the mouse or use arrow keys to rotate, plus and minus to zoom."
             onMouseDown={handleMouseDown}
             onMouseMove={handleMouseMove}
             onMouseUp={handleMouseUp}
             onMouseLeave={handleMouseUp}
-            className="w-full h-full block"
+            onKeyDown={handleCanvasKeyDown}
+            className="w-full h-full block focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400/70"
           />
           <div className="absolute bottom-4 left-6 text-[11px] font-mono text-slate-500 select-none">
-            Click & drag to rotate 3D yaw/pitch • Scroll or use buttons to zoom
+            Click &amp; drag to rotate 3D yaw/pitch • Arrow keys rotate • + / − zooms
           </div>
         </div>
       </div>
 
       {/* Expert Inspection Sidebar */}
-      <div className="w-80 h-full border-l border-slate-800/80 bg-slate-900/40 p-6 flex flex-col space-y-4 overflow-y-auto">
+      <div className="w-full lg:w-80 h-full border-l border-slate-800/80 bg-slate-900/40 p-6 flex flex-col space-y-4 overflow-y-auto shrink-0">
         <h3 className="text-xs font-bold text-slate-300 uppercase tracking-wider font-mono">
           MoE Expert Matrix ({experts.length} Nodes)
         </h3>
+        <p className="text-[11px] text-slate-500 font-mono leading-relaxed">
+          Tier, activations, LFRU score and pinning are live telemetry from /experts.
+          Topic labels are illustrative — assigned by layer/expert index, not derived
+          from the model.
+        </p>
+
+        {error && (
+          <div role="alert" className="rounded-xl border border-red-500/40 bg-red-950/40 px-3.5 py-2.5 text-xs text-red-300">
+            Telemetry failed: {error}
+          </div>
+        )}
+
+        {!error && experts.length === 0 && !isLoading && (
+          <div className="rounded-xl border border-slate-800 bg-slate-950/60 px-3.5 py-2.5 text-xs text-slate-400">
+            No expert telemetry yet — start the engine with a model loaded and it will appear here.
+          </div>
+        )}
 
         {/* Expert List Grid */}
         <div className="grid grid-cols-4 gap-2">
@@ -274,7 +314,9 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
             <button
               key={`e-${exp.layer}-${exp.expert}`}
               onClick={() => setSelectedExpert(exp)}
-              className={`p-2 rounded-xl border text-center transition-all ${
+              aria-pressed={selectedExpert?.layer === exp.layer && selectedExpert?.expert === exp.expert}
+              aria-label={`Layer ${exp.layer}, expert ${exp.expert}, tier ${exp.tier}`}
+              className={`p-2 rounded-xl border text-center transition-all focus:outline-none focus-visible:ring-2 focus-visible:ring-cyan-400 ${
                 selectedExpert?.layer === exp.layer && selectedExpert?.expert === exp.expert
                   ? 'border-white bg-slate-800 shadow-lg'
                   : exp.tier === 'VRAM'
@@ -309,7 +351,7 @@ export const CortexAtlas: React.FC<CortexAtlasProps> = ({ t }) => {
               </span>
             </div>
             <div>
-              <span className="text-slate-500">Semantic Topic:</span>
+              <span className="text-slate-500">Topic (illustrative label):</span>
               <div className="text-cyan-300 font-sans text-xs mt-0.5">{selectedExpert.topic}</div>
             </div>
             <div className="flex justify-between">

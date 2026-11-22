@@ -1,213 +1,449 @@
-# Next-Generation Real-Execution MoE Streaming Inference Engine & Desktop Suite
+# JXAI — Native C++ Inference Engine
 
-### Executive Architecture & Verification Summary
+JXAI is a local inference product built around a custom native C++ engine
+(`moe_engine`): GGUF/SafeTensors model loading, a C++20 SIMD transformer
+(AVX2 with runtime dispatch, optional AVX-512), an OpenAI-compatible HTTP
+server with SSE streaming, and a React web UI served by the engine itself.
+There is also a Tauri desktop shell that spawns the same engine.
 
-The Next-Generation Real-Execution MoE Streaming Inference Engine has been implemented, compiled natively with SIMD optimizations (AVX2 / FMA3 — AVX-512 is CPUID-detected only; no AVX-512 intrinsics are used), and validated end-to-end. The system operates strictly without mock loops, placeholder data, or synthetic sleep delays.
+**The native engine is the default backend.** The normal workflow
+(`./start_jxai.sh`) builds or locates `moe_engine`, starts
+`moe_engine serve` on `127.0.0.1:8001`, waits for a successful `/health`
+check (60 s), and serves the project's own web UI from the same origin.
+It never starts Ollama, never depends on an Ollama installation, and never
+silently falls back to one — if the engine fails to start, the launcher
+prints the failure and the log tail and exits. The Ollama proxy
+(`jxai_gateway.py`) is a separate, optional integration; see
+[Optional Ollama proxy](#optional-ollama-proxy-not-the-native-engine).
+
+What is verified, what is not, and what the engine refuses lives in
+[`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md). Read it before
+assuming a model, architecture, or quant type will work.
 
 ---
 
-## 1. Architectural Highlights
+## 1. Prerequisites
 
-```mermaid
-flowchart TD
-    subgraph Multi_Tier_Memory["Multi-Tier Memory Architecture"]
-        VRAM["Dense Backbone & Pinned Hot Experts<br/>(RAM/VRAM Zero-Copy mmap)"]
-        RAM["LFRU Tier Cache<br/>(Admitted Dynamic Slots)"]
-        NVMe["Sparse MoE Expert Slices<br/>(NVMe Disk, e.g. Q4_0, FP8, BF16)"]
-    end
+| Requirement | Notes |
+|---|---|
+| C++20 compiler | GCC 11+ / Clang 14+ on Linux; MSVC on Windows. The Linux/macOS build is a **portable baseline with runtime AVX2 dispatch** — it runs on CPUs without AVX2. The MSVC build still requires AVX2 (see [Acceleration](#6-acceleration-and-io)). |
+| CMake ≥ 3.20 | `cmake -S . -B build` |
+| Python 3 | Used by `start_jxai.sh` to read `moe_config.json`. No Python runtime is needed for inference. |
+| Node.js 22 + npm | Only to build the web UI (`cd web && npm ci && npm run build`). The launcher builds it automatically if the bundle is missing. |
+| A real GGUF model | The engine refuses to start without one — it will not silently forge a toy model as a backend. See [Model setup](#4-model-setup). |
+| Linux (primary) / Windows | Linux is the verified platform. Windows launchers exist (`run_studio.bat`, `run_open_webui.bat`, `install.bat`) but **were rewritten and have not been executed on a Windows host**; treat Windows as best-effort until someone runs them there. |
 
-    subgraph PILOT["PILOT Asynchronous Overlapped I/O"]
-        IOCP["Win32 IOCP / Linux pread()<br/>Direct Asynchronous I/O Queue"]
-        Prefetch["Pipelined Prefetch:<br/>Dispatch Layer L+1 Expert Reads during Layer L Matmuls"]
-    end
+No Ollama installation is needed for the default path. No GPU is needed;
+inference runs on CPU (see [Acceleration](#6-acceleration-and-io)).
 
-    subgraph Math_Engine["C++20 Vectorized Compute Core"]
-        RoPE["RoPE & YaRN Rotational Embeddings"]
-        GQA["Grouped-Query Attention & Contiguous KV Cache"]
-        Router["Router Gate Matrix & Top-K Softmax (CACHE_ROUTE aware)"]
-        SwiGLU["Vectorized SwiGLU:<br/>SiLU(x * W_gate) ⊙ (x * W_up) * W_down"]
-        LMHead["RMSNorm & LM Head Logit Projection"]
-    end
+---
 
-    subgraph Client_Gateway["OpenAI Gateway & Reactive Workspace"]
-        HTTP["OpenAI-Compatible HTTP Server (:8000)<br/>Full SSE Streaming + Dual-Channel Reasoning"]
-        WebUI["React 18 + TypeScript + Vite + Tailwind CSS v4<br/>Chat, 3D Cortex Atlas, Profiler, SystemOne, Image Synthesis"]
-        Desktop["Tauri v2 Desktop Shell"]
-    end
+## 2. Build
 
-    NVMe -->|Async Overlapped Read| IOCP
-    IOCP --> Prefetch
-    Prefetch --> RAM
-    RAM --> SwiGLU
-    VRAM --> RoPE
-    VRAM --> GQA
-    VRAM --> Router
-    Router --> SwiGLU
-    SwiGLU --> LMHead
-    LMHead --> HTTP
-    HTTP --> WebUI
-    HTTP --> Desktop
+```bash
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build -j
+# Produces build/moe_engine
 ```
 
-### 1.1 Asynchronous Multi-Tier Memory Streaming
-- **Dense Backbone in Memory**: Attention mechanisms (GQA/MHA), embedding tables, layer norms, and router gating matrices stay resident in system RAM or GPU VRAM via zero-copy memory-mapping (`mmap` / `CreateFileMapping` + `MapViewOfFile`).
-- **Sparse Experts on NVMe**: Sparse MoE expert matrices remain on disk and are streamed into small, recyclable memory buffers only when selected by the router.
-- **PILOT Compute/IO Overlap**: Background I/O threads dispatch asynchronous disk reads for Layer $L+1$ while compute kernels execute on Layer $L$, effectively hiding NVMe latency behind math time.
-- **Adaptive LFRU Caching & Dynamic Pinning**:
-  $$\text{Score} = (\text{Frequency} \times 256) + \min(255, \text{Recency})$$
-  Features a 25% hysteresis margin to prevent cache thrashing. Frequently routed "hot" experts (frequency $\ge 12$) are dynamically pinned into VRAM.
-- **CACHE_ROUTE Substitution**: If candidate uncached expert and resident expert have gate logits within $\epsilon \le 0.08$, the resident expert is substituted to avoid disk I/O.
+Windows (MSVC):
+
+```powershell
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build --config Release --parallel
+# Produces build\Release\moe_engine.exe
+```
+
+Build the web UI (the launcher does this for you if `web/dist` is missing):
+
+```bash
+cd web && npm ci && npm run build
+```
 
 ---
 
-## 2. Benchmark & Verification Results
+## 3. Run — the default path
 
-### 2.1 Automated Test Suite Verification
-`moe_engine test` runs a 10-point self-test and passes 10/10. **These numbers are from the synthetic self-test, not real-model benchmarks**: the dot-product and RoPE tests use synthetic vectors, and the end-to-end test uses the repo's forged 1.3 MB toy model (`models/qwen_run.gguf`, vocab 512), which generates empty text. Do not quote them as model performance.
+```bash
+./start_jxai.sh
+```
 
-| Test ID | Component Verified | Reference Metric | Real Engine Metric | Status |
-| :--- | :--- | :--- | :--- | :--- |
-| **Test 1** | Q4_0 & Q8_0 Dot Products | Ref FP32: `0.150863` | Q8: `0.152989` / Q4: `0.144648` | **PASSED** |
-| **Test 2** | RMSNorm Invariance & Scaling | Target: `1.000000` | Output RMS: `0.999990` | **PASSED** |
-| **Test 3** | RoPE Rotational Embedding | Norm Pre: `62.8509` | Norm Post: `62.8509` | **PASSED** |
-| **Test 4** | GGUF v3 Binary Generator & Parser | GGUF v3 Specification | Parsed 43 tensors (`1,328,288` bytes) | **PASSED** |
-| **Test 5** | Real MoE End-to-End Generation | Dual `<think>` Reasoning | Streamed valid token sequence | **PASSED** |
+What it does, in order:
 
-### 2.2 Verified on Real Models
-Greedy decoding (`temperature 0`), two prompts: "What is 2+2?" and "What is the capital of France?" Correct answers are "4" and "Paris". Throughput on this Linux VM is roughly **0.2–5 tok/s** depending on model and machine load (Qwen2.5-0.5B ~5 tok/s unloaded; Gemma-3-1b 0.2–0.6 tok/s; Phi-3-mini Q2_K ~0.0–0.2 tok/s); prefill is one forward per prompt token. The `2247.2 tok/s` figure in older versions of this README was the toy-model self-test, not a real model.
+1. Resolves a model: `--model <path>` → `MOE_MODEL` → `moe_config.json`
+   `"model_path"` → `models/real/qwen2.5-0.5b-instruct-q4_0.gguf`.
+   If no model file exists it **refuses to start** and tells you how to get
+   one (see [Model setup](#4-model-setup)).
+2. Builds `build/moe_engine` if the binary is missing (unless `--no-build`).
+3. Builds the web UI bundle if `web/dist/index.html` is missing.
+4. Starts `moe_engine serve --model <model> --host 127.0.0.1 --port 8001
+   --web-dir web/dist`, logging to `build/jxai-engine.log`.
+5. Waits up to 60 s for `/health` to report `{"status":"ok"}`. If the engine
+   exits early or never becomes healthy, it prints the last 30 lines of the
+   log and exits — no fallback to anything else.
+6. If a healthy engine is already on the port it reuses it instead of
+   starting a second one; if something else holds the port it refuses.
+7. Ctrl-C stops the engine cleanly (up to 5 s grace, then forced) and
+   releases the port. No orphaned server is left behind.
 
-<!-- VERIFIED-MODELS-TABLE -->
-| Model | Quant | 2+2 (greedy) | Capital of France (greedy) |
+When it is up:
+
+```
+Backend:  native C++ engine (moe_engine serve)
+Web UI:   http://127.0.0.1:8001/
+Engine:   http://127.0.0.1:8001/health
+Chat API: http://127.0.0.1:8001/v1/chat/completions
+```
+
+Useful options: `./start_jxai.sh --model <path> --port <n> --host <addr>
+--no-build`. `--public` was removed: this launcher never starts Open WebUI
+or a public tunnel.
+
+### Manual serve (no launcher)
+
+```bash
+./build/moe_engine serve --model models/real/qwen2.5-0.5b-instruct-q4_0.gguf \
+  --host 127.0.0.1 --port 8001 --web-dir web/dist
+```
+
+Note: `serve` without `--port` defaults to **8000**; the launcher, the
+desktop shell, and `moe_config.json` all use **8001**. Pass `--port 8001`
+explicitly to match them.
+
+### Interactive CLI chat
+
+```bash
+./build/moe_engine chat --model models/real/qwen2.5-0.5b-instruct-q4_0.gguf --max-tokens 128
+```
+
+### Desktop (Tauri)
+
+The desktop shell (`desktop/`) spawns the same native engine
+(`moe_engine serve --port 8001 --web-dir web/dist`) and opens the built-in
+UI. It does not use Ollama.
+
+---
+
+## 4. Model setup
+
+### Download a model (Hugging Face)
+
+```bash
+./build/moe_engine pull Qwen/Qwen2.5-0.5B-Instruct-GGUF
+# or a specific file:
+./build/moe_engine pull Qwen/Qwen2.5-0.5B-Instruct-GGUF Qwen2.5-0.5B-Instruct-Q4_0.gguf
+./build/moe_engine pull --list   # list downloadable files for a repo
+```
+
+- Downloads are **HTTPS only**; `http://` URLs are rejected.
+- `HF_TOKEN` (for gated/private repos) is attached **only to
+  huggingface.co hosts** — never to arbitrary user-supplied URLs or
+  redirect destinations.
+- Downloaded files are validated (GGUF/SafeTensors structure) before the
+  engine will load them; malformed files fail with an error instead of
+  producing plausible-but-wrong output. See
+  [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) §3 for what is
+  checked.
+- Models land under `models/real/` (gitignored). Point the launcher at one
+  with `--model`, `MOE_MODEL`, or `moe_config.json` `"model_path"`.
+
+### Use a local file
+
+Place any GGUF (v2/v3) or SafeTensors file (single file or sharded
+directory) anywhere and pass it with `--model`. Sharded GGUF can be merged
+first:
+
+```bash
+./build/moe_engine convert --merge <shard1.gguf> <shard2.gguf> -o merged.gguf
+./build/moe_engine convert --quantize model.gguf --to Q8_0 -o model-q8_0.gguf
+./build/moe_engine info model.gguf   # architecture, quant types, warnings
+```
+
+### Which models work?
+
+See [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) — architectures,
+quantization types, tokenizer/template behaviour, and the real model each
+row was verified against. Quick summary of what has actually been run
+end-to-end (greedy, temperature 0):
+
+| Model | Quant | 2+2 | Capital of France |
 | :--- | :--- | :--- | :--- |
 | Qwen2.5-0.5B-Instruct | Q4_0 | "The answer to 2+2 is 4." ✅ | "The capital of France is Paris." ✅ |
 | Llama-3.2-1B-Instruct | Q4_K_M | "The answer to 2+2 is 4." ✅ | "The capital of France is Paris." ✅ |
-| Qwen3-0.6B | Q4_K_M | ✅ with a large budget — thinks first, needs >128 tokens; at 254 tokens: "the answer is simply 4" / "2 + 2 equals 4" (at 64 tokens it is still inside the `<think>` block) | ✅ same caveat — reasoning names Paris; final answer needs the larger budget |
+| Qwen3-0.6B | Q4_K_M | ✅ with a large budget — thinks first, needs &gt;128 tokens; at 254 tokens: "the answer is simply 4" | ✅ same caveat |
 | Gemma-3-1b-it | Q4_K_M | "2 + 2 = 4" ✅ | "The capital of France is **Paris**." ✅ |
-| Phi-3-mini-4k-instruct | Q2_K | Coherent but verbose — 32 tokens cut off before stating "4" ("The answer to the question "What is 2+2?" is straightforward arithmetic…"); very slow on this VM (~0.2 tok/s) ⚠️ | "The capital of France is Paris, and it serves as the country's most populous city…" ✅ |
-| Mistral-7B-Instruct-v0.3 | Q2_K | ✅ (verified by the model-support workstream) | ✅ (verified by the model-support workstream) |
+| Phi-3-mini-4k-instruct | Q2_K | Coherent but verbose; 32 tokens cut off before stating "4" ⚠️ | "The capital of France is Paris, and it serves as the country's most populous city…" ✅ |
+| Mistral-7B-Instruct-v0.3 | Q2_K | ✅ | ✅ |
 
-DeepSeek-architecture models are **not verified**: no DeepSeek model has passed the greedy 2+2/Paris check yet, so its RoPE and chat-template behaviour is unconfirmed.
+**Not verified:** true `deepseek`/`deepseek2` architecture (DeepSeek-LLM-7B's
+GGUF reports arch `llama`, so it runs as llama — that says nothing about a
+real deepseek-arch file). Unknown architectures are refused at load instead
+of guessed.
 
-### 2.3 Live HTTP & SSE Gateway Endpoints Validated
+---
 
-| Endpoint | Method | Response Metric | Validation Details |
+## 5. API
+
+Base URL is the engine itself (`http://127.0.0.1:8001` via the launcher).
+All responses are JSON; errors are `{"error": "...", "message": "..."}`.
+
+| Endpoint | Method | Auth | Notes |
 | :--- | :--- | :--- | :--- |
-| `/health` | `GET` | `200 OK` | Reports active slots, hardware (CPUID-detected SIMD), and memory tier stats |
-| `/v1/chat/completions` | `POST` | `200 OK` | Full SSE streaming with dual-channel reasoning deltas |
-| `/profile` | `GET` | `200 OK` | Real-time snapshots of wall time, NVMe I/O wait, matmul, and attention latency |
-| `/experts` | `GET` | `200 OK` | Real-time activation hit-map showing tier distribution and dynamic pinning |
-| `/v1/systemone` | `POST` | `200 OK` (`0.569ms`, 0 tokens generated) | Categorical decision evaluation directly via LM head logit distribution |
-| `/v1/images/generations` | `POST` | `200 OK` | Renders a 16×16 latent SVG visualisation (coloured grid + caption) conditioned by a transformer forward pass — **not image generation** |
-| `/` (Root UI) | `GET` | `200 OK` | Serves compiled Vite bundle (`web/dist/index.html`) |
+| `/health` | GET | Open | Liveness probe: status, model, hardware, tier stats |
+| `/v1/chat/completions` | POST | Key* | OpenAI-compatible; `stream: true` gives SSE with dual-channel reasoning deltas; `stream: false` returns one JSON object |
+| `/v1/completions`, `/api/chat`, `/api/generate` | POST | Key* | Compatibility aliases for chat |
+| `/v1/models` | GET | Open | Lists models; **exposes model filesystem paths** (deliberate, for model selection in the UI) |
+| `/v1/models/load` | POST | Key* | Load a model by path |
+| `/v1/models/pull` | POST | Key* | Pull a model from Hugging Face |
+| `/v1/embeddings` | POST | Key* | Embeddings via the loaded model |
+| `/v1/systemone` | POST | Key* | Zero-token categorical evaluation via LM-head logits (see below) |
+| `/v1/images/generations` | POST | Key* | **Latent SVG visualisation, not image generation** (see below) |
+| `/v1/config` | GET / POST | Key* (POST) | GET redacts the stored API key |
+| `/v1/slots`, `/v1/slots/clear` | GET / POST | Key* (POST) | Paged KV-cache slot management |
+| `/experts` | GET | Open | Live expert telemetry: tier, activations, LFRU score, pinning |
+| `/profile` | GET | Open | Latency / throughput snapshot |
+| `/` | GET | Open | Serves the compiled web UI (`web/dist`) |
 
-**What the engine does not do:** Vulkan only queries the physical device — `dispatch_gemv_q4_0()` always falls back to CPU compute. On Linux, model I/O uses plain `pread()`, not io_uring (the "io_uring" label in older docs was a hardcoded string). Large-scale MoE streaming (30B–700B parameters) is untested in this repo; the only models run end-to-end so far are the ones in §2.2.
+\* Key = required when `MOE_API_KEY` is configured on the server, as
+`Authorization: Bearer <key>` or `x-api-key: <key>`. Without a key the
+response is `401 {"error":"unauthorized"}`. `GET /health` stays open.
+
+```bash
+# Chat (streaming)
+curl -N -H "Authorization: Bearer $MOE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is 2+2?"}],"stream":true,"temperature":0}' \
+  http://127.0.0.1:8001/v1/chat/completions
+
+# Chat (single JSON response)
+curl -H "Authorization: Bearer $MOE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is 2+2?"}],"stream":false,"temperature":0}' \
+  http://127.0.0.1:8001/v1/chat/completions
+
+# Tool calling (single-turn only — see Known limitations)
+curl -H "Authorization: Bearer $MOE_API_KEY" -H 'Content-Type: application/json' \
+  -d '{"messages":[{"role":"user","content":"What is the weather in Paris?"}],"tools":[{"type":"function","function":{"name":"get_weather","description":"Get the current weather","parameters":{"type":"object","properties":{"location":{"type":"string"}},"required":["location"]}}}],"stream":false,"temperature":0,"max_tokens":128}' \
+  http://127.0.0.1:8001/v1/chat/completions
+```
+
+Sampling parameters are validated server-side: `temperature` must be
+finite and ≥ 0, `top_p` in [0, 1], `max_new_tokens` ≤ 16,384. Invalid
+values are rejected, not silently accepted. (Qwen3 needs `max_tokens`
+≥ 128 to finish its thinking block and answer.)
+
+**SystemOne** (`/v1/systemone`) scores candidate options directly from
+the LM-head logits — 0 tokens generated. Entropy and confidence shown in
+the UI are computed in the browser from those probabilities; they are
+derived, not calibrated. On the built-in 30-item sentiment benchmark the
+small reference model scores **10/30 (33.3% = baseline)**, so treat
+SystemOne output as a ranking signal, not a verified classifier.
+
+**Latent visualisation** (`/v1/images/generations`) renders a 16×16 latent
+SVG grid conditioned by a transformer forward pass. It is **not image
+generation** and the UI labels it as a visualisation. Do not present its
+output as a generated image.
+
+**Expert telemetry** (`/experts`) is live: tier, activations, LFRU score,
+and pinning come from the running engine. The "topic" label shown per
+expert in the UI is **illustrative** — a fixed label assigned by
+layer/expert index, not derived from the model.
 
 ---
 
-## 3. Project Directory Map
+## 6. Acceleration and I/O
 
-```
-jxai/
-├── CMakeLists.txt              # Native C++20 build configuration
-├── build\                      # Compiled native binaries (moe_engine.exe)
-├── include\
-│   ├── common.h                # Hardware specs, GGML enums, high-res timers
-│   ├── quant.h                 # Q4_0, Q8_0, IQ4_NL, Q4_K dequantize-on-the-fly SIMD
-│   ├── gguf.h                  # Native zero-copy GGUF v3 & SafeTensors parser
-│   ├── tokenizer.h            # Byte-level BPE, byte fallback & streaming UTF-8 decoder
-│   ├── tier.h                 # LFRU caching, dynamic pinning & CACHE_ROUTE
-│   ├── pilot_io.h             # Win32 IOCP overlapped async I/O & multi-drive striping
-│   ├── transformer.h          # Full MoE transformer forward pass, KV cache, GQA, RoPE
-│   ├── diffusion.h            # Neural latent synthesizer with progressive preview
-│   ├── model_forge.h          # Generator for compliant GGUF & SafeTensors models
-│   └── server.h               # Standards-compliant HTTP server with SSE
-├── src\
-│   ├── quant.cpp, gguf.cpp, tokenizer.cpp, tier.cpp, pilot_io.cpp
-│   ├── transformer.cpp, diffusion.cpp, model_forge.cpp, server.cpp, main.cpp
-├── web\                        # Modern React 18, TypeScript, Vite, Tailwind CSS v4 UI
-│   ├── src\components\
-│   │   ├── ChatWorkspace.tsx       # Dual-channel chat & HTML/SVG preview sandbox
-│   │   ├── CortexAtlas.tsx         # 3D canvas cortical hemisphere & expert hitmap
-│   │   ├── ProfilerDashboard.tsx   # Stacked latency & throughput charts
-│   │   ├── SystemOneWorkspace.tsx  # Zero-token-generation categorical scoring
-│   │   ├── ImageWorkspace.tsx      # Text-to-image with denoising & lightbox zoom
-│   │   └── SettingsModal.tsx       # Memory-only keys, i18n, custom prompts
-│   └── dist\                       # Production bundle served directly by engine
-└── desktop\                    # Tauri v2 desktop shell
-    └── src-tauri\
-        ├── Cargo.toml, tauri.conf.json, src/main.rs
-```
+Honest numbers only — see [Benchmarks](#8-benchmarks) for the measured
+results and the command that produced them.
+
+- **CPU dispatch:** portable baseline build with runtime AVX2 dispatch on
+  Linux/macOS. The binary is safe on CPUs without AVX2. The MSVC build
+  still requires AVX2 (Haswell+); on a non-AVX2 machine it may fault
+  (SIGILL) — `moe_engine doctor` reports this.
+- **AVX-512:** AVX-512 dot kernels exist for Q4_0/Q4_K/Q8_0, but they are
+  **off by default**. On the VM where they were measured they were ~5×
+  *slower* than AVX2 on prefill (287.6 vs 57.0 ms/forward), and they have
+  no dedicated Test 1 assertions. Opt in with `MOE_AVX512=1` only if you
+  measure a win on your hardware.
+- **Vulkan:** device detection only. No Vulkan compute kernels are
+  implemented; inference runs on CPU. Do not expect GPU acceleration.
+- **I/O (Linux):** synchronous `pread()` + `mmap` with background prefetch
+  of the next layer's experts while the current layer computes. This is
+  **not** async I/O, io_uring, or DMA — older docs that said otherwise
+  were wrong. The `bypass_io` / `direct_dma` keys in `moe_config.json`
+  are legacy and do not change Linux I/O behaviour.
+- **Prefetch:** bounded background prefetch; cache-hit, read, wait, and
+  latency figures in `/profile` and the UI are measured counters, not
+  estimates.
 
 ---
 
-## 4. How to Run
+## 7. Web UI
 
-### Interactive CLI Chat Mode
-```powershell
-cd jxai
-.\build\moe_engine.exe chat --model models/qwen_run.gguf --max-tokens 128
+Served by the engine itself at `http://127.0.0.1:8001/` — same origin, so
+the UI calls relative `/v1/*` and `/health` URLs. No separate frontend
+server is needed.
+
+- **Chat** — streaming chat with dual-channel reasoning, per-token
+  telemetry, and model/slot info. Handles disconnects, cancellation,
+  empty responses, malformed chunks, and server errors without hanging.
+- **3D Cortex Atlas** — live expert routing map from `/experts`.
+- **Profiler** — measured latency/throughput from `/profile`.
+- **SystemOne** — zero-token categorical evaluation (see §5).
+- **Latent Visualisation** — SVG-grid visualisation (see §5), not image
+  generation.
+- **Settings** — API key, system prompt, sampler settings, language, and
+  a connection card showing backend (native engine), loaded model, and
+  max context.
+
+**API key handling:** the key is **memory-only**. It is kept in the page's
+JavaScript memory, never written to `localStorage`, `sessionStorage`, a
+cookie, or disk, and it is cleared when the page reloads — re-enter it
+each session. Tradeoff: an in-page script (XSS) could still read it from
+memory while the page is loaded. Keep the engine loopback-only (the
+default) and do not load untrusted pages in the same browser profile.
+
+---
+
+## 8. Benchmarks
+
+Reproducible with the built-in command (no model downloads — use a local
+model):
+
+```bash
+OMP_NUM_THREADS=1 ./build/moe_engine bench --model models/real/qwen2.5-0.5b-instruct-q4_0.gguf \
+  --prompt "What is 2+2?" --tokens 16
 ```
 
-### Run HTTP Gateway & Web UI Server
-```powershell
-.\build\moe_engine.exe serve --model models/qwen_run.gguf --port 8000 --web-dir web/dist
+Measured on this Linux VM (AMD EPYC, pinned single thread,
+`OMP_NUM_THREADS=1`), model Qwen2.5-0.5B-Instruct Q4_0:
+
+| Metric | Measured |
+| :--- | :--- |
+| Prefill | ~49–57 ms/forward |
+| Decode | ~13 tok/s |
+
+Do not compare these numbers to other hardware without naming the
+hardware and settings. Do not quote toy-model throughput as real-model
+performance: the self-test's forged 1.3 MB toy model is a correctness
+fixture, not a benchmark. Older README figures (e.g. "2247 tok/s",
+"~5 tok/s") were either the toy self-test or stale and have been removed.
+
+---
+
+## 9. Security
+
+- **Loopback by default.** `moe_engine serve` binds `127.0.0.1` unless
+  `--host` says otherwise. Binding a non-loopback address with no key
+  configured is **refused** unless you pass `--allow-insecure-remote` —
+  that flag means anyone who can reach the port can load models, download
+  files, and overwrite the config.
+- **API key.** Set `MOE_API_KEY` in the environment, or `"api_key"` in
+  `moe_config.json` (env wins). Never commit a real key. When a key is
+  configured, every mutating, model-loading, model-pulling, and inference
+  endpoint requires it (see §5). `GET /health` stays open as the liveness
+  probe; `GET /v1/config` redacts the stored key. Read-only GET endpoints
+  (model list, profiles, telemetry, static UI) do not require a key —
+  treat the server as a trusted-local service, not a public one.
+- **CORS.** Same-origin by default: no `Access-Control-Allow-Origin`
+  header is emitted at all. Allow additional origins explicitly with
+  `MOE_CORS_ORIGINS` (comma-separated exact origins) or `"cors_origins"`
+  in `moe_config.json`.
+- **Model downloads.** HTTPS only; `HF_TOKEN` is attached only to
+  huggingface.co hosts. Downloaded files are structure-validated before
+  loading.
+- **Web UI key.** Memory-only (see §7). The key never touches browser
+  storage or the frontend bundle.
+- **No secrets** in source, logs, frontend bundles, test fixtures, or
+  docs. `MOE_API_KEY` is passed by environment only.
+
+**Known remaining exposures (do not ignore):**
+- `HF_TOKEN` is passed to `curl` on the command line during pulls, so it
+  is visible in the process list (`ps`) while a pull runs.
+- `/v1/models` exposes model filesystem paths (deliberate, for model
+  selection).
+- Piping CLI pull output to a closed stdout pipe can still SIGPIPE.
+- The Windows WinINet model-pull path has not been compile-tested.
+- Request `cache_slot` is accepted by the server in [0, 4096] but the
+  engine caps user slots at [0, 63]; requests for slots 64–4096 are
+  rejected by the engine with empty output.
+
+---
+
+## 10. Tests
+
+```bash
+# Native engine: 11-section self-test (quant/dot, RoPE, GGUF parser,
+# toy end-to-end, malformed-input guards, security section 11).
+# Synthetic vectors + the forged toy model only — it proves the code
+# paths run; it proves nothing about real-model accuracy.
+./build/moe_engine test
+
+# Web UI: 10 tests (offline unit tests + live API-contract tests).
+# Live tests need a real engine + model; without them they skip with a
+# clear message instead of failing.
+cd web && npm test
+MOE_ENGINE_BIN=../build/moe_engine \
+  MOE_MODEL=../models/real/qwen2.5-0.5b-instruct-q4_0.gguf \
+  npm test
+
+# Hardware / SIMD diagnostics
+./build/moe_engine doctor
+./build/moe_engine doctor --quick
 ```
-Then navigate to `http://localhost:8000/` in any browser.
 
-### Run Verification Suite
-```powershell
-.\build\moe_engine.exe test
+CI (`.github/workflows/ci.yml`) builds the native engine and runs the
+11-point self-test on Linux + Windows, plus web typecheck/build/tests.
+It downloads no models. Note: workflow files cannot be pushed with the
+GitHub connector snapshot push (403) — the file must be added via the
+GitHub web UI.
+
+---
+
+## 11. Known limitations
+
+Full detail in [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) §8.
+The short list:
+
+1. **Short-read detection for expert disk reads is incomplete** — a
+   failed/short `pread` can leave expert weights partially zero-filled
+   while reporting success.
+2. **No batched prefill.** Requests serialize on a mutex; matmul
+   dominates (96% of prefill, 82% of decode).
+3. **Tool calling is single-turn.** Multi-turn `tool` role / `tool_calls`
+   history messages are not parsed from requests.
+4. **BF16 norms/biases are ignored.** All-BF16 SafeTensors models load
+   with a warning and run with identity norms.
+5. **Qwen3 needs a large token budget** (`max_tokens` ≥ 128) to finish
+   thinking and answer.
+6. **SystemOne at baseline** on the built-in sentiment set (10/30).
+7. **IQ quantizers are simplified** (no importance matrix); IQ
+   dequantizers drop remainders on direct calls.
+8. **Vulkan is device detection only**; no GPU compute kernels.
+9. **Windows launchers unexecuted** on a Windows host; Windows WinINet
+   pull path not compile-tested.
+10. **True deepseek/deepseek2 arch unverified** (see §4).
+
+---
+
+## Optional Ollama proxy — NOT the native engine
+
+`jxai_gateway.py` is a **separate, optional** OpenAI-compatible proxy to
+Ollama, for users who explicitly want to run inference through Ollama +
+Open WebUI. It is **not** part of the default path, not started by
+`start_jxai.sh`, and not the native engine — its `/health` reports
+`"ollama_connected"` and every chat request is forwarded to the Ollama
+daemon on `127.0.0.1:11434`. It requires Ollama to be installed and
+running. Do not confuse it with `moe_engine serve`.
+
+```bash
+python3 jxai_gateway.py --port 8001   # optional only; default port is the engine's, so pick another if the engine is running
 ```
 
-## 5. Security
+The old `run_open_webui.bat` starts the native engine on :8001 and Open
+WebUI on :8080 as an optional UI choice; the built-in UI served by the
+engine itself remains the default.
 
-Both servers bind **localhost only by default** and accept an API key when one
-is configured. Nothing in this repo is safe to expose to a network or the
-internet without a key.
-
-**Native engine (`moe_engine serve`, port 8000)**
-- Default bind is `127.0.0.1`. `--host` overrides it; `moe_config.json`
-  `"api_host"` is the fallback when `--host` is not given.
-- API key: set the `MOE_API_KEY` environment variable, or `"api_key"` in
-  `moe_config.json` (env wins). Never commit a real key.
-- When a key is configured, every mutating endpoint requires
-  `Authorization: Bearer <key>` or `x-api-key: <key>`: `POST /v1/models/load`,
-  `/v1/models/pull`, `/v1/config`, `/v1/slots/clear`, `/v1/chat/completions`
-  (and `/v1/completions`, `/api/chat`, `/api/generate`), `/v1/embeddings`,
-  `/v1/systemone`, `/v1/images/generations`. Anything else returns
-  `401 {"error":"unauthorized"}`. `GET /health` stays open as the liveness
-  probe; `GET /v1/config` redacts the stored key.
-- Binding a non-loopback address with no key configured is **refused** unless
-  you pass `--allow-insecure-remote` — that flag means "anyone who can reach
-  the port can load models, download files, and overwrite the config".
-  ```bash
-  MOE_API_KEY="$(openssl rand -hex 24)" ./build/moe_engine serve --model models/real/qwen2.5-0.5b-instruct-q4_0.gguf --port 8000
-  curl http://127.0.0.1:8000/health
-  curl -H "Authorization: Bearer $MOE_API_KEY" -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"What is 2+2?"}],"stream":false}' \
-    http://127.0.0.1:8000/v1/chat/completions
-  ```
-
-**Gateway (`jxai_gateway.py`, port 8001)**
-- Same model: default bind `127.0.0.1`, port **8001** (the engine owns 8000,
-  so the two no longer collide), key from `MOE_API_KEY`, `401` on its POST
-  endpoints without a valid key, `GET /health` open. `--host` /
-  `--allow-insecure-remote` behave the same way.
-
-**Full stack (`start_jxai.sh`)**
-- Open WebUI runs with auth on (`WEBUI_AUTH=True`); create the admin account
-  in the UI on first run. `WEBUI_SECRET_KEY` comes from the environment or is
-  generated once per run and printed — save it, or WebUI sessions break on
-  restart. There is no default `admin/admin` login any more.
-- The public Cloudflare tunnel is **opt-in only**: `./start_jxai.sh --public`
-  prints a warning and requires typing `yes` before the tunnel starts. The
-  default run exposes nothing beyond localhost.
-
-**Known remaining exposure:** read-only GET endpoints (model list, profiles,
-telemetry, static web UI) do not require a key; CORS is still `*`. Treat the
-servers as trusted-local-network services, not public ones.
+---
 
 ## License
 
 MIT — see [LICENSE](LICENSE).
-

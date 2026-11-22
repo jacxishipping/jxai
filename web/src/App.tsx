@@ -100,50 +100,11 @@ export const App: React.FC = () => {
         setHealth(data);
       }
     } catch {
-      // Offline fallback telemetry for client previews
-      if (!health) {
-        setHealth({
-          status: 'ok',
-          model_name: 'Qwen2.5-MoE-Stream-Q4_0',
-          architecture: 'qwen2moe',
-          format: 'GGUFv3',
-          active_slots: 1,
-          queued_requests: 0,
-          hparams: {
-            vocab_size: 512,
-            dim: 128,
-            n_layers: 4,
-            n_heads: 4,
-            n_kv_heads: 2,
-            n_experts: 8,
-            n_experts_used: 2,
-            max_seq_len: 2048
-          },
-          hardware: {
-            cpu_brand: 'x86_64 Multi-Core Processor',
-            logical_cores: 8,
-            simd_backend: 'AVX2 + FMA3 Vectorized',
-            io_backend: 'Win32 IOCP Overlapped Async I/O',
-            total_ram_bytes: 16 * 1024 * 1024 * 1024,
-            avail_ram_bytes: 10 * 1024 * 1024 * 1024,
-            vram_budget_bytes: 4 * 1024 * 1024 * 1024
-          },
-          tiers: {
-            vram_experts: 8,
-            ram_experts: 8,
-            disk_experts: 16,
-            total_experts: 32,
-            dense_backbone_bytes: 430080,
-            sparse_disk_bytes: 884736,
-            resident_cache_bytes: 442368,
-            cache_hits: 142,
-            cache_misses: 12,
-            cache_routed: 9,
-            bytes_streamed: 331776,
-            io_ops: 24
-          }
-        });
-      }
+      // Engine unreachable: leave health null so the UI shows the
+      // disconnected state. Never invent telemetry — a fake "ok" health
+      // object here used to present fabricated model/hardware numbers
+      // as if the engine were running.
+      setHealth(null);
     }
   };
 
