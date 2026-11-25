@@ -26,14 +26,12 @@ namespace moe {
 //  * Slot ids are bounded (below): a client must not be able to force
 //    unbounded KV allocation by naming arbitrary slot ids. Internal
 //    scratch slots 9998 (embeddings) / 9999 (SystemOne) are exempt.
-//    NOTE (server seam): server.cpp currently validates cache_slot as an
-//    integer in [0, 4096] — wider than this cap. The server must be
-//    tightened to [0, 63] (workstream B); until then a request for slot
-//    64..4096 is rejected here with empty logits / no tokens.
+//    Defense in depth: server.cpp also rejects cache_slot outside [0, 63]
+//    with HTTP 400 before generation starts.
 constexpr uint32_t kMaxUserSlot = 63;
 constexpr uint32_t kScratchSlotEmbeddings = 9998;
 constexpr uint32_t kScratchSlotSystemOne = 9999;
-constexpr uint32_t kScratchSlotDiffusion = 8888; // diffusion.cpp:115 image path (fixed internal id, not user-reachable: the server caps cache_slot at 4096)
+constexpr uint32_t kScratchSlotDiffusion = 8888; // diffusion.cpp image path (internal; not user-reachable via server cache_slot)
 constexpr uint32_t kMaxNewTokens = 16384;
 constexpr uint32_t kMaxDraftTokens = 64;
 

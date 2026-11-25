@@ -7,9 +7,10 @@ produced coherent output on this engine; a row marked "unverified" means
 the code path exists but no real model was exercised, and the engine says
 so loudly at load time instead of silently producing wrong output.
 
-Last updated: 2026-11-21 (workstream C — inference correctness).
+Last updated: 2026-11-25 (investigation — retired fixed short-read /
+cache_slot seams; confirmed CI absent from tree).
 Engine state at that date: `moe_engine test` 11/11 (incl. Test 1d K-quant
-remainder checks and new Tests 1e/1f malformed-input guards).
+remainder checks and Tests 1e/1f malformed-input guards).
 
 > **Toy models are not evidence.** The forged toy model
 > (`forge_moe_gguf_model`, qwen2moe, vocab 512, dim 128, 4 layers) is used
@@ -129,10 +130,9 @@ Validated in the sampler/transformer layer (`validate_sampler_config`,
 Server-side validation also exists in `src/server.cpp`
 (`validate_sampler_params`) — the engine checks above are
 defense-in-depth so a bad value can never reach the sampler through
-any caller. **Seam (workstream B's file, not fixed here):** the server
-accepts `cache_slot` in [0, 4096] but the engine caps user slots at
-[0, 63]; requests for slots 64–4096 are rejected by the engine with
-empty logits / no tokens. The server must be tightened to [0, 63].
+any caller. `cache_slot` is validated by the server as an integer in
+`[0, 63]` (400 otherwise); the engine independently rejects any slot
+outside user `0..63` plus the internal scratch ids.
 
 ## 6. Concurrency model
 
@@ -176,41 +176,41 @@ a slot does not silently share another slot's state.
 
 ## 8. Known limitations (do not present as supported)
 
-1. **Short-read detection for expert disk reads is incomplete.**
-   `src/pilot_io.cpp:196-198` (`read_expert_sync`) discards the boolean
-   return of `read_at_offset`, so a failed/short `pread` leaves the
-   expert vector partially zero-filled and reports success. The
-   transformer layer (`src/transformer.cpp`, `forward_token`) can only
-   size-check the returned buffer — it cannot detect a short read.
-   Fix requires: capture the bool per read, add an `ok`/bytes-read
-   field to `StreamedExpertWeights` (`include/pilot_io.h:24`), and
-   propagate. `pilot_io.cpp` was outside workstream C's file list.
-2. **Server `cache_slot` range seam** — see §5. Server allows [0, 4096];
-   engine allows [0, 63].
-3. **BF16 norms/biases are ignored.** The forward pass only applies
+1. **BF16 norms/biases are ignored.** The forward pass only applies
    F32 norms/biases. All-BF16 SafeTensors models (e.g. `qwen2moe-tiny`,
    `mixtral-tiny`) load with a stderr warning and run with identity
    norms. This is a documented limitation, not a silent success.
-4. **No batched prefill.** Requests serialize on `engine_mtx_`;
+2. **No batched prefill.** Requests serialize on `engine_mtx_`;
    throughput-bound matmul dominates (96% of prefill, 82% of decode).
    Batched prefill was assessed and deliberately not landed (ceiling
    ≈1.35×, needs a layer-loop rewrite with silent-corruption risk).
-5. **Tool calling is single-turn.** `tools` are accepted and parsed
+3. **Tool calling is single-turn.** `tools` are accepted and parsed
    (`<tool_call>` / `[TOOL_CALLS]` / bare JSON), but multi-turn `tool`
    role / `tool_calls` history messages are not parsed from requests.
-6. **Qwen3 needs a large token budget.** Thinking consumes the budget;
+   `parse_chat_messages` also drops any message whose `content` is empty
+   or null, so an assistant turn that only carries `tool_calls` never
+   reaches the template.
+4. **Qwen3 needs a large token budget.** Thinking consumes the budget;
    `max_tokens ≤ 64` yields an empty answer. Use ≥ 128.
-7. **No trending-audio / no real video generation.** Reels built from
+5. **No trending-audio / no real video generation.** Reels built from
    stills are a product-level workaround, not an engine capability.
    (Not an engine limitation per se — recorded here so it is not
    claimed as one.)
-8. **Vulkan is query-only on this machine.** No Vulkan SDK headers /
-   `glslc` in the VM; the engine reports dispatch as always false.
-9. **Web UI API key is memory-only** (no `localStorage` persistence since
+6. **Vulkan is detection-only.** Device query exists; no compute kernels
+   are implemented. Inference always runs on CPU.
+7. **Web UI API key is memory-only** (no `localStorage` persistence since
    the security workstream). The key is re-entered each session and cleared
    on reload; in-page XSS could still read it from memory while loaded.
-10. **IQ quantizers are simplified** (no importance matrix) and IQ
-    dequantizers drop remainders on direct calls (see §2).
+8. **IQ quantizers are simplified** (no importance matrix) and IQ
+   dequantizers drop remainders on direct calls (see §2).
+
+### Fixed (kept for audit trail)
+
+- **Expert short-read detection** — `read_expert_sync` now sets
+  `StreamedExpertWeights.ok`; `forward_token` refuses to admit a failed
+  read into the expert cache and falls back to mmap (or skips).
+- **Server `cache_slot` range** — server and engine both enforce user
+  slots `[0, 63]` (server returns 400; engine rejects out-of-range).
 
 ## 9. Tested models / fixtures (local only, gitignored)
 
