@@ -362,9 +362,8 @@ fixture, not a benchmark. Older README figures (e.g. "2247 tok/s",
   selection).
 - Piping CLI pull output to a closed stdout pipe can still SIGPIPE.
 - The Windows WinINet model-pull path has not been compile-tested.
-- Request `cache_slot` is accepted by the server in [0, 4096] but the
-  engine caps user slots at [0, 63]; requests for slots 64–4096 are
-  rejected by the engine with empty output.
+- `cache_slot` must be an integer in `[0, 63]` (server 400; engine also
+  rejects out-of-range slots).
 
 ---
 
@@ -390,11 +389,10 @@ MOE_ENGINE_BIN=../build/moe_engine \
 ./build/moe_engine doctor --quick
 ```
 
-CI (`.github/workflows/ci.yml`) builds the native engine and runs the
-11-point self-test on Linux + Windows, plus web typecheck/build/tests.
-It downloads no models. Note: workflow files cannot be pushed with the
-GitHub connector snapshot push (403) — the file must be added via the
-GitHub web UI.
+CI: there is currently **no** `.github/workflows/` directory in this
+repo (as of the 2026-11 investigation). Offline coverage that should be
+wired into CI is `./build/moe_engine test` (11/11, no model download)
+and `cd web && npm test` (live API cases skip without a model).
 
 ---
 
@@ -403,20 +401,19 @@ GitHub web UI.
 Full detail in [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) §8.
 The short list:
 
-1. **Short-read detection for expert disk reads is incomplete** — a
-   failed/short `pread` can leave expert weights partially zero-filled
-   while reporting success.
-2. **No batched prefill.** Requests serialize on a mutex; matmul
+1. **No batched prefill.** Requests serialize on a mutex; matmul
    dominates (96% of prefill, 82% of decode).
-3. **Tool calling is single-turn.** Multi-turn `tool` role / `tool_calls`
-   history messages are not parsed from requests.
-4. **BF16 norms/biases are ignored.** All-BF16 SafeTensors models load
+2. **Tool calling is single-turn.** Multi-turn `tool` role / `tool_calls`
+   history messages are not parsed; empty-content assistant turns are
+   dropped before templating.
+3. **BF16 norms/biases are ignored.** All-BF16 SafeTensors models load
    with a warning and run with identity norms.
-5. **Qwen3 needs a large token budget** (`max_tokens` ≥ 128) to finish
+4. **Qwen3 needs a large token budget** (`max_tokens` ≥ 128) to finish
    thinking and answer.
-6. **SystemOne at baseline** on the built-in sentiment set (10/30).
-7. **IQ quantizers are simplified** (no importance matrix); IQ
+5. **SystemOne at baseline** on the built-in sentiment set (10/30).
+6. **IQ quantizers are simplified** (no importance matrix); IQ
    dequantizers drop remainders on direct calls.
+7. **No GitHub Actions CI** in-tree yet (see §10).
 8. **Vulkan is device detection only**; no GPU compute kernels.
 9. **Windows launchers unexecuted** on a Windows host; Windows WinINet
    pull path not compile-tested.
