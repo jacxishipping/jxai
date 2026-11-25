@@ -8,22 +8,22 @@ echo   JXAI: NATIVE C++ ENGINE (:8001) ^& MOE STUDIO
 echo ===================================================================
 echo.
 
-:: Pick a real GGUF model. Never start the engine without one: it would
-:: auto-forge a synthetic toy model, which is not a real backend.
-set "MODEL=models\real\qwen2.5-0.5b-instruct-q4_0.gguf"
+:: Pick a real GGUF model. Never start the engine without one, and never
+:: fall back to models\test_qwen.gguf (that file is the forged toy from
+:: `moe_engine setup` / self-tests — not a real backend).
+if defined MOE_MODEL (
+    set "MODEL=%MOE_MODEL%"
+) else (
+    set "MODEL=models\real\qwen2.5-0.5b-instruct-q4_0.gguf"
+)
 if not exist "%MODEL%" (
-    if exist "models\test_qwen.gguf" (
-        set "MODEL=models\test_qwen.gguf"
-    ) else if exist "models\qwen2moe_stream_q4.gguf" (
-        set "MODEL=models\qwen2moe_stream_q4.gguf"
-    ) else (
-        echo [ERROR] No GGUF model found.
-        echo Download one first, e.g.:
-        echo   .\build\moe_engine.exe pull Qwen/Qwen2.5-0.5B-Instruct-GGUF
-        echo then re-run this script.
-        pause
-        exit /b 1
-    )
+    echo [ERROR] Model file not found: %MODEL%
+    echo Download one first, e.g.:
+    echo   .\build\moe_engine.exe pull Qwen/Qwen2.5-0.5B-Instruct-GGUF
+    echo then re-run with the file under models\real\, or set MOE_MODEL.
+    echo Refusing to start with a synthetic toy model.
+    pause
+    exit /b 1
 )
 
 :: Start the native engine on port 8001 if it is not already healthy

@@ -9,20 +9,21 @@ echo.
 
 cd /d "%~dp0"
 
-:: 1. Pick a real GGUF model. Never start the engine without one: it would
-::    auto-forge a synthetic toy model, which is not a real backend.
-set "MODEL=models\real\qwen2.5-0.5b-instruct-q4_0.gguf"
+:: 1. Pick a real GGUF model. Never start without one, and never fall back
+::    to models\test_qwen.gguf (forged toy from setup/self-tests).
+if defined MOE_MODEL (
+    set "MODEL=%MOE_MODEL%"
+) else (
+    set "MODEL=models\real\qwen2.5-0.5b-instruct-q4_0.gguf"
+)
 if not exist "%MODEL%" (
-    if exist "models\test_qwen.gguf" (
-        set "MODEL=models\test_qwen.gguf"
-    ) else (
-        echo [ERROR] No GGUF model found.
-        echo Download one first, e.g.:
-        echo   .\build\moe_engine.exe pull Qwen/Qwen2.5-0.5B-Instruct-GGUF
-        echo then re-run this script.
-        pause
-        exit /b 1
-    )
+    echo [ERROR] Model file not found: %MODEL%
+    echo Download one first, e.g.:
+    echo   .\build\moe_engine.exe pull Qwen/Qwen2.5-0.5B-Instruct-GGUF
+    echo then re-run with the file under models\real\, or set MOE_MODEL.
+    echo Refusing to start with a synthetic toy model.
+    pause
+    exit /b 1
 )
 
 :: 2. Ensure the native engine is running on port 8001

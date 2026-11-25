@@ -1673,18 +1673,42 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     }
 
     if ((method == "POST" || method == "DELETE") && (path == "/v1/slots/clear" || path.starts_with("/v1/slots/"))) {
-        uint32_t slot_id = 0;
+        // Same user-slot range as chat completions: integer in [0, 63].
+        // Path form: DELETE/POST /v1/slots/<id>. Body form: {"slot_id": N}
+        // on /v1/slots/clear. Reject out-of-range / non-integer with 400
+        // instead of silently wrapping via uint32 cast or ignoring parse failure.
+        double slot_raw = 0.0;
+        bool have_slot = false;
         if (path.starts_with("/v1/slots/") && path.size() > 10 && path != "/v1/slots/clear") {
             try {
-                slot_id = static_cast<uint32_t>(std::stoul(path.substr(10)));
-            } catch (...) {}
+                size_t idx = 0;
+                unsigned long parsed = std::stoul(path.substr(10), &idx);
+                if (idx == 0 || path.substr(10).find_first_not_of("0123456789") != std::string::npos) {
+                    send_http_json(client_sock, 400, "Bad Request",
+                                   "{\"error\":\"invalid_parameter\",\"message\":\"slot id in path must be an integer in [0, 63].\"}");
+                    return;
+                }
+                slot_raw = static_cast<double>(parsed);
+                have_slot = true;
+            } catch (...) {
+                send_http_json(client_sock, 400, "Bad Request",
+                               "{\"error\":\"invalid_parameter\",\"message\":\"slot id in path must be an integer in [0, 63].\"}");
+                return;
+            }
         } else {
-            slot_id = static_cast<uint32_t>(extract_json_number(body, "slot_id", 0.0));
+            slot_raw = extract_json_number(body, "slot_id", 0.0);
+            have_slot = true;
         }
-        // Clear under the slot's generation mutex when it is a user slot,
-        // so a clear cannot land mid-generation on that slot.
-        std::unique_lock<std::mutex> clear_lock;
-        if (slot_id < 64) clear_lock = std::unique_lock<std::mutex>(slot_mutexes_[slot_id]);
+        if (!have_slot || !std::isfinite(slot_raw) || slot_raw < 0.0 || slot_raw > 63.0 ||
+            std::floor(slot_raw) != slot_raw) {
+            send_http_json(client_sock, 400, "Bad Request",
+                           "{\"error\":\"invalid_parameter\",\"message\":\"slot_id must be an integer in [0, 63].\"}");
+            return;
+        }
+        uint32_t slot_id = static_cast<uint32_t>(slot_raw);
+        // Clear under the slot's generation mutex so a clear cannot land
+        // mid-generation on that slot.
+        std::unique_lock<std::mutex> clear_lock(slot_mutexes_[slot_id]);
         bool cleared = engine_.clear_slot(slot_id);
         std::ostringstream js;
         js << "{\"status\":\"ok\",\"slot_id\":" << slot_id << ",\"cleared\":" << (cleared ? "true" : "false") << "}";

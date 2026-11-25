@@ -280,6 +280,20 @@ if __name__ == "__main__":
                         help="Allow a non-loopback bind with no MOE_API_KEY configured")
     args = parser.parse_args()
 
+    # Require an explicit opt-in so this proxy cannot be mistaken for the
+    # native engine by a casual `python3 jxai_gateway.py`.
+    if os.environ.get("JXAI_ALLOW_OLLAMA_PROXY", "") != "1":
+        print("""
+[ERROR] Refusing to start the optional Ollama proxy without an explicit opt-in.
+
+  export JXAI_ALLOW_OLLAMA_PROXY=1
+  python3 jxai_gateway.py --port 8001
+
+This is NOT the native JXAI engine. The default backend is:
+  ./start_jxai.sh   # moe_engine serve on 127.0.0.1:8001
+""", file=sys.stderr)
+        sys.exit(1)
+
     if args.host not in LOOPBACK_HOSTS and not API_KEY and not args.allow_insecure_remote:
         print(f"""
 [SECURITY] Refusing to bind {args.host} without an API key: set MOE_API_KEY,

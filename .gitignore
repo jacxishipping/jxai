@@ -42,4 +42,8 @@ models/
 *.safetensors
 *.tmp
 
+# Python
+__pycache__/
+*.py[cod]
+
 
