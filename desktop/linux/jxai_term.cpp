@@ -86,6 +86,7 @@ Winsize term_size() {
 struct TermiosGuard {
     termios orig{};
     bool ok = false;
+    bool mouse = false;
     TermiosGuard() {
         if (!isatty(STDIN_FILENO) || !isatty(STDOUT_FILENO)) return;
         if (tcgetattr(STDIN_FILENO, &orig) != 0) return;
@@ -95,14 +96,24 @@ struct TermiosGuard {
         raw.c_cc[VMIN] = 0;
         raw.c_cc[VTIME] = 1;          // 100ms poll
         if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return;
-        // alt screen, hide cursor initially, enable mouse wheel (SGR)
-        std::fputs("\033[?1049h\033[?25l\033[?1000h\033[?1006h\033[2J\033[H", stdout);
+        // Alt screen + hide cursor. Mouse reporting is deferred until the
+        // chat UI — enabling it during the wizard made clicks emit ESC
+        // sequences that the wizard treated as quit.
+        std::fputs("\033[?1049h\033[?25l\033[2J\033[H", stdout);
         std::fflush(stdout);
         ok = true;
     }
+    void enable_mouse() {
+        if (!ok || mouse) return;
+        // SGR mouse (1006) + basic press/release (1000) for wheel scroll.
+        std::fputs("\033[?1000h\033[?1006h", stdout);
+        std::fflush(stdout);
+        mouse = true;
+    }
     ~TermiosGuard() {
         if (!ok) return;
-        std::fputs("\033[?1006l\033[?1000l\033[?25h\033[?1049l", stdout);
+        if (mouse) std::fputs("\033[?1006l\033[?1000l", stdout);
+        std::fputs("\033[?25h\033[?1049l", stdout);
         std::fflush(stdout);
         tcsetattr(STDIN_FILENO, TCSAFLUSH, &orig);
     }
@@ -763,22 +774,36 @@ KeyEvent read_key() {
         buf.erase(0, n);
     };
 
-    // mouse SGR: ESC [ < b ; x ; y M/m
-    if (buf.size() >= 6 && buf[0] == 0x1b && buf[1] == '[' && buf[2] == '<') {
+    // Mouse SGR: ESC [ < b ; x ; y M/m  (clicks ignored; wheel → scroll)
+    if (buf.size() >= 3 && buf[0] == 0x1b && buf[1] == '[' && buf[2] == '<') {
         size_t end = buf.find_first_of("Mm");
         if (end == std::string::npos) {
-            // incomplete — wait for more
             fill_key_buf();
             end = buf.find_first_of("Mm");
-            if (end == std::string::npos) return ev;
+            if (end == std::string::npos) {
+                // Still incomplete — wait; do NOT treat as Esc (that quit the app).
+                if (buf.size() > 64) take(buf.size()); // corrupt / truncated: drop
+                return ev;
+            }
         }
         int button = 0, x = 0, y = 0;
         char kind = 0;
         if (std::sscanf(buf.c_str(), "\033[<%d;%d;%d%c", &button, &x, &y, &kind) >= 4) {
             if (button == 64) ev.key = Key::WheelUp;
             else if (button == 65) ev.key = Key::WheelDown;
+            // button 0/1/2 (left/mid/right) and releases: ignore
         }
         take(end + 1);
+        return ev;
+    }
+
+    // Legacy X10 mouse: ESC [ M Cb Cx Cy — ignore entirely (no wheel encoding here).
+    if (buf.size() >= 3 && buf[0] == 0x1b && buf[1] == '[' && buf[2] == 'M') {
+        if (buf.size() < 6) {
+            fill_key_buf();
+            if (buf.size() < 6) return ev;
+        }
+        take(6);
         return ev;
     }
 
@@ -798,10 +823,16 @@ KeyEvent read_key() {
             if (c == 'F') { ev.key = Key::End; take(3); return ev; }
             if (buf.size() >= 4 && c == '5' && buf[3] == '~') { ev.key = Key::PgUp; take(4); return ev; }
             if (buf.size() >= 4 && c == '6' && buf[3] == '~') { ev.key = Key::PgDn; take(4); return ev; }
-            // Unknown CSI — drop Esc and continue
-            take(1);
-            ev.key = Key::Escape;
-            return ev;
+            // Unknown CSI — consume through the final byte (0x40–0x7E), never
+            // emit Escape (mouse / focus / keypad leftovers used to quit).
+            size_t i = 2;
+            while (i < buf.size()) {
+                unsigned char ch = static_cast<unsigned char>(buf[i]);
+                if (ch >= 0x40 && ch <= 0x7E) { take(i + 1); return ev; }
+                ++i;
+            }
+            fill_key_buf();
+            return ev; // incomplete CSI; wait
         }
         ev.key = Key::Escape;
         take(1);
@@ -938,6 +969,10 @@ int main(int argc, char** argv) {
         std::fputs("\033[2J\033[H", stdout);
         std::fflush(stdout);
     }
+
+    // Mouse only in the chat UI (wheel scroll). Enabling earlier made
+    // terminal clicks look like Esc and quit the wizard / main loop.
+    guard.enable_mouse();
 
     // Bring up the engine if needed (wizard may have just downloaded a model).
     {

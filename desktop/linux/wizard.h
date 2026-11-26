@@ -538,9 +538,40 @@ inline WKeyEv wizard_read_key() {
             if (n > 0) buf.append(reinterpret_cast<char*>(tmp), reinterpret_cast<char*>(tmp) + n);
             if (buf.size() == 1) { ev.key = WKey::Esc; take(1); return ev; }
         }
+        // SGR mouse (ESC [ < … M/m) — ignore. Clicks used to become Esc and quit.
+        if (buf.size() >= 3 && buf[1] == '[' && buf[2] == '<') {
+            size_t end = buf.find_first_of("Mm");
+            if (end == std::string::npos) {
+                unsigned char tmp[64];
+                ssize_t n = ::read(STDIN_FILENO, tmp, sizeof(tmp));
+                if (n > 0) buf.append(reinterpret_cast<char*>(tmp), reinterpret_cast<char*>(tmp) + n);
+                end = buf.find_first_of("Mm");
+            }
+            if (end != std::string::npos) take(end + 1);
+            else if (buf.size() > 64) take(buf.size());
+            return ev;
+        }
+        // X10 mouse: ESC [ M Cb Cx Cy
+        if (buf.size() >= 3 && buf[1] == '[' && buf[2] == 'M') {
+            if (buf.size() < 6) {
+                unsigned char tmp[16];
+                ssize_t n = ::read(STDIN_FILENO, tmp, sizeof(tmp));
+                if (n > 0) buf.append(reinterpret_cast<char*>(tmp), reinterpret_cast<char*>(tmp) + n);
+            }
+            if (buf.size() >= 6) take(6);
+            return ev;
+        }
         if (buf.size() >= 3 && buf[1] == '[') {
             if (buf[2] == 'A') { ev.key = WKey::Up; take(3); return ev; }
             if (buf[2] == 'B') { ev.key = WKey::Down; take(3); return ev; }
+            // Other CSI (not bare Esc) — consume terminator, do not quit.
+            size_t i = 2;
+            while (i < buf.size()) {
+                unsigned char ch = static_cast<unsigned char>(buf[i]);
+                if (ch >= 0x40 && ch <= 0x7E) { take(i + 1); return ev; }
+                ++i;
+            }
+            return ev;
         }
         ev.key = WKey::Esc;
         take(1);
