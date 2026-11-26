@@ -12,6 +12,9 @@
 #ifndef _WIN32
 #include <sys/mman.h>
 #endif
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace moe {
 
@@ -263,6 +266,23 @@ bool ModelFile::open(const std::string& path, std::string& err_msg) {
 #ifdef MADV_HUGEPAGE
         (void)madvise(const_cast<uint8_t*>(mapped_base_), static_cast<size_t>(file_size_), MADV_HUGEPAGE);
 #endif
+        // MADV_WILLNEED is asynchronous. For large GGUFs (≥512 MiB) the first
+        // decode still stutters on major page faults. Synchronously touch
+        // every 16th page (64 KiB stride) so weights are resident before the
+        // first forward — load is slightly slower; tokens stream smoothly.
+        constexpr uint64_t kPrefaultMinBytes = 512ull << 20;
+        if (file_size_ >= kPrefaultMinBytes) {
+            constexpr size_t kPage = 4096;
+            constexpr size_t kStride = kPage * 16;
+            const size_t n = static_cast<size_t>(file_size_);
+#if defined(_OPENMP)
+            #pragma omp parallel for schedule(static)
+#endif
+            for (size_t off = 0; off < n; off += kStride) {
+                volatile uint8_t c = mapped_base_[off];
+                (void)c;
+            }
+        }
     }
 #endif
 
