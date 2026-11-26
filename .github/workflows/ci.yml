@@ -27,6 +27,18 @@ jobs:
       - name: Run offline verification suite
         run: ./build/moe_engine test
 
+      - name: jxai_term smoke
+        run: |
+          test -x ./build/jxai_term
+          ./build/jxai_term --help | grep -q "terminal client"
+          # Non-TTY must refuse cleanly (exit 1), not crash.
+          set +e
+          ./build/jxai_term --skip-wizard </dev/null >/dev/null 2>term.err
+          rc=$?
+          set -e
+          test "$rc" -eq 1
+          grep -qi "TTY\|tty\|interactive" term.err
+
   web:
     name: web npm test
     runs-on: ubuntu-latest

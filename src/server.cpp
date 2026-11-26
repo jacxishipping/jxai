@@ -1396,16 +1396,19 @@ void HttpServer::handle_client(uintptr_t client_sock) {
            << "\"parent\":null"
            << "}";
 
-        // Discover additional local .gguf / .safetensors models in models/ directory
+        // Discover local .gguf / .safetensors under models/ (incl. models/real/).
         std::error_code ec;
         if (std::filesystem::exists("models", ec) && std::filesystem::is_directory("models", ec)) {
-            for (const auto& entry : std::filesystem::directory_iterator("models", ec)) {
+            for (const auto& entry : std::filesystem::recursive_directory_iterator("models", ec)) {
                 if (!entry.is_regular_file(ec)) continue;
                 std::string ext = entry.path().extension().string();
                 if (ext != ".gguf" && ext != ".safetensors") continue;
-                std::string rel_path = "models/" + entry.path().filename().string();
+                std::string rel_path = entry.path().generic_string();
+                // Normalize leading "./"
+                if (rel_path.rfind("./", 0) == 0) rel_path.erase(0, 2);
                 std::string fname = entry.path().filename().string();
-                bool is_curr = (active_path == rel_path || active_path.ends_with(fname));
+                bool is_curr = (active_path == rel_path || active_path.ends_with(fname) ||
+                                active_path.ends_with(rel_path));
                 uint64_t fsize = entry.file_size(ec);
                 js << ",{"
                    << "\"id\":\"" << json_escape(fname) << "\","

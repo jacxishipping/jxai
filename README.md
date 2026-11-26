@@ -132,7 +132,8 @@ cmake --build build -j --target jxai_term && ./build/jxai_term
 ```
 
 Keys: Enter send · ↑/↓ input history · Ctrl+N newline · Esc abort stream · PgUp/PgDn/wheel scroll.
-Commands: `/help` `/clear` (chat + KV slot) `/temp` `/tokens` `/slot` `/system` `/setup` (in-process wizard) `/retry` `/quit`.
+Commands: `/help` `/clear` (chat + KV slot) `/model list|load` `/temp` `/tokens` `/slot` `/system` `/setup` (in-process wizard) `/retry` `/quit`.
+Wizard catalog includes verified Qwen2.5 / Llama-3.2 / Qwen3 / Gemma-3 / Phi-3 GGUFs plus a local-path option.
 
 ### Desktop (Tauri)
 

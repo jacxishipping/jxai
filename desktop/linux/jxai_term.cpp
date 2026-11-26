@@ -46,6 +46,7 @@ namespace {
 using jxai::term::ChatTurn;
 using jxai::term::EngineClient;
 using jxai::term::HealthInfo;
+using jxai::term::ModelEntry;
 using jxai::term::StreamTelem;
 
 // ── palette (ANSI) ──────────────────────────────────────────────────────────
@@ -666,7 +667,7 @@ bool handle_slash(App& app, const std::string& line) {
             "  /help                 this help\n"
             "  /clear                clear chat + engine KV slot\n"
             "  /health               refresh engine status\n"
-            "  /model                show loaded model\n"
+            "  /model [list|load p]  show / list / hot-load a GGUF\n"
             "  /temp <0-2>           sampling temperature\n"
             "  /tokens <n>           max new tokens\n"
             "  /slot <0-63>          KV cache slot\n"
@@ -717,11 +718,101 @@ bool handle_slash(App& app, const std::string& line) {
         return true;
     }
     if (cmd == "/model") {
-        app.refresh_health();
-        app.push_info(app.health.online
-            ? ("model " + app.health.model_name + " (" + app.health.architecture + ", " +
-               app.health.format + ")")
-            : "no model — engine offline");
+        std::string arg = rest();
+        auto trim = [](std::string s) {
+            while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+            while (!s.empty() && (s[0] == ' ' || s[0] == '\t')) s.erase(s.begin());
+            return s;
+        };
+        arg = trim(arg);
+        if (arg.empty()) {
+            app.refresh_health();
+            app.push_info(app.health.online
+                ? ("model " + app.health.model_name + " (" + app.health.architecture + ", " +
+                   app.health.format + ")\n  /model list   ·  /model load <path>")
+                : "no model — engine offline");
+            return true;
+        }
+        std::string sub;
+        std::string path;
+        {
+            std::istringstream is(arg);
+            is >> sub;
+            std::getline(is, path);
+            path = trim(path);
+        }
+        if (sub == "list") {
+            std::vector<ModelEntry> models;
+            std::string err;
+            if (!app.client.list_models(models, err)) {
+                app.push_error(err);
+                return true;
+            }
+            if (models.empty()) {
+                app.push_info("No local models under models/. Use /setup or moe_engine pull.");
+                return true;
+            }
+            std::ostringstream oss;
+            oss << "Local models (" << models.size() << "):\n";
+            for (const auto& m : models) {
+                oss << (m.active ? "  ● " : "  ○ ") << m.path;
+                if (m.size > 0) {
+                    oss << "  (" << (m.size / (1024 * 1024)) << " MB)";
+                }
+                oss << "\n";
+            }
+            oss << "Load with: /model load <path>";
+            app.push_info(oss.str());
+            return true;
+        }
+        if (sub == "load") {
+            if (path.empty()) {
+                app.push_error("usage: /model load <path-under-cwd>");
+                return true;
+            }
+            if (app.streaming) {
+                app.client.stop();
+                app.streaming = false;
+            }
+            app.push_info("Loading " + path + " …");
+            std::string err;
+            if (!app.client.load_model(path, app.cfg.api_key, err)) {
+                app.push_error(err);
+                return true;
+            }
+            app.cfg.model_path = path;
+            app.bubbles.clear();
+            app.history.clear();
+            std::string cerr;
+            (void)app.client.clear_slot(app.cfg.slot, app.cfg.api_key, cerr);
+            app.refresh_health();
+            app.push_info("Loaded · " + app.health.model_name + " · " + app.health.architecture);
+            return true;
+        }
+        // Treat bare path as load for convenience: /model models/real/foo.gguf
+        if (sub.find('/') != std::string::npos || sub.find(".gguf") != std::string::npos) {
+            path = path.empty() ? sub : (sub + " " + path);
+            path = trim(path);
+            if (app.streaming) {
+                app.client.stop();
+                app.streaming = false;
+            }
+            app.push_info("Loading " + path + " …");
+            std::string err;
+            if (!app.client.load_model(path, app.cfg.api_key, err)) {
+                app.push_error(err);
+                return true;
+            }
+            app.cfg.model_path = path;
+            app.bubbles.clear();
+            app.history.clear();
+            std::string cerr;
+            (void)app.client.clear_slot(app.cfg.slot, app.cfg.api_key, cerr);
+            app.refresh_health();
+            app.push_info("Loaded · " + app.health.model_name + " · " + app.health.architecture);
+            return true;
+        }
+        app.push_error("usage: /model | /model list | /model load <path>");
         return true;
     }
     if (cmd == "/temp") {

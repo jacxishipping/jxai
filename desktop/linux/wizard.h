@@ -40,33 +40,61 @@ struct WizardModel {
     uint64_t approx_bytes;
 };
 
+// Catalog mirrors docs/SUPPORT_MATRIX.md verified arches. Keep "local" last.
 inline const WizardModel kWizardModels[] = {
     {
         "qwen25-05b",
         "Qwen2.5-0.5B Instruct Q4_0",
-        "Fast starter · ~409 MB · fits 8–16 GB RAM VMs",
+        "Fast starter · ~409 MB · fits small VMs",
         "Qwen/Qwen2.5-0.5B-Instruct-GGUF",
         "qwen2.5-0.5b-instruct-q4_0.gguf",
         "models/real/qwen2.5-0.5b-instruct-q4_0.gguf",
         428730208ULL,
     },
     {
-        "qwen25-15b",
-        "Qwen2.5-1.5B Instruct Q4_0",
-        "Balanced quality · ~1.0 GB",
-        "Qwen/Qwen2.5-1.5B-Instruct-GGUF",
-        "qwen2.5-1.5b-instruct-q4_0.gguf",
-        "models/real/qwen2.5-1.5b-instruct-q4_0.gguf",
-        1050000000ULL,
-    },
-    {
         "qwen25-3b",
         "Qwen2.5-3B Instruct Q4_0",
-        "Stronger answers · ~1.9 GB · needs ~4 GB free RAM",
+        "Stronger Qwen2 · ~1.9 GB · needs ~4 GB free RAM",
         "Qwen/Qwen2.5-3B-Instruct-GGUF",
         "qwen2.5-3b-instruct-q4_0.gguf",
         "models/real/qwen2.5-3b-instruct-q4_0.gguf",
         1997532128ULL,
+    },
+    {
+        "llama32-1b",
+        "Llama-3.2-1B Instruct Q4_K_M",
+        "Verified llama arch · ~0.8 GB",
+        "bartowski/Llama-3.2-1B-Instruct-GGUF",
+        "Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        "models/real/Llama-3.2-1B-Instruct-Q4_K_M.gguf",
+        808000000ULL,
+    },
+    {
+        "qwen3-06b",
+        "Qwen3-0.6B Q4_K_M",
+        "Verified qwen3 · ~0.5 GB · set /tokens 256+ (thinks first)",
+        "Qwen/Qwen3-0.6B-GGUF",
+        "Qwen3-0.6B-Q4_K_M.gguf",
+        "models/real/Qwen3-0.6B-Q4_K_M.gguf",
+        520000000ULL,
+    },
+    {
+        "gemma3-1b",
+        "Gemma-3-1B-it Q4_K_M",
+        "Verified gemma3 · ~0.8 GB",
+        "bartowski/gemma-3-1b-it-GGUF",
+        "gemma-3-1b-it-Q4_K_M.gguf",
+        "models/real/gemma-3-1b-it-Q4_K_M.gguf",
+        850000000ULL,
+    },
+    {
+        "phi3-mini",
+        "Phi-3-mini-4k Instruct Q4_K_M",
+        "Verified phi3 · ~2.4 GB",
+        "bartowski/Phi-3-mini-4k-instruct-GGUF",
+        "Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+        "models/real/Phi-3-mini-4k-instruct-Q4_K_M.gguf",
+        2400000000ULL,
     },
     {
         "local",
@@ -285,10 +313,11 @@ inline void draw_models(WizardState& st) {
     move_to(7, 4);
     std::printf("%s↑↓ or number keys · Enter to confirm%s", FG_MUTED, RESET);
 
+    // Compact 2-row entries so the verified-arch catalog fits common TTYs.
     for (int i = 0; i < kWizardModelCount; ++i) {
         const auto& m = kWizardModels[i];
         bool sel = (i == st.model_index);
-        int row = 9 + i * 3;
+        int row = 9 + i * 2;
         move_to(row, 4);
         std::printf("%s%s%s %d. %s%s",
                     sel ? BOLD : "",
@@ -302,12 +331,12 @@ inline void draw_models(WizardState& st) {
         if (m.local_rel) {
             std::error_code ec;
             if (fs::exists(m.local_rel, ec) && fs::file_size(m.local_rel, ec) > 0) {
-                std::printf("  %s[already on disk]%s", FG_OK, RESET);
+                std::printf("  %s[on disk]%s", FG_OK, RESET);
             }
         }
     }
     if (!st.error.empty()) {
-        move_to(9 + kWizardModelCount * 3, 4);
+        move_to(9 + kWizardModelCount * 2, 4);
         std::printf("%s%s%s", FG_BAD, st.error.c_str(), RESET);
     }
 }

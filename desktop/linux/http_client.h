@@ -51,6 +51,13 @@ struct ChatTurn {
     std::string content;
 };
 
+struct ModelEntry {
+    std::string id;
+    std::string path;
+    uint64_t size = 0;
+    bool active = false;
+};
+
 inline std::string json_escape(const std::string& s) {
     std::string o;
     o.reserve(s.size() + 8);
@@ -224,6 +231,37 @@ public:
             if (extract_json_string(resp, "error", msg) || extract_json_string(resp, "message", msg))
                 err += ": " + msg;
             return false;
+        }
+        return true;
+    }
+
+    // List models from GET /v1/models (active + files under models/).
+    bool list_models(std::vector<ModelEntry>& out, std::string& err) {
+        out.clear();
+        std::string resp;
+        if (!http_get("/v1/models", resp) || resp.find("200") == std::string::npos) {
+            err = "cannot reach engine at " + host_ + ":" + std::to_string(port_);
+            return false;
+        }
+        // Walk every "path":"…" occurrence in the data array.
+        size_t pos = 0;
+        while ((pos = resp.find("\"path\":\"", pos)) != std::string::npos) {
+            ModelEntry e;
+            e.path = json_unescape_string(resp, pos + 8);
+            // Look backward a bit for id / active / size on this object.
+            size_t obj = resp.rfind('{', pos);
+            size_t obj_end = resp.find('}', pos);
+            if (obj == std::string::npos) obj = 0;
+            if (obj_end == std::string::npos) obj_end = resp.size();
+            const std::string slice = resp.substr(obj, obj_end - obj + 1);
+            extract_json_string(slice, "id", e.id);
+            double sz = 0;
+            if (extract_json_number(slice, "size", sz) && sz > 0)
+                e.size = static_cast<uint64_t>(sz);
+            e.active = slice.find("\"active\":true") != std::string::npos;
+            if (e.id.empty()) e.id = e.path;
+            if (!e.path.empty()) out.push_back(std::move(e));
+            pos += 8;
         }
         return true;
     }
