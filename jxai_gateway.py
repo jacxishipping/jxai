@@ -34,6 +34,11 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8001"))
 GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
 API_KEY = os.environ.get("MOE_API_KEY", "")
+# Comma-separated exact origins (same contract as native moe_engine /
+# MOE_CORS_ORIGINS). Empty = same-origin only: no Access-Control-Allow-Origin.
+CORS_ORIGINS = [
+    o.strip() for o in os.environ.get("MOE_CORS_ORIGINS", "").split(",") if o.strip()
+]
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -56,9 +61,16 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
         print(f"[JXAI Gateway] {args[0]} {args[1]} {args[2]}")
 
     def _set_cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, User-Agent")
+        # Mirror native engine: never emit Access-Control-Allow-Origin: *.
+        # When MOE_CORS_ORIGINS is set, echo the request Origin only if it
+        # is an exact allow-list match; otherwise omit CORS headers entirely.
+        origin = self.headers.get("Origin", "")
+        if origin and origin in CORS_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, Authorization, x-api-key, User-Agent")
 
     def _send_json(self, status, data):
         body = json.dumps(data).encode("utf-8")
