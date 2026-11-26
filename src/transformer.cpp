@@ -3097,7 +3097,10 @@ std::vector<float> MoETransformerEngine::forward_token(
                                    ? (pos - hp_.sliding_window + 1) : 0;
 
 #if defined(_OPENMP)
-        #pragma omp parallel for if(hp_.n_heads >= 4 && pos >= 32) schedule(static)
+        // Parallelize attention earlier: waiting until pos>=32 left the first
+        // ~32 decode steps single-threaded on multi-head models (stutter at
+        // the start of a reply).
+        #pragma omp parallel for if(hp_.n_heads >= 4 && pos >= 8) schedule(static)
 #endif
         for (int h_i = 0; h_i < static_cast<int>(hp_.n_heads); ++h_i) {
             const uint32_t h = static_cast<uint32_t>(h_i);
@@ -3394,7 +3397,10 @@ std::vector<float> MoETransformerEngine::forward_token(
             *out_hidden = x_norm;
         }
         if (compute_logits) {
-            logits.assign(hp_.vocab_size, 0.0f);
+            // Do not zero-fill: matmul_quant_f32 writes every vocab row.
+            // assign(N, 0) was ~vocab*4 bytes of dead store per decode step
+            // (≈600 KB for Qwen2.5) on the hottest path.
+            logits.resize(hp_.vocab_size);
             if (lm_head_) {
                 matmul_quant_f32(lm_head_->type, lm_head_->mapped_ptr, x_norm.data(), logits.data(), hp_.vocab_size, dim);
                 if (hp_.final_logit_softcapping > 0.0f) {
@@ -3537,20 +3543,30 @@ uint32_t MoETransformerEngine::sample_next_token(
         return static_cast<uint32_t>(std::max_element(adj.begin(), adj.end()) - adj.begin());
     }
 
-    // 3. Top-K filtering
+    // 3. Top-K filtering — O(V log k) min-heap instead of allocating and
+    // partial_sorting a TokProb for every vocab row (V≈150k on Qwen).
     struct TokProb {
         uint32_t id;
         float val;
     };
-    std::vector<TokProb> cands(vocab_sz);
+    const uint32_t k = (safe.top_k > 0 && safe.top_k < vocab_sz) ? safe.top_k : vocab_sz;
+    const float inv_temp = 1.0f / safe.temperature;
+    std::vector<TokProb> cands;
+    cands.reserve(k);
+    auto worse = [](const TokProb& a, const TokProb& b) { return a.val > b.val; }; // min-heap by score
     for (uint32_t i = 0; i < vocab_sz; ++i) {
-        cands[i] = {i, adj[i] / safe.temperature};
+        const float v = adj[i] * inv_temp;
+        if (cands.size() < k) {
+            cands.push_back({i, v});
+            if (cands.size() == k) std::make_heap(cands.begin(), cands.end(), worse);
+        } else if (v > cands.front().val) {
+            std::pop_heap(cands.begin(), cands.end(), worse);
+            cands.back() = {i, v};
+            std::push_heap(cands.begin(), cands.end(), worse);
+        }
     }
-
-    uint32_t k = (safe.top_k > 0 && safe.top_k < vocab_sz) ? safe.top_k : vocab_sz;
-    std::partial_sort(cands.begin(), cands.begin() + k, cands.end(),
-        [](const TokProb& a, const TokProb& b) { return a.val > b.val; });
-    cands.resize(k);
+    std::sort_heap(cands.begin(), cands.end(), worse); // ascending; reverse for softmax max
+    std::reverse(cands.begin(), cands.end());
 
     // 4. Softmax + Top-P (Nucleus) filtering
     float max_l = cands[0].val;

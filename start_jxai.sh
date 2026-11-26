@@ -180,9 +180,16 @@ fi
 
 mkdir -p "$(dirname "$ENGINE_LOG")"
 
+# Use all cores for OpenMP matmuls unless the user already pinned a count.
+# Single-thread decode is ~4× slower on a 4-core VM.
+if [[ -z "${OMP_NUM_THREADS:-}" ]]; then
+    export OMP_NUM_THREADS="$(nproc 2>/dev/null || echo 4)"
+fi
+
 echo "[3/3] Starting native C++ engine (moe_engine serve)..."
 echo "  Model: $MODEL"
 echo "  Log:   $ENGINE_LOG"
+echo "  Threads: OMP_NUM_THREADS=$OMP_NUM_THREADS"
 if [[ -n "${MOE_API_KEY:-}" ]]; then
     echo "  Auth:  API key required (MOE_API_KEY is set)"
 else

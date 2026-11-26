@@ -331,13 +331,16 @@ OMP_NUM_THREADS=1 ./build/moe_engine bench --model models/real/qwen2.5-0.5b-inst
   --prompt "What is 2+2?" --tokens 16
 ```
 
-Measured on this Linux VM (AMD EPYC, pinned single thread,
-`OMP_NUM_THREADS=1`), model Qwen2.5-0.5B-Instruct Q4_0:
+Measured on a 4-core Linux VM (AVX2), model Qwen2.5-0.5B-Instruct Q4_0:
 
-| Metric | Measured |
-| :--- | :--- |
-| Prefill | ~49–57 ms/forward |
-| Decode | ~13 tok/s |
+| Setting | Prefill (warm) | Decode |
+| :--- | :--- | :--- |
+| Default (`OMP_NUM_THREADS` = nproc) | ~120 tok/s | ~69 tok/s |
+| `OMP_NUM_THREADS=1` | ~37 tok/s | ~20 tok/s |
+
+The engine and `./start_jxai.sh` default to all logical cores when
+`OMP_NUM_THREADS` is unset. Pin `OMP_NUM_THREADS=1` only for apples-to-
+apples single-thread comparisons.
 
 Do not compare these numbers to other hardware without naming the
 hardware and settings. Do not quote toy-model throughput as real-model

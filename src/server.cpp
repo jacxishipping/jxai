@@ -1931,7 +1931,9 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         std::lock_guard<std::mutex> slot_lock(slot_mutexes_[slot_id]);
         bool compaction = extract_json_bool(body, "context_compaction", true);
         bool continue_asst = extract_json_bool(body, "continue_assistant", false);
-        bool speculative = extract_json_bool(body, "speculative", false);
+        // Speculative prompt-lookup is on by default for smoother streaming
+        // when history has repeating n-grams; clients can set "speculative":false.
+        bool speculative = extract_json_bool(body, "speculative", true);
         uint32_t draft_count = static_cast<uint32_t>(std::clamp(extract_json_number(body, "draft_tokens", 2.0), 1.0, 4.0));
 
         SamplerConfig scfg;

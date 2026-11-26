@@ -4392,12 +4392,15 @@ void matmul_quant_f32(
     const size_t row_bytes = tensor_byte_size(type, static_cast<uint64_t>(cols));
     const auto* base = static_cast<const uint8_t*>(W);
 
-    std::vector<block_q8_0> x_q8;
+    // Reuse a thread-local Q8 activation buffer across calls — avoids a
+    // heap alloc + free on every GEMV (including the huge LM-head).
+    thread_local std::vector<block_q8_0> tls_q8;
     const block_q8_0* x_q8_ptr = nullptr;
     if (cpu_has_avx2() && rows >= 8 && supports_q8_activation(type, cols)) {
-        x_q8.resize(static_cast<size_t>(cols / 32));
-        quantize_row_q8_0(x, x_q8.data(), cols);
-        x_q8_ptr = x_q8.data();
+        const size_t need = static_cast<size_t>(cols / 32);
+        if (tls_q8.size() < need) tls_q8.resize(need);
+        quantize_row_q8_0(x, tls_q8.data(), cols);
+        x_q8_ptr = tls_q8.data();
     }
 
 #if defined(_OPENMP)
@@ -4425,12 +4428,13 @@ void matmul_qkv_quant_f32(
     const int64_t total_rows = (Wq ? q_rows : 0) + (Wk ? k_rows : 0) + (Wv ? v_rows : 0);
     if (total_rows <= 0) return;
 
-    std::vector<block_q8_0> x_q8;
+    thread_local std::vector<block_q8_0> tls_q8;
     const block_q8_0* x_q8_ptr = nullptr;
     if (cpu_has_avx2() && total_rows >= 8 && (cols % 32 == 0)) {
-        x_q8.resize(static_cast<size_t>(cols / 32));
-        quantize_row_q8_0(x, x_q8.data(), cols);
-        x_q8_ptr = x_q8.data();
+        const size_t need = static_cast<size_t>(cols / 32);
+        if (tls_q8.size() < need) tls_q8.resize(need);
+        quantize_row_q8_0(x, tls_q8.data(), cols);
+        x_q8_ptr = tls_q8.data();
     }
 
     const int64_t q_end = Wq ? q_rows : 0;
@@ -4466,12 +4470,13 @@ void matmul_swiglu_quant_f32(
     const auto* gate_base = static_cast<const uint8_t*>(W_gate);
     const auto* up_base   = static_cast<const uint8_t*>(W_up);
 
-    std::vector<block_q8_0> x_q8;
+    thread_local std::vector<block_q8_0> tls_q8;
     const block_q8_0* x_q8_ptr = nullptr;
     if (cpu_has_avx2() && exp_dim >= 8 && (cols % 32 == 0)) {
-        x_q8.resize(static_cast<size_t>(cols / 32));
-        quantize_row_q8_0(x, x_q8.data(), cols);
-        x_q8_ptr = x_q8.data();
+        const size_t need = static_cast<size_t>(cols / 32);
+        if (tls_q8.size() < need) tls_q8.resize(need);
+        quantize_row_q8_0(x, tls_q8.data(), cols);
+        x_q8_ptr = tls_q8.data();
     }
 
 #if defined(_OPENMP)
