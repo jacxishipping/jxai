@@ -229,6 +229,7 @@ public:
         loaded_ = false;
         io_engine_.shutdown();
         model_file_.close();
+        scratch_ = ForwardScratch{};
     }
 
     bool is_loaded() const { return loaded_; }
@@ -350,6 +351,42 @@ private:
 
     uint64_t dense_bytes_ = 0;
     uint64_t sparse_bytes_ = 0;
+
+    // Reused across forward_token calls so large models (36–80 layers) do not
+    // heap-allocate Q/K/V/FFN scratch on every token. Guarded by engine_mtx_.
+    struct ForwardScratch {
+        std::vector<float> x;
+        std::vector<float> x_norm;
+        std::vector<float> q;
+        std::vector<float> k;
+        std::vector<float> v;
+        std::vector<float> attn_out;
+        std::vector<float> proj_out;
+        std::vector<float> router_logits;
+        std::vector<float> moe_accum;
+        std::vector<float> gate_buf;
+        std::vector<float> down_buf;
+        std::vector<float> logits;
+        void ensure(uint32_t dim, uint32_t q_dim, uint32_t kv_dim,
+                    uint32_t exp_dim, uint32_t n_experts, uint32_t vocab) {
+            auto grow = [](std::vector<float>& v, size_t n) {
+                if (v.size() < n) v.resize(n);
+            };
+            grow(x, dim);
+            grow(x_norm, dim);
+            grow(q, q_dim);
+            grow(k, kv_dim);
+            grow(v, kv_dim);
+            grow(attn_out, q_dim);
+            grow(proj_out, dim);
+            grow(router_logits, std::max<uint32_t>(1, n_experts));
+            grow(moe_accum, dim);
+            grow(gate_buf, exp_dim);
+            grow(down_buf, dim);
+            grow(logits, vocab);
+        }
+    };
+    ForwardScratch scratch_;
 
     mutable std::mutex engine_mtx_;
     mutable std::mutex profile_mtx_;

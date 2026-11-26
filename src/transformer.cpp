@@ -2284,7 +2284,10 @@ bool MoETransformerEngine::bind_tensors(std::string& err_msg) {
             avail = 2ull << 30;
         }
         if (hp_.n_layers > 0 && hp_.kv_dim > 0) {
-            uint64_t budget = avail / 4;
+            // Large models leave less headroom for page cache + activations —
+            // keep KV under 20% of RAM when the dense backbone exceeds 1.5 GiB.
+            const uint64_t dense_est = model_file_.file_size();
+            uint64_t budget = (dense_est >= (1536ull << 20)) ? (avail / 5) : (avail / 4);
             while (cap > 256) {
                 uint64_t est = static_cast<uint64_t>(hp_.n_layers) * cap *
                                static_cast<uint64_t>(hp_.kv_dim) * 2ull * 2ull;
@@ -2951,8 +2954,24 @@ std::vector<float> MoETransformerEngine::forward_token(
     const uint32_t max_kv_dim = hp_.kv_dim;
     const uint32_t exp_dim = hp_.moe_expert_dim;
 
+    // Grow once, reuse every token — critical for large models (36–80 layers)
+    // where per-call vector construction dominated allocator traffic.
+    scratch_.ensure(dim, max_q_dim, max_kv_dim, exp_dim, hp_.n_experts,
+                    hp_.vocab_size);
+    auto& x = scratch_.x;
+    auto& x_norm = scratch_.x_norm;
+    auto& q = scratch_.q;
+    auto& k = scratch_.k;
+    auto& v = scratch_.v;
+    auto& attn_out = scratch_.attn_out;
+    auto& proj_out = scratch_.proj_out;
+    auto& router_logits = scratch_.router_logits;
+    auto& moe_accum = scratch_.moe_accum;
+    auto& gate_buf = scratch_.gate_buf;
+    auto& down_buf = scratch_.down_buf;
+
     // 1. Embedding Lookup
-    std::vector<float> x(dim, 0.0f);
+    std::fill(x.begin(), x.begin() + dim, 0.0f);
     if (tok_emb_ && token_id < hp_.vocab_size) {
         size_t row_bytes = tensor_byte_size(tok_emb_->type, dim);
         const uint8_t* emb_row = static_cast<const uint8_t*>(tok_emb_->mapped_ptr) + token_id * row_bytes;
@@ -2994,17 +3013,6 @@ std::vector<float> MoETransformerEngine::forward_token(
             }
         }
     }
-
-    std::vector<float> x_norm(dim, 0.0f);
-    std::vector<float> q(max_q_dim, 0.0f);
-    std::vector<float> k(max_kv_dim, 0.0f);
-    std::vector<float> v(max_kv_dim, 0.0f);
-    std::vector<float> attn_out(max_q_dim, 0.0f);
-    std::vector<float> proj_out(dim, 0.0f);
-    std::vector<float> router_logits(hp_.n_experts, 0.0f);
-    std::vector<float> moe_accum(dim, 0.0f);
-    std::vector<float> gate_buf(exp_dim, 0.0f);
-    std::vector<float> down_buf(dim, 0.0f);
 
     // Map holding PILOT async prefetch futures for Layer L+1
     std::unordered_map<uint32_t, std::future<StreamedExpertWeights>> prefetched_futures;
@@ -3107,7 +3115,11 @@ std::vector<float> MoETransformerEngine::forward_token(
             const float* q_head = q.data() + h * head_dim;
             const uint32_t kvh = h / kv_mul;
             const uint32_t win_len = pos - t_start_win + 1;
-            std::vector<float> scores(win_len);
+            // Thread-local scores: OpenMP heads must not share one buffer,
+            // and reallocating per head per layer stalls large models.
+            thread_local std::vector<float> tls_scores;
+            if (tls_scores.size() < win_len) tls_scores.resize(win_len);
+            float* scores = tls_scores.data();
 
             for (uint32_t t = t_start_win; t <= pos; ++t) {
                 const uint16_t* k_t = slot.k_cache[kv_layer].data() + static_cast<size_t>(t) * max_kv_dim + kvh * head_dim;
@@ -3126,7 +3138,7 @@ std::vector<float> MoETransformerEngine::forward_token(
                     scores[s] = cap * std::tanh(scores[s] * inv_cap);
                 }
             }
-            softmax(scores.data(), win_len);
+            softmax(scores, win_len);
 
             float* out_head = attn_out.data() + h * head_dim;
             for (uint32_t t = t_start_win; t <= pos; ++t) {
@@ -3394,23 +3406,25 @@ std::vector<float> MoETransformerEngine::forward_token(
                              ? static_cast<const float*>(out_norm_->mapped_ptr) : nullptr;
         rms_norm(x_norm.data(), x.data(), onorm_w, dim, hp_.rms_norm_eps);
         if (out_hidden) {
-            *out_hidden = x_norm;
+            out_hidden->assign(x_norm.begin(), x_norm.begin() + dim);
         }
         if (compute_logits) {
             // Do not zero-fill: matmul_quant_f32 writes every vocab row.
-            // assign(N, 0) was ~vocab*4 bytes of dead store per decode step
-            // (≈600 KB for Qwen2.5) on the hottest path.
-            logits.resize(hp_.vocab_size);
+            // Write into reused scratch, then copy out so the API still
+            // returns an owned vector without reallocating the scratch.
+            float* logit_dst = scratch_.logits.data();
             if (lm_head_) {
-                matmul_quant_f32(lm_head_->type, lm_head_->mapped_ptr, x_norm.data(), logits.data(), hp_.vocab_size, dim);
+                matmul_quant_f32(lm_head_->type, lm_head_->mapped_ptr, x_norm.data(), logit_dst, hp_.vocab_size, dim);
                 if (hp_.final_logit_softcapping > 0.0f) {
                     const float cap = hp_.final_logit_softcapping;
                     const float inv_cap = 1.0f / cap;
-                    for (float& lval : logits) {
-                        lval = cap * std::tanh(lval * inv_cap);
+                    for (uint32_t i = 0; i < hp_.vocab_size; ++i) {
+                        logit_dst[i] = cap * std::tanh(logit_dst[i] * inv_cap);
                     }
                 }
             }
+            logits.assign(scratch_.logits.begin(),
+                          scratch_.logits.begin() + hp_.vocab_size);
         }
     }
     head_ms = now_ms() - th0;

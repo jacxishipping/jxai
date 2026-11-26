@@ -4407,6 +4407,11 @@ void matmul_quant_f32(
     #pragma omp parallel for if(rows >= 64) schedule(static)
 #endif
     for (int64_t r = 0; r < rows; ++r) {
+        // Prefetch weight rows ahead — large LM-heads (vocab≈150k) and
+        // wide FFN downs otherwise stall on sequential DRAM traffic.
+        if (r + 8 < rows) {
+            __builtin_prefetch(base + (r + 8) * row_bytes, 0, 3);
+        }
         out[r] = vec_dot_row_with_q8(type, base + r * row_bytes, x, x_q8_ptr, cols);
     }
 }
@@ -4444,6 +4449,16 @@ void matmul_qkv_quant_f32(
     #pragma omp parallel for if(total_rows >= 64) schedule(static)
 #endif
     for (int64_t idx = 0; idx < total_rows; ++idx) {
+        // Prefetch the weight row ~8 ahead within the same Q/K/V band.
+        if (idx + 8 < total_rows) {
+            if (idx + 8 < q_end && q_base) {
+                __builtin_prefetch(q_base + (idx + 8) * q_row_bytes, 0, 3);
+            } else if (idx + 8 < k_end && k_base) {
+                __builtin_prefetch(k_base + (idx + 8 - q_end) * k_row_bytes, 0, 3);
+            } else if (v_base) {
+                __builtin_prefetch(v_base + (idx + 8 - k_end) * v_row_bytes, 0, 3);
+            }
+        }
         if (idx < q_end) {
             q_out[idx] = vec_dot_row_with_q8(wq_type, q_base + idx * q_row_bytes, x, x_q8_ptr, cols);
         } else if (idx < k_end) {
@@ -4483,6 +4498,10 @@ void matmul_swiglu_quant_f32(
     #pragma omp parallel for if(exp_dim >= 64) schedule(static)
 #endif
     for (int64_t r = 0; r < exp_dim; ++r) {
+        if (r + 8 < exp_dim) {
+            __builtin_prefetch(gate_base + (r + 8) * gate_row_bytes, 0, 3);
+            __builtin_prefetch(up_base   + (r + 8) * up_row_bytes,   0, 3);
+        }
         float g = vec_dot_row_with_q8(gate_type, gate_base + r * gate_row_bytes, x, x_q8_ptr, cols);
         float u = vec_dot_row_with_q8(up_type,   up_base   + r * up_row_bytes,   x, x_q8_ptr, cols);
         if (use_gelu) {
