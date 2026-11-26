@@ -34,6 +34,11 @@ OLLAMA_HOST = os.environ.get("OLLAMA_HOST", "http://127.0.0.1:11434")
 GATEWAY_PORT = int(os.environ.get("GATEWAY_PORT", "8001"))
 GATEWAY_HOST = os.environ.get("GATEWAY_HOST", "127.0.0.1")
 API_KEY = os.environ.get("MOE_API_KEY", "")
+# Comma-separated exact origins (same contract as native moe_engine /
+# MOE_CORS_ORIGINS). Empty = same-origin only: no Access-Control-Allow-Origin.
+CORS_ORIGINS = [
+    o.strip() for o in os.environ.get("MOE_CORS_ORIGINS", "").split(",") if o.strip()
+]
 
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -56,9 +61,16 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
         print(f"[JXAI Gateway] {args[0]} {args[1]} {args[2]}")
 
     def _set_cors(self):
-        self.send_header("Access-Control-Allow-Origin", "*")
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
-        self.send_header("Access-Control-Allow-Headers", "Content-Type, Authorization, x-api-key, User-Agent")
+        # Mirror native engine: never emit Access-Control-Allow-Origin: *.
+        # When MOE_CORS_ORIGINS is set, echo the request Origin only if it
+        # is an exact allow-list match; otherwise omit CORS headers entirely.
+        origin = self.headers.get("Origin", "")
+        if origin and origin in CORS_ORIGINS:
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
+            self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS, DELETE")
+            self.send_header("Access-Control-Allow-Headers",
+                             "Content-Type, Authorization, x-api-key, User-Agent")
 
     def _send_json(self, status, data):
         body = json.dumps(data).encode("utf-8")
@@ -211,11 +223,26 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
         # Mutating endpoints require the API key whenever one is configured.
         if not self._require_auth():
             return
-        content_length = int(self.headers.get("Content-Length", 0))
+        # Same 1 MiB body cap as the native engine (DoS bound).
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self._send_json(400, {"error": "invalid_content_length",
+                                  "message": "Content-Length must be a non-negative integer."})
+            return
+        if content_length < 0 or content_length > 1 * 1024 * 1024:
+            self._send_json(413, {"error": "request_too_large",
+                                  "message": "Request body exceeds the 1 MiB limit."})
+            return
         body = self.rfile.read(content_length) if content_length > 0 else b"{}"
 
         if path in ("/v1/chat/completions", "/v1/completions", "/api/chat", "/api/generate"):
-            req_data = json.loads(body.decode("utf-8"))
+            try:
+                req_data = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"error": "invalid_json",
+                                      "message": "Request body must be valid JSON."})
+                return
             stream = req_data.get("stream", False)
             ollama_model = req_data.get("model", "qwen3.6:35b-a3b")
             messages = req_data.get("messages", [])

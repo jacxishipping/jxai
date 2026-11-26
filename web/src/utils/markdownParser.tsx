@@ -230,20 +230,32 @@ function parseInlineSpans(text: string): React.ReactNode[] {
       }
     }
 
-    // Link [text](url)
+    // Link [text](url) — only http(s)/mailto/# relative; reject javascript:/data:
     const linkMatch = remaining.match(/^\[([^\]]+)\]\(([^)]+)\)/);
     if (linkMatch) {
-      nodes.push(
-        <a
-          key={`link-${keyIndex++}`}
-          href={linkMatch[2]}
-          target="_blank"
-          rel="noreferrer noopener"
-          className="text-blue-400 underline hover:text-blue-300 transition-colors"
-        >
-          {linkMatch[1]}
-        </a>
-      );
+      const href = linkMatch[2].trim();
+      const safe =
+        /^(https?:|mailto:|#|\/|\.\/|\.\.\/)/i.test(href) &&
+        !/^(javascript|data|vbscript):/i.test(href);
+      if (safe) {
+        nodes.push(
+          <a
+            key={`link-${keyIndex++}`}
+            href={href}
+            target="_blank"
+            rel="noreferrer noopener"
+            className="text-blue-400 underline hover:text-blue-300 transition-colors"
+          >
+            {linkMatch[1]}
+          </a>
+        );
+      } else {
+        nodes.push(
+          <span key={`link-${keyIndex++}`} className="text-slate-400">
+            [{linkMatch[1]}]({href})
+          </span>
+        );
+      }
       remaining = remaining.slice(linkMatch[0].length);
       continue;
     }

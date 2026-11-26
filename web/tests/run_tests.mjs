@@ -126,6 +126,22 @@ test('5. Built bundle: web/dist exists and references a real JS asset', () => {
   assert.ok(fs.statSync(assetPath).size > 10_000, 'built JS asset is suspiciously small');
 });
 
+test('6. Markdown href allow-list rejects javascript:/data: schemes', () => {
+  // Mirrors web/src/utils/markdownParser.tsx link gate.
+  function isSafeHref(href) {
+    const h = String(href).trim();
+    return /^(https?:|mailto:|#|\/|\.\/|\.\.\/)/i.test(h) &&
+           !/^(javascript|data|vbscript):/i.test(h);
+  }
+  assert.strictEqual(isSafeHref('https://example.com'), true);
+  assert.strictEqual(isSafeHref('/docs'), true);
+  assert.strictEqual(isSafeHref('#section'), true);
+  assert.strictEqual(isSafeHref('mailto:a@b.c'), true);
+  assert.strictEqual(isSafeHref('javascript:alert(1)'), false);
+  assert.strictEqual(isSafeHref('data:text/html,<script>'), false);
+  assert.strictEqual(isSafeHref('vbscript:msgbox(1)'), false);
+});
+
 // ------------------------------------------------------------------------------
 // B. Live API-contract tests against the real moe_engine server
 // ------------------------------------------------------------------------------

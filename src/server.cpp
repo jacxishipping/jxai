@@ -58,7 +58,45 @@ bool send_all(uintptr_t s, const char* data, size_t len) {
 // than the header cap is dropped. Concurrency is capped in start().
 constexpr size_t kMaxHeaderBytes = 64 * 1024;        // 64 KiB request line + headers
 constexpr size_t kMaxBodyBytes = 1 * 1024 * 1024;    // 1 MiB JSON bodies
+constexpr size_t kMaxStaticFileBytes = 32 * 1024 * 1024; // 32 MiB static assets
 constexpr uint32_t kMaxConcurrentRequests = 64;      // simultaneous connections
+
+} // namespace (anonymous — reopen after resolve_under_root)
+
+bool resolve_under_root(const std::string& root, const std::string& rel,
+                        std::string& out) {
+    if (rel.empty()) return false;
+    std::filesystem::path rel_p(rel);
+    // Absolute / root-name / has_root_directory means the RHS of path
+    // join would replace `root` (classic `//etc/passwd` / `/etc/passwd`
+    // escape against `web_root / sub`).
+    if (rel_p.is_absolute() || rel_p.has_root_name() || rel_p.has_root_directory()) {
+        return false;
+    }
+    for (const auto& part : rel_p) {
+        if (part == "..") return false;
+    }
+    std::filesystem::path root_p = std::filesystem::path(root).lexically_normal();
+    if (root_p.empty()) root_p = ".";
+    // Make root absolute-ish for the prefix check without requiring the
+    // directory to exist on disk (unit tests use synthetic roots).
+    if (!root_p.is_absolute()) {
+        root_p = (std::filesystem::current_path() / root_p).lexically_normal();
+    }
+    std::filesystem::path target = (root_p / rel_p).lexically_normal();
+    auto root_s = root_p.generic_string();
+    auto target_s = target.generic_string();
+    if (root_s.back() != '/') root_s.push_back('/');
+    // Exact root match is not a file; require target to be a strict child.
+    if (target_s.size() <= root_s.size() ||
+        target_s.compare(0, root_s.size(), root_s) != 0) {
+        return false;
+    }
+    out = target.string();
+    return true;
+}
+
+namespace {
 
 std::string json_escape(const std::string& s) {
     std::string out;
@@ -1398,10 +1436,16 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     // ------------------------------------------------------------------------
     if (method == "POST" && path == "/v1/models/load") {
         std::string model_path = extract_json_string(body, "model_path", "");
-        if (model_path.empty() || model_path.find("..") != std::string::npos) {
-            send_http_json(client_sock, 400, "Bad Request", "{\"error\":\"Invalid or missing model_path\"}");
+        // Contain under CWD (same policy as static files): no absolute
+        // paths, no `..`, no `//etc/...` root replacement. Operators who
+        // need a path outside the working tree must restart with --model.
+        std::string resolved;
+        if (model_path.empty() || !resolve_under_root(".", model_path, resolved)) {
+            send_http_json(client_sock, 400, "Bad Request",
+                           "{\"error\":\"Invalid or missing model_path\",\"message\":\"model_path must be a relative path under the engine working directory (no .. or absolute paths).\"}");
             return;
         }
+        model_path = resolved;
         std::string err_msg;
         if (!engine_.load_model(model_path, err_msg)) {
             std::ostringstream err_js;
@@ -2220,38 +2264,56 @@ void HttpServer::handle_client(uintptr_t client_sock) {
     if (method == "GET" || method == "HEAD") {
         std::string clean_path = path;
         if (clean_path.empty() || clean_path == "/") clean_path = "/index.html";
-        if (clean_path.find("..") != std::string::npos) {
+        // Strip a single leading slash so the join is relative. Multiple
+        // leading slashes used to leave an absolute `sub` (`/etc/passwd`)
+        // that replaced `web_root_` under std::filesystem join rules.
+        while (!clean_path.empty() && clean_path.front() == '/') clean_path.erase(clean_path.begin());
+        if (clean_path.empty()) clean_path = "index.html";
+
+        std::string resolved;
+        std::filesystem::path target_p;
+        if (!resolve_under_root(web_root_, clean_path, resolved)) {
             send_http_json(client_sock, 403, "Forbidden", "{\"error\":\"Forbidden\"}");
             return;
         }
+        target_p = resolved;
 
-        std::filesystem::path root_p(web_root_);
-        std::string sub = clean_path.starts_with("/") ? clean_path.substr(1) : clean_path;
-        std::filesystem::path target_p = root_p / sub;
-
-        if (!std::filesystem::exists(target_p)) {
-            // SPA fallback to index.html
-            target_p = root_p / "index.html";
+        if (!std::filesystem::exists(target_p) || !std::filesystem::is_regular_file(target_p)) {
+            // SPA fallback — only when the fallback itself stays under root.
+            std::string index_resolved;
+            if (!resolve_under_root(web_root_, "index.html", index_resolved) ||
+                !std::filesystem::exists(index_resolved) ||
+                !std::filesystem::is_regular_file(index_resolved)) {
+                send_http_json(client_sock, 404, "Not Found", "{\"error\":\"Not found\"}");
+                return;
+            }
+            target_p = index_resolved;
         }
 
-        if (std::filesystem::exists(target_p) && std::filesystem::is_regular_file(target_p)) {
-            std::ifstream ifs(target_p, std::ios::binary);
-            std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
-            std::string mime = mime_type_for_path(target_p.string());
-
-            std::ostringstream hdr;
-            hdr << "HTTP/1.1 200 OK\r\n"
-                << "Content-Type: " << mime << "\r\n"
-                << cors_response_header()
-                << "Content-Length: " << content.size() << "\r\n"
-                << "Connection: close\r\n\r\n";
-            std::string h = hdr.str();
-            send_all(client_sock, h.data(), h.size());
-            if (method == "GET") {
-                send_all(client_sock, content.data(), content.size());
-            }
+        std::error_code ec;
+        const auto fsize = std::filesystem::file_size(target_p, ec);
+        if (ec || fsize > kMaxStaticFileBytes) {
+            send_http_json(client_sock, 413, "Content Too Large",
+                           "{\"error\":\"file_too_large\",\"message\":\"Static file exceeds the 32 MiB limit.\"}");
             return;
         }
+
+        std::ifstream ifs(target_p, std::ios::binary);
+        std::string content((std::istreambuf_iterator<char>(ifs)), std::istreambuf_iterator<char>());
+        std::string mime = mime_type_for_path(target_p.string());
+
+        std::ostringstream hdr;
+        hdr << "HTTP/1.1 200 OK\r\n"
+            << "Content-Type: " << mime << "\r\n"
+            << cors_response_header()
+            << "Content-Length: " << content.size() << "\r\n"
+            << "Connection: close\r\n\r\n";
+        std::string h = hdr.str();
+        send_all(client_sock, h.data(), h.size());
+        if (method == "GET") {
+            send_all(client_sock, content.data(), content.size());
+        }
+        return;
     }
 
     send_http_json(client_sock, 404, "Not Found", "{\"error\":\"Endpoint not found\"}");

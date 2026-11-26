@@ -72,6 +72,14 @@ bool validate_server_config(int paged_blocks, int active_slots, int max_context,
                             double top_p, const std::string& api_host,
                             std::string& err);
 
+// Resolve `rel` under `root` without escaping the root. Rejects empty
+// paths, `..` segments, and absolute / drive-rooted `rel` (so a request
+// like `//etc/passwd` cannot replace the join root). On success `out`
+// is the lexically-normalized absolute path under `root`. Pure helper —
+// does not touch the filesystem (so unit tests need no disk layout).
+bool resolve_under_root(const std::string& root, const std::string& rel,
+                        std::string& out);
+
 class HttpServer {
 public:
     HttpServer(MoETransformerEngine& engine, const std::string& web_root = "web/dist");

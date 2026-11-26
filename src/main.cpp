@@ -1269,6 +1269,27 @@ bool run_verification_tests() {
         check(!request_authorized("Authorization: Bearer wrong\r\n", "k"), "auth: wrong key rejected");
         check(!request_authorized("X-Custom: x-api-key: k\r\n", "k"), "auth: key inside another header's value must not authenticate");
         check(!request_authorized("", "k"), "auth: no headers rejected");
+        // --- static / model path containment (blocks //etc/passwd joins) ---
+        {
+            std::string out;
+            check(resolve_under_root("/tmp/jxai-web", "index.html", out) &&
+                  out.find("index.html") != std::string::npos,
+                  "resolve_under_root: relative child ok");
+            check(resolve_under_root("/tmp/jxai-web", "assets/app.js", out),
+                  "resolve_under_root: nested relative ok");
+            check(!resolve_under_root("/tmp/jxai-web", "/etc/passwd", out),
+                  "resolve_under_root: absolute path rejected");
+            check(!resolve_under_root("/tmp/jxai-web", "//etc/passwd", out),
+                  "resolve_under_root: double-slash absolute rejected");
+            check(!resolve_under_root("/tmp/jxai-web", "../etc/passwd", out),
+                  "resolve_under_root: .. segment rejected");
+            check(!resolve_under_root("/tmp/jxai-web", "foo/../../etc/passwd", out),
+                  "resolve_under_root: embedded .. rejected");
+            check(!resolve_under_root("/tmp/jxai-web", "", out),
+                  "resolve_under_root: empty rejected");
+            check(!resolve_under_root(".", "/home/weights.gguf", out),
+                  "resolve_under_root: absolute model path rejected");
+        }
         // --- SIGPIPE / client-disconnect survival (POSIX only) ---
 #ifndef _WIN32
         {
@@ -2018,8 +2039,20 @@ int main(int argc, char* argv[]) {
 #endif
     }
 
-    // Auto-forge model if specified file does not exist
+    // Refuse to silently forge a toy model for serve/chat/bench. Forging
+    // is only for `moe_engine setup|forge|test`. Launchers already refuse;
+    // the binary must match that honesty so a bare `moe_engine serve`
+    // cannot pretend a synthetic GGUF is a real backend.
     if (!fs::exists(model_path)) {
+        if (mode == "serve" || mode == "chat" || mode == "bench") {
+            std::cerr << "[ERROR] Model file not found: " << model_path << "\n"
+                      << "Download one first, e.g.:\n"
+                      << "  ./build/moe_engine pull Qwen/Qwen2.5-0.5B-Instruct-GGUF\n"
+                      << "or pass --model <path/to/real.gguf>.\n"
+                      << "Refusing to auto-forge a synthetic toy model as a backend.\n"
+                      << "(Use `moe_engine setup` / `moe_engine forge` only for offline fixtures.)\n";
+            return 1;
+        }
         std::cout << "[NOTE] Model file '" << model_path << "' not found. Automatically forging operational MoE model...\n";
         if (fs::path(model_path).has_parent_path()) {
             fs::create_directories(fs::path(model_path).parent_path());

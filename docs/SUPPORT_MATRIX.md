@@ -7,8 +7,8 @@ produced coherent output on this engine; a row marked "unverified" means
 the code path exists but no real model was exercised, and the engine says
 so loudly at load time instead of silently producing wrong output.
 
-Last updated: 2026-11-25 (investigation — retired fixed short-read /
-cache_slot seams; confirmed CI absent from tree).
+Last updated: 2026-11-26 (follow-up investigation — CI workflow added;
+markdown `javascript:` links blocked; gateway CORS no longer `*`).
 Engine state at that date: `moe_engine test` 11/11 (incl. Test 1d K-quant
 remainder checks and Tests 1e/1f malformed-input guards).
 
@@ -176,10 +176,12 @@ a slot does not silently share another slot's state.
 
 ## 8. Known limitations (do not present as supported)
 
-1. **BF16 norms/biases are ignored.** The forward pass only applies
-   F32 norms/biases. All-BF16 SafeTensors models (e.g. `qwen2moe-tiny`,
-   `mixtral-tiny`) load with a stderr warning and run with identity
-   norms. This is a documented limitation, not a silent success.
+1. **Non-F32 norms/biases are ignored (F16 and BF16).** The forward pass
+   only applies F32 norms/biases. All-BF16/F16 SafeTensors models (e.g.
+   `qwen2moe-tiny`, `mixtral-tiny`) load with a stderr warning and run
+   with identity norms. Typical GGUF files keep norms as F32, so this
+   mainly bites all-half SafeTensors. Documented limitation, not a
+   silent success.
 2. **No batched prefill.** Requests serialize on `engine_mtx_`;
    throughput-bound matmul dominates (96% of prefill, 82% of decode).
    Batched prefill was assessed and deliberately not landed (ceiling
@@ -203,6 +205,13 @@ a slot does not silently share another slot's state.
    on reload; in-page XSS could still read it from memory while loaded.
 8. **IQ quantizers are simplified** (no importance matrix) and IQ
    dequantizers drop remainders on direct calls (see §2).
+9. **No default model in a clean clone.** `models/real/` is gitignored;
+   live web API tests and `./start_jxai.sh` need a downloaded GGUF (or
+   `MOE_MODEL`). There is no auto-pull on first launch.
+10. **Desktop UI config still defaults to `models/test_qwen.gguf`**
+    (`desktop/src/main_win.cpp` `SystemConfigUI`). Windows `.bat`
+    launchers refuse that toy; the desktop shell's config reset path
+    still names it.
 
 ### Fixed (kept for audit trail)
 
@@ -211,6 +220,24 @@ a slot does not silently share another slot's state.
   read into the expert cache and falls back to mmap (or skips).
 - **Server `cache_slot` range** — server and engine both enforce user
   slots `[0, 63]` (server returns 400; engine rejects out-of-range).
+- **GitHub Actions CI** — `.github/workflows/ci.yml` runs
+  `moe_engine test` and `cd web && npm test` on push/PR to `main`.
+- **Markdown link scheme filter** — `web/src/utils/markdownParser.tsx`
+  only renders `http(s)` / `mailto` / relative / `#` hrefs; `javascript:`
+  / `data:` / `vbscript:` links are shown as plain text.
+- **Ollama proxy CORS** — `jxai_gateway.py` no longer emits
+  `Access-Control-Allow-Origin: *`; it mirrors the native engine's
+  `MOE_CORS_ORIGINS` allow-list (empty = same-origin, no CORS header).
+- **Static `//` path escape** — `resolve_under_root` rejects absolute /
+  root-directory `rel` so `GET //etc/passwd` cannot leave `web_root_`.
+  Static reads are also capped at 32 MiB.
+- **`/v1/models/load` containment** — relative paths under CWD only;
+  absolute / `..` rejected.
+- **`serve`/`chat`/`bench` refuse auto-forge** — missing model exits
+  instead of forging a toy GGUF (forge stays for `setup`/`forge`/`test`).
+- **Launcher health fingerprint** — `start_jxai.sh` / Windows bats require
+  `/health` `architecture` (+ reject `ollama_connected`) so the optional
+  Ollama proxy is never mistaken for the native engine.
 
 ## 9. Tested models / fixtures (local only, gitignored)
 

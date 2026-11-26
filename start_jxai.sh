@@ -134,26 +134,47 @@ fi
 
 HEALTH_URL="http://${ENGINE_HOST}:${ENGINE_PORT}/health"
 
-health_ok() {
-    curl -s --max-time 2 "$HEALTH_URL" 2>/dev/null | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"'
+# Native engine /health includes "architecture" + "hparams". The optional
+# Ollama proxy also returns "status":"ok" but adds "ollama_connected" and
+# has no architecture — do not treat that as the native engine.
+health_body() {
+    curl -s --max-time 2 "$HEALTH_URL" 2>/dev/null || true
 }
 
-# --- If a healthy engine is already on the port, reuse it (do not own it). ---
-if health_ok; then
+native_engine_healthy() {
+    local body
+    body="$(health_body)"
+    [[ -n "$body" ]] || return 1
+    echo "$body" | grep -q '"status"[[:space:]]*:[[:space:]]*"ok"' || return 1
+    echo "$body" | grep -q '"architecture"' || return 1
+    echo "$body" | grep -q '"hparams"' || return 1
+    # Explicit reject of the optional Ollama proxy fingerprint.
+    echo "$body" | grep -q '"ollama_connected"' && return 1
+    return 0
+}
+
+# --- If a healthy native engine is already on the port, reuse it (do not own it). ---
+if native_engine_healthy; then
     echo "[3/3] Native engine already healthy on ${ENGINE_HOST}:${ENGINE_PORT} — reusing it (not started by this script)."
     echo ""
     echo "  Backend:  native C++ engine (moe_engine serve)"
     echo "  Engine:   http://${ENGINE_HOST}:${ENGINE_PORT}/health"
     echo "  Web UI:   http://${ENGINE_HOST}:${ENGINE_PORT}/"
-    echo "  Model:    $(curl -s --max-time 2 "$HEALTH_URL" | grep -o '"model_name":"[^"]*"' | head -1)"
+    echo "  Model:    $(health_body | grep -o '"model_name":"[^"]*"' | head -1)"
     echo ""
     exit 0
 fi
 
 # --- Port conflict: something else is listening but it is not our engine. ---
-if curl -s --max-time 2 "http://${ENGINE_HOST}:${ENGINE_PORT}/" >/dev/null 2>&1; then
-    echo "[ERROR] Port ${ENGINE_PORT} is already in use by something that is not a healthy JXAI engine." >&2
-    echo "Stop that process, or pick another port:  ./start_jxai.sh --port <n>" >&2
+if curl -s --max-time 2 "http://${ENGINE_HOST}:${ENGINE_PORT}/" >/dev/null 2>&1 || \
+   curl -s --max-time 2 "$HEALTH_URL" >/dev/null 2>&1; then
+    echo "[ERROR] Port ${ENGINE_PORT} is already in use by something that is not a healthy native JXAI engine." >&2
+    if health_body | grep -q '"ollama_connected"'; then
+        echo "Detected the optional Ollama proxy on this port (ollama_connected)." >&2
+        echo "Stop it, or pick another port:  ./start_jxai.sh --port <n>" >&2
+    else
+        echo "Stop that process, or pick another port:  ./start_jxai.sh --port <n>" >&2
+    fi
     exit 1
 fi
 
@@ -200,10 +221,10 @@ cleanup() {
 }
 trap cleanup INT TERM
 
-# --- Wait for a successful health check; fail loudly on early exit/timeout. ---
+# --- Wait for a successful native /health; fail loudly on early exit/timeout. ---
 WAITED=0
 while [[ $WAITED -lt 60 ]]; do
-    if health_ok; then
+    if native_engine_healthy; then
         break
     fi
     if ! kill -0 "$ENGINE_PID" 2>/dev/null; then
@@ -224,7 +245,7 @@ while [[ $WAITED -lt 60 ]]; do
     WAITED=$((WAITED + 1))
 done
 
-if ! health_ok; then
+if ! native_engine_healthy; then
     echo "" >&2
     echo "[ERROR] Engine did not become healthy within 60s on ${ENGINE_HOST}:${ENGINE_PORT}." >&2
     echo "Last 30 lines of $ENGINE_LOG:" >&2
