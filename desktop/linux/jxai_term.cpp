@@ -8,8 +8,12 @@
 //        ./start_jxai_term.sh   # starts engine if needed, then the TUI
 
 #include "http_client.h"
+#include "config_store.h"
+#include "wizard.h"
 
+#include <fcntl.h>
 #include <sys/ioctl.h>
+#include <sys/wait.h>
 #include <termios.h>
 #include <unistd.h>
 
@@ -17,10 +21,12 @@
 #include <cctype>
 #include <cmath>
 #include <csignal>
+#include <chrono>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <deque>
+#include <filesystem>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
@@ -28,7 +34,12 @@
 #include <optional>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <vector>
+
+// Shared with wizard.h
+volatile std::sig_atomic_t g_winch = 0;
+volatile std::sig_atomic_t g_interrupt = 0;
 
 namespace {
 
@@ -53,9 +64,6 @@ constexpr const char* FG_BAD    = "\033[38;2;196;96;84m";
 constexpr const char* FG_META   = "\033[38;2;168;156;132m";
 constexpr const char* BG_BAR    = "\033[48;2;28;26;22m";
 constexpr const char* BG_INPUT  = "\033[48;2;36;33;28m";
-
-volatile std::sig_atomic_t g_winch = 0;
-volatile std::sig_atomic_t g_interrupt = 0;
 
 void on_winch(int) { g_winch = 1; }
 void on_int(int) { g_interrupt = 1; }
@@ -116,7 +124,90 @@ struct AppConfig {
     uint32_t slot = 0;
     std::string system_prompt;
     std::string api_key;
+    bool force_wizard = false;
+    bool skip_wizard = false;
+    std::string model_path; // from wizard / config
 };
+
+// Spawn moe_engine serve if nothing healthy is listening. Returns true when
+// /health becomes ok (reused or freshly started).
+bool ensure_engine(const AppConfig& cfg, pid_t& child_pid, std::string& err) {
+    child_pid = -1;
+    EngineClient probe(cfg.host, cfg.port);
+    if (probe.health().online) return true;
+
+    std::string model = cfg.model_path;
+    if (model.empty()) {
+        auto tc = jxai::term::load_term_config();
+        model = tc.model_path;
+    }
+    if (model.empty()) {
+        err = "no model_path configured — run the first-run wizard";
+        return false;
+    }
+    std::error_code ec;
+    if (!std::filesystem::exists(model, ec) || std::filesystem::file_size(model, ec) == 0) {
+        err = "model file missing: " + model;
+        return false;
+    }
+    if (!std::filesystem::exists("build/moe_engine", ec)) {
+        err = "build/moe_engine not found — build the engine first";
+        return false;
+    }
+
+    // Load HF token into env for any future pulls the engine may do.
+    auto tok = jxai::term::load_hf_token();
+    if (!tok.empty()) setenv("HF_TOKEN", tok.c_str(), 1);
+
+    std::filesystem::create_directories("build", ec);
+    pid_t pid = fork();
+    if (pid == 0) {
+        int logfd = ::open("build/jxai-engine.log", O_WRONLY | O_CREAT | O_APPEND, 0644);
+        if (logfd >= 0) {
+            dup2(logfd, STDOUT_FILENO);
+            dup2(logfd, STDERR_FILENO);
+            ::close(logfd);
+        }
+        std::string port = std::to_string(cfg.port);
+        const char* web = std::filesystem::exists("web/dist/index.html") ? "web/dist" : nullptr;
+        if (web) {
+            execl("./build/moe_engine",
+                  "./build/moe_engine",
+                  "serve",
+                  "--model", model.c_str(),
+                  "--host", cfg.host.c_str(),
+                  "--port", port.c_str(),
+                  "--web-dir", web,
+                  static_cast<char*>(nullptr));
+        } else {
+            execl("./build/moe_engine",
+                  "./build/moe_engine",
+                  "serve",
+                  "--model", model.c_str(),
+                  "--host", cfg.host.c_str(),
+                  "--port", port.c_str(),
+                  static_cast<char*>(nullptr));
+        }
+        _exit(127);
+    }
+    if (pid < 0) {
+        err = "fork failed while starting engine";
+        return false;
+    }
+    child_pid = pid;
+    for (int i = 0; i < 90; ++i) {
+        if (probe.health().online) return true;
+        int st = 0;
+        if (waitpid(pid, &st, WNOHANG) == pid) {
+            err = "engine exited while starting — see build/jxai-engine.log";
+            child_pid = -1;
+            return false;
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    err = "engine did not become healthy within 45s";
+    return false;
+}
 
 struct App {
     AppConfig cfg;
@@ -515,9 +606,14 @@ bool handle_slash(App& app, const std::string& line) {
             "  /tokens <n>           max new tokens\n"
             "  /slot <0-63>          KV cache slot\n"
             "  /system <text>        set system prompt (empty clears)\n"
+            "  /setup                re-run first-run wizard (HF token + model)\n"
             "  /retry                resend last user message\n"
             "  /abort                stop current stream\n"
             "  /quit                 exit");
+        return true;
+    }
+    if (cmd == "/setup" || cmd == "/wizard") {
+        app.push_info("Restart with --wizard to re-run setup:\n  ./start_jxai_term.sh --wizard");
         return true;
     }
     if (cmd == "/quit" || cmd == "/exit" || cmd == "/q") {
@@ -755,9 +851,10 @@ void backspace(App& app) {
 void usage(const char* argv0) {
     std::cerr
         << "Usage: " << argv0 << " [--host ADDR] [--port N] [--temp F] [--tokens N] [--slot N]\n"
-        << "                       [--system TEXT] [--api-key KEY]\n"
+        << "                       [--system TEXT] [--api-key KEY] [--wizard] [--skip-wizard]\n"
         << "\n"
         << "Full-screen terminal client for the JXAI native engine.\n"
+        << "On first run, a setup wizard asks for an HF token and model.\n"
         << "Default endpoint: 127.0.0.1:8001  (same as ./start_jxai.sh)\n"
         << "Set MOE_API_KEY if the engine requires auth.\n";
 }
@@ -781,6 +878,8 @@ AppConfig parse_args(int argc, char** argv) {
         else if (a == "--slot") cfg.slot = static_cast<uint32_t>(std::stoi(need("--slot")));
         else if (a == "--system") cfg.system_prompt = need("--system");
         else if (a == "--api-key") cfg.api_key = need("--api-key");
+        else if (a == "--wizard") cfg.force_wizard = true;
+        else if (a == "--skip-wizard") cfg.skip_wizard = true;
         else {
             std::cerr << "unknown argument: " << a << "\n";
             usage(argv[0]);
@@ -804,13 +903,59 @@ int main(int argc, char** argv) {
     std::signal(SIGWINCH, on_winch);
     std::signal(SIGINT, on_int);
 
+    // Prefill from saved term config / HF token when present.
+    {
+        auto tc = jxai::term::load_term_config();
+        if (!tc.host.empty()) cfg.host = tc.host;
+        if (tc.port) cfg.port = tc.port;
+        if (!tc.model_path.empty()) cfg.model_path = tc.model_path;
+        if (tc.max_tokens) cfg.max_tokens = tc.max_tokens;
+        cfg.temperature = tc.temperature;
+        if (!tc.system_prompt.empty()) cfg.system_prompt = tc.system_prompt;
+        auto tok = jxai::term::load_hf_token();
+        if (!tok.empty()) setenv("HF_TOKEN", tok.c_str(), 0);
+    }
+
     TermiosGuard guard;
     if (!guard.ok) {
         std::cerr << "failed to enter raw terminal mode\n";
         return 1;
     }
 
+    pid_t engine_pid = -1;
+
+    const bool run_wizard = !cfg.skip_wizard &&
+        jxai::term::needs_first_run_wizard(cfg.force_wizard);
+    if (run_wizard) {
+        jxai::term::WizardResult wr;
+        if (!jxai::term::run_first_run_wizard(wr)) {
+            return 1; // user aborted
+        }
+        cfg.model_path = wr.model_path;
+        cfg.host = wr.host;
+        cfg.port = wr.port;
+        // Clear screen before chat UI
+        std::fputs("\033[2J\033[H", stdout);
+        std::fflush(stdout);
+    }
+
+    // Bring up the engine if needed (wizard may have just downloaded a model).
+    {
+        std::string eng_err;
+        if (!ensure_engine(cfg, engine_pid, eng_err)) {
+            // Still open the TUI so the user can see the error /health offline.
+            // Message is pushed after App construction below via health check.
+            (void)eng_err;
+        }
+    }
+
     App app(cfg);
+    if (!cfg.model_path.empty() && !app.health.online) {
+        app.push_info("Starting engine with " + cfg.model_path + " …");
+        // one more poll after a short wait
+        std::this_thread::sleep_for(std::chrono::milliseconds(800));
+        app.refresh_health();
+    }
     draw_app(app);
 
     auto handle_event = [&](const KeyEvent& ev) -> bool {
@@ -909,5 +1054,15 @@ int main(int argc, char** argv) {
     }
 
     app.client.stop();
+    if (engine_pid > 0) {
+        kill(engine_pid, SIGTERM);
+        for (int i = 0; i < 10; ++i) {
+            int st = 0;
+            if (waitpid(engine_pid, &st, WNOHANG) == engine_pid) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        }
+        kill(engine_pid, SIGKILL);
+        waitpid(engine_pid, nullptr, WNOHANG);
+    }
     return 0;
 }

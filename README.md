@@ -121,14 +121,18 @@ explicitly to match them.
 Full-screen TUI client for Linux/macOS. Talks to `moe_engine serve` over
 HTTP/SSE (multi-turn history, live tok/s, slash commands). No ncurses.
 
+**First run** opens a setup wizard: Hugging Face token → model select →
+download → save config (`~/.config/jxai/`), then starts the engine.
+
 ```bash
 ./start_jxai_term.sh
+./start_jxai_term.sh --wizard          # force the wizard again
 # or, with an engine already running on :8001:
 cmake --build build -j --target jxai_term && ./build/jxai_term
 ```
 
 Keys: Enter send · Ctrl+N newline · Esc abort stream · PgUp/PgDn scroll.
-Commands: `/help` `/clear` `/temp` `/tokens` `/slot` `/system` `/retry` `/quit`.
+Commands: `/help` `/clear` `/temp` `/tokens` `/slot` `/system` `/setup` `/retry` `/quit`.
 
 ### Desktop (Tauri)
 
