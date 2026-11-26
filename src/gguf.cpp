@@ -9,6 +9,9 @@
 #include <memory>
 #include <set>
 #include <unordered_set>
+#ifndef _WIN32
+#include <sys/mman.h>
+#endif
 
 namespace moe {
 
@@ -249,6 +252,18 @@ bool ModelFile::open(const std::string& path, std::string& err_msg) {
         return false;
     }
     mapped_base_ = static_cast<const uint8_t*>(ptr);
+#endif
+
+#ifndef _WIN32
+    // Ask the kernel to start paging the model in now so the first chat
+    // tokens do not stall on a burst of major faults (smooth TTFT).
+    // Best-effort — ignore failures on kernels/filesystems that reject it.
+    if (mapped_base_ && file_size_ > 0) {
+        (void)madvise(const_cast<uint8_t*>(mapped_base_), static_cast<size_t>(file_size_), MADV_WILLNEED);
+#ifdef MADV_HUGEPAGE
+        (void)madvise(const_cast<uint8_t*>(mapped_base_), static_cast<size_t>(file_size_), MADV_HUGEPAGE);
+#endif
+    }
 #endif
 
     // Check magic bytes for GGUF ("GGUF" = 0x46554747)
