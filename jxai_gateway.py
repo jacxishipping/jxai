@@ -223,11 +223,26 @@ class JXAIAPIHandler(BaseHTTPRequestHandler):
         # Mutating endpoints require the API key whenever one is configured.
         if not self._require_auth():
             return
-        content_length = int(self.headers.get("Content-Length", 0))
+        # Same 1 MiB body cap as the native engine (DoS bound).
+        try:
+            content_length = int(self.headers.get("Content-Length", "0"))
+        except (TypeError, ValueError):
+            self._send_json(400, {"error": "invalid_content_length",
+                                  "message": "Content-Length must be a non-negative integer."})
+            return
+        if content_length < 0 or content_length > 1 * 1024 * 1024:
+            self._send_json(413, {"error": "request_too_large",
+                                  "message": "Request body exceeds the 1 MiB limit."})
+            return
         body = self.rfile.read(content_length) if content_length > 0 else b"{}"
 
         if path in ("/v1/chat/completions", "/v1/completions", "/api/chat", "/api/generate"):
-            req_data = json.loads(body.decode("utf-8"))
+            try:
+                req_data = json.loads(body.decode("utf-8"))
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._send_json(400, {"error": "invalid_json",
+                                      "message": "Request body must be valid JSON."})
+                return
             stream = req_data.get("stream", False)
             ollama_model = req_data.get("model", "qwen3.6:35b-a3b")
             messages = req_data.get("messages", [])

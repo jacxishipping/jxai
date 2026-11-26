@@ -405,8 +405,8 @@ The short list:
 2. **Tool calling is single-turn.** Multi-turn `tool` role / `tool_calls`
    history messages are not parsed; empty-content assistant turns are
    dropped before templating.
-3. **BF16 norms/biases are ignored.** All-BF16 SafeTensors models load
-   with a warning and run with identity norms.
+3. **Non-F32 (F16/BF16) norms/biases are ignored.** All-half SafeTensors
+   models load with a warning and run with identity norms.
 4. **Qwen3 needs a large token budget** (`max_tokens` ≥ 128) to finish
    thinking and answer.
 5. **SystemOne at baseline** on the built-in sentiment set (10/30).
@@ -433,7 +433,10 @@ daemon on `127.0.0.1:11434`. It requires Ollama to be installed and
 running. Do not confuse it with `moe_engine serve`.
 
 ```bash
-python3 jxai_gateway.py --port 8001   # optional only; default port is the engine's, so pick another if the engine is running
+JXAI_ALLOW_OLLAMA_PROXY=1 python3 jxai_gateway.py --port 8002
+# Opt-in env is required. Default port 8001 is the engine's — pick another
+# if moe_engine is already running. CORS mirrors MOE_CORS_ORIGINS (empty =
+# same-origin only; never Access-Control-Allow-Origin: *).
 ```
 
 The old `run_open_webui.bat` starts the native engine on :8001 and Open

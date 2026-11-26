@@ -26,16 +26,35 @@ if not exist "%MODEL%" (
     exit /b 1
 )
 
-:: Start the native engine on port 8001 if it is not already healthy
-curl -s http://127.0.0.1:8001/health >nul 2>&1
-if %ERRORLEVEL% neq 0 (
+:: Native engine /health must include "architecture" (and must not be the
+:: optional Ollama proxy, which reports ollama_connected).
+set "HEALTH_OK=0"
+for /f "delims=" %%H in ('curl -s http://127.0.0.1:8001/health 2^>nul') do set "HEALTH_BODY=%%H"
+echo %HEALTH_BODY% | findstr /C:"\"status\":\"ok\"" >nul 2>&1
+if %ERRORLEVEL% EQU 0 (
+    echo %HEALTH_BODY% | findstr /C:"\"architecture\"" >nul 2>&1
+    if %ERRORLEVEL% EQU 0 (
+        echo %HEALTH_BODY% | findstr /C:"\"ollama_connected\"" >nul 2>&1
+        if %ERRORLEVEL% NEQ 0 set "HEALTH_OK=1"
+    )
+)
+if "%HEALTH_OK%"=="0" (
     echo [LAUNCH] Starting native C++ engine on http://127.0.0.1:8001 ...
     echo          Model: %MODEL%
     start "JXAI Native Engine" /min "build\moe_engine.exe" serve --model "%MODEL%" --host 127.0.0.1 --port 8001 --web-dir "web\dist"
     set /a WAITED=0
     :wait_engine
-    curl -s http://127.0.0.1:8001/health >nul 2>&1
-    if %ERRORLEVEL% EQU 0 goto engine_up
+    set "HEALTH_OK=0"
+    for /f "delims=" %%H in ('curl -s http://127.0.0.1:8001/health 2^>nul') do set "HEALTH_BODY=%%H"
+    echo %HEALTH_BODY% | findstr /C:"\"status\":\"ok\"" >nul 2>&1
+    if %ERRORLEVEL% EQU 0 (
+        echo %HEALTH_BODY% | findstr /C:"\"architecture\"" >nul 2>&1
+        if %ERRORLEVEL% EQU 0 (
+            echo %HEALTH_BODY% | findstr /C:"\"ollama_connected\"" >nul 2>&1
+            if %ERRORLEVEL% NEQ 0 set "HEALTH_OK=1"
+        )
+    )
+    if "%HEALTH_OK%"=="1" goto engine_up
     set /a WAITED+=1
     if %WAITED% GEQ 60 (
         echo [ERROR] Native engine did not become healthy within 60s.

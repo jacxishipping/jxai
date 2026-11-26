@@ -176,10 +176,12 @@ a slot does not silently share another slot's state.
 
 ## 8. Known limitations (do not present as supported)
 
-1. **BF16 norms/biases are ignored.** The forward pass only applies
-   F32 norms/biases. All-BF16 SafeTensors models (e.g. `qwen2moe-tiny`,
-   `mixtral-tiny`) load with a stderr warning and run with identity
-   norms. This is a documented limitation, not a silent success.
+1. **Non-F32 norms/biases are ignored (F16 and BF16).** The forward pass
+   only applies F32 norms/biases. All-BF16/F16 SafeTensors models (e.g.
+   `qwen2moe-tiny`, `mixtral-tiny`) load with a stderr warning and run
+   with identity norms. Typical GGUF files keep norms as F32, so this
+   mainly bites all-half SafeTensors. Documented limitation, not a
+   silent success.
 2. **No batched prefill.** Requests serialize on `engine_mtx_`;
    throughput-bound matmul dominates (96% of prefill, 82% of decode).
    Batched prefill was assessed and deliberately not landed (ceiling
@@ -226,6 +228,16 @@ a slot does not silently share another slot's state.
 - **Ollama proxy CORS** — `jxai_gateway.py` no longer emits
   `Access-Control-Allow-Origin: *`; it mirrors the native engine's
   `MOE_CORS_ORIGINS` allow-list (empty = same-origin, no CORS header).
+- **Static `//` path escape** — `resolve_under_root` rejects absolute /
+  root-directory `rel` so `GET //etc/passwd` cannot leave `web_root_`.
+  Static reads are also capped at 32 MiB.
+- **`/v1/models/load` containment** — relative paths under CWD only;
+  absolute / `..` rejected.
+- **`serve`/`chat`/`bench` refuse auto-forge** — missing model exits
+  instead of forging a toy GGUF (forge stays for `setup`/`forge`/`test`).
+- **Launcher health fingerprint** — `start_jxai.sh` / Windows bats require
+  `/health` `architecture` (+ reject `ollama_connected`) so the optional
+  Ollama proxy is never mistaken for the native engine.
 
 ## 9. Tested models / fixtures (local only, gitignored)
 
