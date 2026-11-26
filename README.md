@@ -116,6 +116,20 @@ explicitly to match them.
 ./build/moe_engine chat --model models/real/qwen2.5-0.5b-instruct-q4_0.gguf --max-tokens 128
 ```
 
+### Linux terminal UI (`jxai_term`)
+
+Full-screen TUI client for Linux/macOS. Talks to `moe_engine serve` over
+HTTP/SSE (multi-turn history, live tok/s, slash commands). No ncurses.
+
+```bash
+./start_jxai_term.sh
+# or, with an engine already running on :8001:
+cmake --build build -j --target jxai_term && ./build/jxai_term
+```
+
+Keys: Enter send · Ctrl+N newline · Esc abort stream · PgUp/PgDn scroll.
+Commands: `/help` `/clear` `/temp` `/tokens` `/slot` `/system` `/retry` `/quit`.
+
 ### Desktop (Tauri)
 
 The desktop shell (`desktop/`) spawns the same native engine
