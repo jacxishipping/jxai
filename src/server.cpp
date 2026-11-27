@@ -1016,6 +1016,98 @@ HttpServer::~HttpServer() {
     stop();
 }
 
+void HttpServer::set_llama_upstream(const std::string& host, uint16_t port,
+                                    const std::string& backend_label,
+                                    bool using_gpu) {
+    llama_upstream_host_ = host;
+    llama_upstream_port_ = port;
+    llama_backend_label_ = backend_label;
+    llama_using_gpu_ = using_gpu;
+}
+
+bool HttpServer::proxy_to_llama(uintptr_t client_sock, const std::string& method,
+                                const std::string& path, const std::string& /*headers*/,
+                                const std::string& body) {
+    if (llama_upstream_host_.empty() || llama_upstream_port_ == 0) return false;
+
+#ifdef _WIN32
+    SOCKET fd = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (fd == INVALID_SOCKET) {
+        send_http_json(client_sock, 502, "Bad Gateway",
+                       "{\"error\":\"llama_upstream_unreachable\"}");
+        return true;
+    }
+#else
+    int fd = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        send_http_json(client_sock, 502, "Bad Gateway",
+                       "{\"error\":\"llama_upstream_unreachable\"}");
+        return true;
+    }
+#endif
+    sockaddr_in addr{};
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(llama_upstream_port_);
+    if (::inet_pton(AF_INET, llama_upstream_host_.c_str(), &addr.sin_addr) != 1) {
+#ifdef _WIN32
+        ::closesocket(fd);
+#else
+        ::close(fd);
+#endif
+        send_http_json(client_sock, 502, "Bad Gateway",
+                       "{\"error\":\"llama_upstream_bad_host\"}");
+        return true;
+    }
+    if (::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+#ifdef _WIN32
+        ::closesocket(fd);
+#else
+        ::close(fd);
+#endif
+        send_http_json(client_sock, 502, "Bad Gateway",
+                       "{\"error\":\"llama_upstream_connect_failed\"}");
+        return true;
+    }
+
+    std::ostringstream req;
+    req << method << " " << path << " HTTP/1.1\r\n"
+        << "Host: " << llama_upstream_host_ << "\r\n"
+        << "Content-Type: application/json\r\n"
+        << "Connection: close\r\n"
+        << "Content-Length: " << body.size() << "\r\n\r\n"
+        << body;
+    const std::string req_s = req.str();
+#ifdef _WIN32
+    if (::send(fd, req_s.data(), static_cast<int>(req_s.size()), 0) <= 0) {
+        ::closesocket(fd);
+#else
+    if (::send(fd, req_s.data(), req_s.size(), 0) <= 0) {
+        ::close(fd);
+#endif
+        send_http_json(client_sock, 502, "Bad Gateway",
+                       "{\"error\":\"llama_upstream_send_failed\"}");
+        return true;
+    }
+
+    // Stream the upstream HTTP response verbatim to the client (supports SSE).
+    char buf[8192];
+    while (true) {
+#ifdef _WIN32
+        int n = ::recv(fd, buf, sizeof(buf), 0);
+#else
+        ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+#endif
+        if (n <= 0) break;
+        if (!send_all(client_sock, buf, static_cast<size_t>(n))) break;
+    }
+#ifdef _WIN32
+    ::closesocket(fd);
+#else
+    ::close(fd);
+#endif
+    return true;
+}
+
 void HttpServer::stop() {
     running_ = false;
     if (listen_sock_ != ~static_cast<uintptr_t>(0)) {
@@ -1357,6 +1449,60 @@ void HttpServer::handle_client(uintptr_t client_sock) {
         send_http_json(client_sock, 400, "Bad Request",
                        "{\"error\":\"invalid_json\",\"message\":\"Request body must be a well-formed JSON object.\"}");
         return;
+    }
+
+    // Hybrid llama.cpp upstream: proxy chat + model list; custom /health.
+    if (!llama_upstream_host_.empty()) {
+        if (method == "GET" && path == "/health") {
+            std::ostringstream js;
+            js << "{"
+               << "\"status\":\"ok\","
+               << "\"backend\":\"" << json_escape(llama_backend_label_) << "\","
+               << "\"gpu_compute\":" << (llama_using_gpu_ ? "true" : "false") << ","
+               << "\"architecture\":\"llama.cpp\","
+               << "\"model_name\":\"llama-server\","
+               << "\"format\":\"GGUF\","
+               << "\"upstream\":\"http://" << json_escape(llama_upstream_host_) << ":"
+               << llama_upstream_port_ << "\","
+               << "\"active_slots\":1,"
+               << "\"queued_requests\":0,"
+               << "\"hparams\":{},"
+               << "\"hardware\":{"
+               << "\"vulkan_available\":"
+               << (moe::VulkanComputeBackend::instance().is_available() ? "true" : "false") << ","
+               << "\"gpu_compute\":" << (llama_using_gpu_ ? "true" : "false")
+               << "}"
+               << "}";
+            send_http_json(client_sock, 200, "OK", js.str());
+            return;
+        }
+        const bool proxy_get =
+            method == "GET" &&
+            (path == "/v1/models" || path == "/models" || path.starts_with("/v1/models/") ||
+             path.starts_with("/models/"));
+        const bool proxy_post =
+            method == "POST" &&
+            (path == "/v1/chat/completions" || path == "/v1/completions" ||
+             path == "/api/chat" || path == "/api/generate");
+        if (proxy_get || proxy_post) {
+            std::string hdrs = req.substr(0, header_end);
+            if (proxy_to_llama(client_sock, method, path, hdrs, body)) return;
+        }
+        // Native-only APIs need a loaded moe_engine. Chat + /v1/models already
+        // went through the proxy above; leave static UI routes alone.
+        if (!engine_.is_loaded()) {
+            const bool native_api =
+                path == "/api/tags" || path == "/profile" || path == "/experts" ||
+                path == "/models" || path.starts_with("/models/") ||
+                path.starts_with("/v1/") || path.starts_with("/api/");
+            if (native_api) {
+                send_http_json(client_sock, 501, "Not Implemented",
+                               "{\"error\":\"native_endpoint_unavailable\","
+                               "\"message\":\"This endpoint requires the native moe_engine. "
+                               "Chat uses the hybrid llama.cpp upstream.\"}");
+                return;
+            }
+        }
     }
 
     // ------------------------------------------------------------------------

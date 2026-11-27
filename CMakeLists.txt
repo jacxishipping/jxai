@@ -27,6 +27,7 @@ set(SOURCES
     src/model_forge.cpp
     src/model_pull.cpp
     src/vulkan_backend.cpp
+    src/llama_bridge.cpp
     src/server.cpp
     src/main.cpp
 )

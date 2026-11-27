@@ -42,6 +42,9 @@ models/
 *.safetensors
 *.tmp
 
+# Optional llama.cpp hybrid binary (scripts/fetch_llama_server.*)
+tools/llama/
+
 # Python
 __pycache__/
 *.py[cod]
