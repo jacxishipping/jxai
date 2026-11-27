@@ -1,7 +1,7 @@
 # Package a portable jxai-windows-x64.zip from a local MSVC build tree.
 # Usage (from repo root, after Release build + web build):
-#   powershell -File scripts/package_windows.ps1
-#   powershell -File scripts/package_windows.ps1 -OutDir dist -BuildDir build
+#   pwsh -File scripts/package_windows.ps1
+#   pwsh -File scripts/package_windows.ps1 -OutDir dist -BuildDir build
 
 param(
     [string]$BuildDir = "build",
@@ -31,7 +31,7 @@ $studio = Find-Exe "moe_studio.exe"
 
 $webDist = Join-Path $Root "web\dist\index.html"
 if (-not (Test-Path $webDist)) {
-    throw "web\dist\index.html missing — run: cd web && npm ci && npm run build"
+    throw 'web\dist\index.html missing - run: cd web; npm ci; npm run build'
 }
 
 $stage = Join-Path $Root "$OutDir\jxai-windows-x64"
@@ -44,7 +44,7 @@ Copy-Item $engine (Join-Path $stage "moe_engine.exe")
 if ($studio) {
     Copy-Item $studio (Join-Path $stage "moe_studio.exe")
 } else {
-    Write-Warning "moe_studio.exe not found — packaging engine-only zip"
+    Write-Warning "moe_studio.exe not found - packaging engine-only zip"
 }
 
 Copy-Item -Recurse (Join-Path $Root "web\dist\*") (Join-Path $stage "web\dist\")
