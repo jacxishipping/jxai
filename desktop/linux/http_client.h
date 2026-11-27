@@ -51,6 +51,13 @@ struct ChatTurn {
     std::string content;
 };
 
+struct ModelEntry {
+    std::string id;
+    std::string path;
+    uint64_t size = 0;
+    bool active = false;
+};
+
 inline std::string json_escape(const std::string& s) {
     std::string o;
     o.reserve(s.size() + 8);
@@ -190,6 +197,75 @@ public:
         return h;
     }
 
+    // Clear a KV cache slot on the engine (POST /v1/slots/clear).
+    bool clear_slot(uint32_t slot_id, const std::string& api_key, std::string& err) {
+        const std::string body = "{\"slot_id\":" + std::to_string(slot_id) + "}";
+        std::string resp;
+        int status = 0;
+        if (!http_post_json("/v1/slots/clear", body, api_key, resp, status)) {
+            err = "cannot reach engine at " + host_ + ":" + std::to_string(port_);
+            return false;
+        }
+        if (status != 200) {
+            err = "clear slot HTTP " + std::to_string(status);
+            std::string msg;
+            if (extract_json_string(resp, "message", msg) || extract_json_string(resp, "error", msg))
+                err += ": " + msg;
+            return false;
+        }
+        return true;
+    }
+
+    // Hot-swap the active GGUF (POST /v1/models/load). Path must be under CWD.
+    bool load_model(const std::string& model_path, const std::string& api_key, std::string& err) {
+        const std::string body = "{\"model_path\":\"" + json_escape(model_path) + "\"}";
+        std::string resp;
+        int status = 0;
+        if (!http_post_json("/v1/models/load", body, api_key, resp, status)) {
+            err = "cannot reach engine at " + host_ + ":" + std::to_string(port_);
+            return false;
+        }
+        if (status != 200) {
+            err = "load model HTTP " + std::to_string(status);
+            std::string msg;
+            if (extract_json_string(resp, "error", msg) || extract_json_string(resp, "message", msg))
+                err += ": " + msg;
+            return false;
+        }
+        return true;
+    }
+
+    // List models from GET /v1/models (active + files under models/).
+    bool list_models(std::vector<ModelEntry>& out, std::string& err) {
+        out.clear();
+        std::string resp;
+        if (!http_get("/v1/models", resp) || resp.find("200") == std::string::npos) {
+            err = "cannot reach engine at " + host_ + ":" + std::to_string(port_);
+            return false;
+        }
+        // Walk every "path":"…" occurrence in the data array.
+        size_t pos = 0;
+        while ((pos = resp.find("\"path\":\"", pos)) != std::string::npos) {
+            ModelEntry e;
+            e.path = json_unescape_string(resp, pos + 8);
+            // Look backward a bit for id / active / size on this object.
+            size_t obj = resp.rfind('{', pos);
+            size_t obj_end = resp.find('}', pos);
+            if (obj == std::string::npos) obj = 0;
+            if (obj_end == std::string::npos) obj_end = resp.size();
+            const std::string slice = resp.substr(obj, obj_end - obj + 1);
+            extract_json_string(slice, "id", e.id);
+            double sz = 0;
+            if (extract_json_number(slice, "size", sz) && sz > 0)
+                e.size = static_cast<uint64_t>(sz);
+            e.active = slice.find("\"active\":true") != std::string::npos;
+            if (e.id.empty()) e.id = e.path;
+            if (!e.path.empty()) out.push_back(std::move(e));
+            pos += 8;
+        }
+        return true;
+    }
+
     void stream_chat_async(const std::vector<ChatTurn>& messages,
                            uint32_t max_tokens,
                            float temperature,
@@ -273,6 +349,43 @@ private:
             out.append(buf, static_cast<size_t>(n));
         }
         ::close(fd);
+        return true;
+    }
+
+    bool http_post_json(const std::string& path, const std::string& body,
+                        const std::string& api_key, std::string& out, int& status) {
+        status = 0;
+        int fd = connect_fd();
+        if (fd < 0) return false;
+        std::ostringstream req;
+        req << "POST " << path << " HTTP/1.1\r\n"
+            << "Host: " << host_ << "\r\n"
+            << "Content-Type: application/json\r\n"
+            << "Content-Length: " << body.size() << "\r\n"
+            << "Connection: close\r\n";
+        if (!api_key.empty()) {
+            req << "Authorization: Bearer " << api_key << "\r\n";
+        }
+        req << "\r\n" << body;
+        std::string r = req.str();
+        if (::send(fd, r.data(), r.size(), 0) < 0) {
+            ::close(fd);
+            return false;
+        }
+        out.clear();
+        char buf[4096];
+        while (true) {
+            ssize_t n = ::recv(fd, buf, sizeof(buf), 0);
+            if (n <= 0) break;
+            out.append(buf, static_cast<size_t>(n));
+        }
+        ::close(fd);
+        if (out.rfind("HTTP/", 0) == 0) {
+            size_t sp = out.find(' ');
+            if (sp != std::string::npos) {
+                try { status = std::stoi(out.substr(sp + 1, 3)); } catch (...) {}
+            }
+        }
         return true;
     }
 

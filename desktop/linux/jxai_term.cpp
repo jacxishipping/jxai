@@ -46,6 +46,7 @@ namespace {
 using jxai::term::ChatTurn;
 using jxai::term::EngineClient;
 using jxai::term::HealthInfo;
+using jxai::term::ModelEntry;
 using jxai::term::StreamTelem;
 
 // ── palette (ANSI) ──────────────────────────────────────────────────────────
@@ -109,6 +110,12 @@ struct TermiosGuard {
         std::fputs("\033[?1000h\033[?1006h", stdout);
         std::fflush(stdout);
         mouse = true;
+    }
+    void disable_mouse() {
+        if (!ok || !mouse) return;
+        std::fputs("\033[?1006l\033[?1000l", stdout);
+        std::fflush(stdout);
+        mouse = false;
     }
     ~TermiosGuard() {
         if (!ok) return;
@@ -226,6 +233,9 @@ struct App {
     HealthInfo health;
     std::deque<Bubble> bubbles;
     std::vector<ChatTurn> history; // for API multi-turn
+    std::vector<std::string> input_hist; // submitted composer lines (↑/↓ recall)
+    int input_hist_idx = -1;             // -1 = editing a fresh line
+    std::string input_draft;             // saved when browsing history
     std::string input;
     size_t cursor = 0;
     int scroll = 0; // lines from bottom (0 = pinned to latest)
@@ -233,6 +243,7 @@ struct App {
     bool running = true;
     bool streaming = false;
     bool thinking = false;
+    bool request_setup = false; // /setup — handled in main (needs TermiosGuard)
     std::string status_left;
     std::string status_right;
     double last_tps = 0.0;
@@ -247,7 +258,7 @@ struct App {
         refresh_health();
         push_info(
             "JXAI terminal — local inference over the native engine.\n"
-            "Enter sends · Ctrl+N newline · Esc aborts stream · /help for commands.");
+            "Enter sends · ↑/↓ history · PgUp scroll · Esc aborts · /help for commands.");
         if (!health.online) {
             push_error("Engine offline at " + cfg.host + ":" + std::to_string(cfg.port) +
                        ".\nStart it with ./start_jxai.sh  (or ./start_jxai_term.sh).");
@@ -255,6 +266,50 @@ struct App {
             push_info("Connected · " + health.model_name + " · " + health.architecture +
                       (health.n_layers ? (" · " + std::to_string(health.n_layers) + "L") : ""));
         }
+    }
+
+    void remember_input(const std::string& line) {
+        if (line.empty()) return;
+        if (!input_hist.empty() && input_hist.back() == line) {
+            input_hist_idx = -1;
+            input_draft.clear();
+            return;
+        }
+        input_hist.push_back(line);
+        if (input_hist.size() > 200) {
+            input_hist.erase(input_hist.begin(), input_hist.begin() + static_cast<long>(input_hist.size() - 200));
+        }
+        input_hist_idx = -1;
+        input_draft.clear();
+    }
+
+    void history_up() {
+        if (input_hist.empty()) return;
+        if (input_hist_idx < 0) {
+            input_draft = input;
+            input_hist_idx = static_cast<int>(input_hist.size()) - 1;
+        } else if (input_hist_idx > 0) {
+            --input_hist_idx;
+        } else {
+            return;
+        }
+        input = input_hist[static_cast<size_t>(input_hist_idx)];
+        cursor = input.size();
+        dirty = true;
+    }
+
+    void history_down() {
+        if (input_hist_idx < 0) return;
+        if (input_hist_idx + 1 < static_cast<int>(input_hist.size())) {
+            ++input_hist_idx;
+            input = input_hist[static_cast<size_t>(input_hist_idx)];
+        } else {
+            input_hist_idx = -1;
+            input = input_draft;
+            input_draft.clear();
+        }
+        cursor = input.size();
+        dirty = true;
     }
 
     void refresh_health() {
@@ -535,7 +590,7 @@ void draw_app(App& app) {
     move_to(rows, 1);
     std::string hints = app.streaming
         ? "  Esc abort stream  ·  Ctrl+C quit"
-        : "  Enter send  ·  Ctrl+N newline  ·  /help  ·  PgUp/PgDn scroll  ·  Ctrl+C quit";
+        : "  Enter send  ·  ↑/↓ history  ·  PgUp scroll  ·  /help  ·  Ctrl+C quit";
     std::printf("%s%s%s", DIM, FG_MUTED, pad_or_trim(hints, cols).c_str());
     std::fputs(RESET, stdout);
 
@@ -610,21 +665,27 @@ bool handle_slash(App& app, const std::string& line) {
         app.push_info(
             "Commands:\n"
             "  /help                 this help\n"
-            "  /clear                clear chat + KV history window\n"
+            "  /clear                clear chat + engine KV slot\n"
             "  /health               refresh engine status\n"
-            "  /model                show loaded model\n"
+            "  /model [list|load p]  show / list / hot-load a GGUF\n"
             "  /temp <0-2>           sampling temperature\n"
             "  /tokens <n>           max new tokens\n"
             "  /slot <0-63>          KV cache slot\n"
             "  /system <text>        set system prompt (empty clears)\n"
-            "  /setup                re-run first-run wizard (HF token + model)\n"
+            "  /setup                re-run setup wizard (HF token + model)\n"
             "  /retry                resend last user message\n"
             "  /abort                stop current stream\n"
-            "  /quit                 exit");
+            "  /quit                 exit\n"
+            "Keys: ↑/↓ recall input · PgUp/PgDn/wheel scroll transcript");
         return true;
     }
     if (cmd == "/setup" || cmd == "/wizard") {
-        app.push_info("Restart with --wizard to re-run setup:\n  ./start_jxai_term.sh --wizard");
+        if (app.streaming) {
+            app.client.stop();
+            app.streaming = false;
+        }
+        app.request_setup = true;
+        app.push_info("Opening setup wizard…");
         return true;
     }
     if (cmd == "/quit" || cmd == "/exit" || cmd == "/q") {
@@ -632,9 +693,18 @@ bool handle_slash(App& app, const std::string& line) {
         return true;
     }
     if (cmd == "/clear") {
+        if (app.streaming) {
+            app.client.stop();
+            app.streaming = false;
+        }
         app.bubbles.clear();
         app.history.clear();
-        app.push_info("Cleared.");
+        std::string err;
+        if (app.client.clear_slot(app.cfg.slot, app.cfg.api_key, err)) {
+            app.push_info("Cleared chat and KV slot " + std::to_string(app.cfg.slot) + ".");
+        } else {
+            app.push_info("Cleared local chat. Engine KV clear failed: " + err);
+        }
         return true;
     }
     if (cmd == "/health") {
@@ -648,11 +718,101 @@ bool handle_slash(App& app, const std::string& line) {
         return true;
     }
     if (cmd == "/model") {
-        app.refresh_health();
-        app.push_info(app.health.online
-            ? ("model " + app.health.model_name + " (" + app.health.architecture + ", " +
-               app.health.format + ")")
-            : "no model — engine offline");
+        std::string arg = rest();
+        auto trim = [](std::string s) {
+            while (!s.empty() && (s.back() == ' ' || s.back() == '\t')) s.pop_back();
+            while (!s.empty() && (s[0] == ' ' || s[0] == '\t')) s.erase(s.begin());
+            return s;
+        };
+        arg = trim(arg);
+        if (arg.empty()) {
+            app.refresh_health();
+            app.push_info(app.health.online
+                ? ("model " + app.health.model_name + " (" + app.health.architecture + ", " +
+                   app.health.format + ")\n  /model list   ·  /model load <path>")
+                : "no model — engine offline");
+            return true;
+        }
+        std::string sub;
+        std::string path;
+        {
+            std::istringstream is(arg);
+            is >> sub;
+            std::getline(is, path);
+            path = trim(path);
+        }
+        if (sub == "list") {
+            std::vector<ModelEntry> models;
+            std::string err;
+            if (!app.client.list_models(models, err)) {
+                app.push_error(err);
+                return true;
+            }
+            if (models.empty()) {
+                app.push_info("No local models under models/. Use /setup or moe_engine pull.");
+                return true;
+            }
+            std::ostringstream oss;
+            oss << "Local models (" << models.size() << "):\n";
+            for (const auto& m : models) {
+                oss << (m.active ? "  ● " : "  ○ ") << m.path;
+                if (m.size > 0) {
+                    oss << "  (" << (m.size / (1024 * 1024)) << " MB)";
+                }
+                oss << "\n";
+            }
+            oss << "Load with: /model load <path>";
+            app.push_info(oss.str());
+            return true;
+        }
+        if (sub == "load") {
+            if (path.empty()) {
+                app.push_error("usage: /model load <path-under-cwd>");
+                return true;
+            }
+            if (app.streaming) {
+                app.client.stop();
+                app.streaming = false;
+            }
+            app.push_info("Loading " + path + " …");
+            std::string err;
+            if (!app.client.load_model(path, app.cfg.api_key, err)) {
+                app.push_error(err);
+                return true;
+            }
+            app.cfg.model_path = path;
+            app.bubbles.clear();
+            app.history.clear();
+            std::string cerr;
+            (void)app.client.clear_slot(app.cfg.slot, app.cfg.api_key, cerr);
+            app.refresh_health();
+            app.push_info("Loaded · " + app.health.model_name + " · " + app.health.architecture);
+            return true;
+        }
+        // Treat bare path as load for convenience: /model models/real/foo.gguf
+        if (sub.find('/') != std::string::npos || sub.find(".gguf") != std::string::npos) {
+            path = path.empty() ? sub : (sub + " " + path);
+            path = trim(path);
+            if (app.streaming) {
+                app.client.stop();
+                app.streaming = false;
+            }
+            app.push_info("Loading " + path + " …");
+            std::string err;
+            if (!app.client.load_model(path, app.cfg.api_key, err)) {
+                app.push_error(err);
+                return true;
+            }
+            app.cfg.model_path = path;
+            app.bubbles.clear();
+            app.history.clear();
+            std::string cerr;
+            (void)app.client.clear_slot(app.cfg.slot, app.cfg.api_key, cerr);
+            app.refresh_health();
+            app.push_info("Loaded · " + app.health.model_name + " · " + app.health.architecture);
+            return true;
+        }
+        app.push_error("usage: /model | /model list | /model load <path>");
         return true;
     }
     if (cmd == "/temp") {
@@ -863,6 +1023,10 @@ KeyEvent read_key() {
 }
 
 void insert_text(App& app, const std::string& utf8) {
+    if (app.input_hist_idx >= 0) {
+        app.input_hist_idx = -1;
+        app.input_draft.clear();
+    }
     if (app.cursor > app.input.size()) app.cursor = app.input.size();
     app.input.insert(app.cursor, utf8);
     app.cursor += utf8.size();
@@ -871,6 +1035,10 @@ void insert_text(App& app, const std::string& utf8) {
 
 void backspace(App& app) {
     if (app.cursor == 0) return;
+    if (app.input_hist_idx >= 0) {
+        app.input_hist_idx = -1;
+        app.input_draft.clear();
+    }
     // delete one UTF-8 codepoint before cursor
     size_t i = app.cursor;
     do { --i; } while (i > 0 && (static_cast<unsigned char>(app.input[i]) & 0xC0) == 0x80);
@@ -1014,12 +1182,20 @@ int main(int argc, char** argv) {
             app.dirty = true;
             return true;
         }
-        if (ev.key == Key::PgUp || ev.key == Key::WheelUp || ev.key == Key::Up) {
+        if (ev.key == Key::Up) {
+            app.history_up();
+            return true;
+        }
+        if (ev.key == Key::Down) {
+            app.history_down();
+            return true;
+        }
+        if (ev.key == Key::PgUp || ev.key == Key::WheelUp) {
             app.scroll += (ev.key == Key::PgUp ? 8 : 1);
             app.dirty = true;
             return true;
         }
-        if (ev.key == Key::PgDn || ev.key == Key::WheelDown || ev.key == Key::Down) {
+        if (ev.key == Key::PgDn || ev.key == Key::WheelDown) {
             app.scroll -= (ev.key == Key::PgDn ? 8 : 1);
             app.dirty = true;
             return true;
@@ -1056,6 +1232,7 @@ int main(int argc, char** argv) {
             app.cursor = 0;
             app.dirty = true;
             if (!line.empty()) {
+                app.remember_input(line);
                 if (line[0] == '/') handle_slash(app, line);
                 else send_user(app, line);
             }
@@ -1068,6 +1245,59 @@ int main(int argc, char** argv) {
     };
 
     while (app.running && !g_interrupt) {
+        if (app.request_setup) {
+            app.request_setup = false;
+            guard.disable_mouse();
+            std::fputs("\033[2J\033[H", stdout);
+            std::fflush(stdout);
+            jxai::term::WizardResult wr;
+            const bool ok = jxai::term::run_first_run_wizard(wr);
+            std::fputs("\033[2J\033[H", stdout);
+            std::fflush(stdout);
+            guard.enable_mouse();
+            if (!ok || !wr.completed) {
+                app.push_info("Setup cancelled.");
+                app.dirty = true;
+                continue;
+            }
+            const std::string prev_model = app.cfg.model_path;
+            app.cfg.model_path = wr.model_path;
+            app.cfg.host = wr.host;
+            app.cfg.port = wr.port;
+            app.client.set_endpoint(app.cfg.host, app.cfg.port);
+            app.bubbles.clear();
+            app.history.clear();
+            app.input.clear();
+            app.cursor = 0;
+            app.scroll = 0;
+            {
+                std::string cerr;
+                (void)app.client.clear_slot(app.cfg.slot, app.cfg.api_key, cerr);
+            }
+            if (!app.health.online) {
+                std::string eng_err;
+                if (!ensure_engine(app.cfg, engine_pid, eng_err)) {
+                    app.push_error("Could not start engine: " + eng_err);
+                }
+            } else if (!wr.model_path.empty() && wr.model_path != prev_model) {
+                app.push_info("Loading " + wr.model_path + " …");
+                draw_app(app);
+                std::string lerr;
+                if (!app.client.load_model(wr.model_path, app.cfg.api_key, lerr)) {
+                    app.push_error("Model load failed: " + lerr);
+                }
+            }
+            app.refresh_health();
+            if (app.health.online) {
+                app.push_info("Setup done · " + app.health.model_name + " · " +
+                              app.health.architecture);
+            } else {
+                app.push_error("Engine offline after setup.");
+            }
+            app.dirty = true;
+            continue;
+        }
+
         if (g_winch) {
             g_winch = 0;
             app.dirty = true;
