@@ -151,6 +151,24 @@ Note: `serve` without `--port` defaults to **8000**; the launcher, the
 desktop shell, and `moe_config.json` all use **8001**. Pass `--port 8001`
 explicitly to match them.
 
+### Hybrid GPU (llama.cpp) — optional
+
+Default `--backend auto`: if a GPU is detected **and** `llama-server` is
+on `PATH`, in `tools/llama/`, or via `LLAMA_SERVER` / `--llama-server`,
+serve starts llama.cpp and proxies `/v1/chat/completions`. **No GPU →
+native moe_engine CPU (unchanged).**
+
+```bash
+# one-time: fetch a llama.cpp release binary
+bash scripts/fetch_llama_server.sh          # Linux/macOS
+# pwsh scripts/fetch_llama_server.ps1       # Windows (CUDA zip by default)
+
+./build/moe_engine serve --model models/real/gemma-3-1b-it-Q4_K_M.gguf \
+  --backend auto --host 127.0.0.1 --port 8001 --web-dir web/dist
+# force native CPU even on a GPU PC:
+./build/moe_engine serve --model … --backend cpu …
+```
+
 ### Interactive CLI chat
 
 ```bash
@@ -323,8 +341,16 @@ results and the command that produced them.
   *slower* than AVX2 on prefill (287.6 vs 57.0 ms/forward), and they have
   no dedicated Test 1 assertions. Opt in with `MOE_AVX512=1` only if you
   measure a win on your hardware.
-- **Vulkan:** device detection only. No Vulkan compute kernels are
-  implemented; inference runs on CPU. Do not expect GPU acceleration.
+- **Vulkan (native engine):** device detection only inside `moe_engine`.
+  The native kernels do not run GPU compute.
+- **Hybrid GPU (`--backend auto`):** when a GPU is present **and** a
+  `llama-server` binary is available, `moe_engine serve` starts llama.cpp
+  as an upstream and proxies OpenAI `/v1/*` chat through it (CUDA when
+  NVIDIA is detected, otherwise Vulkan-capable llama builds). PCs
+  **without** a GPU keep the current native CPU engine unchanged. Force
+  either path with `--backend cpu` or `--backend llama`. Install the
+  binary via `scripts/fetch_llama_server.sh` / `.ps1` into `tools/llama/`,
+  or set `LLAMA_SERVER` / `--llama-server`.
 - **I/O (Linux):** synchronous `pread()` + `mmap` with background prefetch
   of the next layer's experts while the current layer computes. This is
   **not** async I/O, io_uring, or DMA — older docs that said otherwise
@@ -475,14 +501,18 @@ The short list:
 5. **SystemOne at baseline** on the built-in sentiment set (10/30).
 6. **IQ quantizers are simplified** (no importance matrix); IQ
    dequantizers drop remainders on direct calls.
-7. **Vulkan is device detection only**; no GPU compute kernels.
-8. **Windows packages** are built by CI (MSVC) and published as
+7. **Native Vulkan is detection-only**; GPU chat uses the hybrid
+   llama.cpp path (`--backend auto`), not in-process Vulkan kernels.
+8. **Hybrid llama.cpp** needs a separate `llama-server` binary; without
+   it (or without a GPU), serve stays on native CPU. Large models on GPU
+   depend on the llama.cpp build you install (CUDA vs Vulkan).
+9. **Windows packages** are built by CI (MSVC) and published as
    `jxai-windows-x64.zip`; treat end-to-end Windows *runtime* as
    best-effort until someone validates a downloaded zip on a host.
    Desktop UI config still defaults to `models/test_qwen.gguf`
    (launchers refuse it).
-9. **True deepseek/deepseek2 arch unverified** (see §4).
-10. **No default model in a clean clone** — live API tests / launcher
+10. **True deepseek/deepseek2 arch unverified** (see §4).
+11. **No default model in a clean clone** — live API tests / launcher
     need a downloaded GGUF or `MOE_MODEL`.
 
 ---

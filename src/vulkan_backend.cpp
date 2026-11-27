@@ -1,5 +1,7 @@
 #include "vulkan_backend.h"
+#include <cctype>
 #include <iostream>
+#include <string>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -98,8 +100,12 @@ bool VulkanComputeBackend::init(std::string& err_msg) {
     auto get_proc = reinterpret_cast<PFN_vkGetInstanceProcAddr>(dlsym(hMod, "vkGetInstanceProcAddr"));
 #endif
 
-    std::string detected_gpu = "Vulkan 1.3 Compatible Compute Device";
-    uint32_t maj = 1, min = 3;
+    // Honest detection: only report available when a real physical device
+    // enumerates. Loading libvulkan.so alone (or a software ICD) is not a GPU.
+    std::string detected_gpu;
+    uint32_t maj = 0, min = 0;
+    bool found_device = false;
+    uint32_t device_type = 4; // VK_PHYSICAL_DEVICE_TYPE_CPU = 4
 
     if (get_proc) {
         auto vkCreateInstance = reinterpret_cast<PFN_vkCreateInstance>(get_proc(nullptr, "vkCreateInstance"));
@@ -125,15 +131,32 @@ bool VulkanComputeBackend::init(std::string& err_msg) {
                     if (vkEnumPhys(vk_inst, &dev_count, nullptr) == 0 && dev_count > 0) {
                         std::vector<void*> devs(dev_count);
                         if (vkEnumPhys(vk_inst, &dev_count, devs.data()) == 0) {
-                            struct VkPhysProps {
-                                uint32_t apiVersion; uint32_t driverVersion; uint32_t vendorID;
-                                uint32_t deviceID; uint32_t deviceType; char deviceName[256];
-                                uint8_t pipelineCacheUUID[16]; uint8_t rest[1024];
-                            } props{};
-                            vkGetProps(devs[0], &props);
-                            detected_gpu = props.deviceName;
-                            maj = (props.apiVersion >> 22) & 0x3FF;
-                            min = (props.apiVersion >> 12) & 0x3FF;
+                            // Prefer a discrete/integrated GPU over CPU/software devices.
+                            for (uint32_t i = 0; i < dev_count; ++i) {
+                                struct VkPhysProps {
+                                    uint32_t apiVersion; uint32_t driverVersion; uint32_t vendorID;
+                                    uint32_t deviceID; uint32_t deviceType; char deviceName[256];
+                                    uint8_t pipelineCacheUUID[16]; uint8_t rest[1024];
+                                } props{};
+                                vkGetProps(devs[i], &props);
+                                std::string name = props.deviceName;
+                                std::string lower = name;
+                                for (char& c : lower) c = static_cast<char>(tolower(static_cast<unsigned char>(c)));
+                                const bool software =
+                                    lower.find("llvmpipe") != std::string::npos ||
+                                    lower.find("lavapipe") != std::string::npos ||
+                                    lower.find("swiftshader") != std::string::npos ||
+                                    lower.find("softpipe") != std::string::npos ||
+                                    props.deviceType == 4; // CPU
+                                if (software) continue;
+                                detected_gpu = name;
+                                maj = (props.apiVersion >> 22) & 0x3FF;
+                                min = (props.apiVersion >> 12) & 0x3FF;
+                                device_type = props.deviceType;
+                                found_device = true;
+                                // Prefer discrete (2) then integrated (1).
+                                if (props.deviceType == 2) break;
+                            }
                         }
                     }
                 }
@@ -142,15 +165,23 @@ bool VulkanComputeBackend::init(std::string& err_msg) {
         }
     }
 
+    if (!found_device) {
+        err_msg = "No usable Vulkan GPU device (software/CPU ICDs ignored).";
+        device_info_.available = false;
+        device_info_.device_name.clear();
+        return false;
+    }
+
     device_info_.available = true;
     device_info_.device_name = detected_gpu;
     device_info_.api_version_major = maj;
     device_info_.api_version_minor = min;
-    device_info_.device_memory_bytes = 4ULL * 1024 * 1024 * 1024;
-    device_info_.has_subgroups = true;
-    device_info_.subgroup_size = 32;
-    device_info_.has_cooperative_matrix = true;
-    device_info_.max_compute_work_group_invocations = 1024;
+    device_info_.device_memory_bytes = 0; // unknown without memory queries
+    device_info_.has_subgroups = false;
+    device_info_.subgroup_size = 0;
+    device_info_.has_cooperative_matrix = false;
+    device_info_.max_compute_work_group_invocations = 0;
+    (void)device_type;
 
     return true;
 }

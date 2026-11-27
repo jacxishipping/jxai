@@ -85,6 +85,12 @@ public:
     HttpServer(MoETransformerEngine& engine, const std::string& web_root = "web/dist");
     ~HttpServer();
 
+    // Hybrid: forward OpenAI chat/completions (and related) to an upstream
+    // llama-server. Native moe_engine remains for PCs without GPU.
+    void set_llama_upstream(const std::string& host, uint16_t port,
+                            const std::string& backend_label,
+                            bool using_gpu);
+
     // Start listening on `port` (blocking loop until stop() is called).
     // Binds to `host` (default 127.0.0.1). A non-loopback host with no API
     // key configured is refused unless `allow_insecure_remote` is true.
@@ -95,6 +101,10 @@ public:
 
 private:
     void handle_client(uintptr_t client_sock);
+    // Returns true when the request was fully handled via upstream proxy.
+    bool proxy_to_llama(uintptr_t client_sock, const std::string& method,
+                        const std::string& path, const std::string& headers,
+                        const std::string& body);
 
     MoETransformerEngine& engine_;
     std::string web_root_;
@@ -119,6 +129,12 @@ private:
     // takes its own mutex internally), so no deadlock cycle exists.
     std::mutex slot_mutexes_[64];
     uintptr_t listen_sock_ = ~static_cast<uintptr_t>(0);
+
+    // llama.cpp upstream (empty host = disabled → native engine).
+    std::string llama_upstream_host_;
+    uint16_t llama_upstream_port_ = 0;
+    std::string llama_backend_label_;
+    bool llama_using_gpu_ = false;
 };
 
 } // namespace moe

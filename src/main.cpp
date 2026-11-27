@@ -1,6 +1,7 @@
 #include "common.h"
 #include "transformer.h"
 #include "gguf.h"
+#include "llama_bridge.h"
 #include "model_forge.h"
 #include "model_pull.h"
 #include "server.h"
@@ -53,6 +54,8 @@ void print_usage() {
               << "                                                [prefill/decode timing: prefill ms + tok/s, decode tok/s, per-forward matmul/attn/lm_head split]\n"
               << "  moe_engine info <model>                        [compatibility report: arch, RoPE, tokenizer, chat template, quant types]\n"
               << "  moe_engine serve  --model <file> [--port 8000] [--host 127.0.0.1] [--allow-insecure-remote] [--web-dir web/dist]\n"
+              << "                    [--backend auto|cpu|llama] [--llama-server <path>] [--llama-port 8010]\n"
+              << "                    [auto: GPU+llama-server → llama.cpp; no GPU → native CPU]\n"
               << "  moe_engine studio [--model <file>] [--port 8000] [launch native C++ Windows desktop app]\n"
               << "  moe_engine pull   <repo|url> [--out <dir>]       [stream & verify models from Hugging Face hub]\n"
               << "  moe_engine pull --list <repo>                  [list available .gguf files (no download)]\n"
@@ -1792,6 +1795,9 @@ int main(int argc, char* argv[]) {
     uint32_t max_tokens = 64;
     bool enable_speculative = false;
     float cli_temp = 0.7f;
+    InferenceBackend backend_mode = InferenceBackend::Auto;
+    std::string llama_server_bin;
+    uint16_t llama_port = 8010;
 
     for (int i = 2; i < argc; ++i) {
         std::string arg = argv[i];
@@ -1805,6 +1811,16 @@ int main(int argc, char* argv[]) {
         else if (arg == "--tokens" && i + 1 < argc) max_tokens = static_cast<uint32_t>(std::stoul(argv[++i]));
         else if (arg == "--temperature" && i + 1 < argc) cli_temp = std::stof(argv[++i]);
         else if (arg == "--speculative") enable_speculative = true;
+        else if (arg == "--backend" && i + 1 < argc) {
+            if (!parse_inference_backend(argv[++i], backend_mode)) {
+                std::cerr << "Invalid --backend (use auto|cpu|llama)\n";
+                return 1;
+            }
+        } else if (arg == "--llama-server" && i + 1 < argc) {
+            llama_server_bin = argv[++i];
+        } else if (arg == "--llama-port" && i + 1 < argc) {
+            llama_port = static_cast<uint16_t>(std::stoi(argv[++i]));
+        }
     }
 
     if (mode == "forge") {
@@ -2093,22 +2109,61 @@ int main(int argc, char* argv[]) {
 
     MoETransformerEngine engine;
     std::string err_msg;
-    std::cout << "[INIT] Loading Model: " << model_path << "...\n";
-    if (!engine.load_model(model_path, err_msg)) {
-        std::cerr << "Failed to load model: " << err_msg << "\n";
-        return 1;
+    LlamaBridge llama_bridge;
+    bool use_llama = false;
+
+    // Hybrid serve: GPU PCs with llama-server use llama.cpp; PCs without GPU
+    // keep the native moe_engine CPU path unchanged.
+    if (mode == "serve") {
+        LlamaGpuInfo gpu = probe_llama_gpu();
+        std::string why;
+        if (should_try_llama_backend(backend_mode, gpu, why)) {
+            std::cout << "[HYBRID] " << why << " (" << gpu.detail << ")\n";
+            LlamaBridgeConfig lcfg;
+            lcfg.server_bin = llama_server_bin;
+            lcfg.model_path = model_path;
+            lcfg.host = "127.0.0.1";
+            lcfg.port = llama_port;
+            if (!start_llama_server(lcfg, gpu, llama_bridge, err_msg)) {
+                if (backend_mode == InferenceBackend::Llama) {
+                    std::cerr << "[ERROR] Forced --backend llama failed: " << err_msg << "\n";
+                    return 1;
+                }
+                std::cout << "[HYBRID] llama.cpp unavailable (" << err_msg
+                          << "); falling back to native moe_engine CPU.\n";
+            } else {
+                use_llama = true;
+            }
+        } else {
+            std::cout << "[HYBRID] " << why << " (" << gpu.detail << ")\n";
+        }
     }
 
-    const auto& hw = engine.hardware();
-    const auto& hp = engine.hparams();
-    std::cout << "\033[1;32m[ENGINE READY]\033[0m\n"
-              << "  Model Name:       " << hp.model_name << " (" << hp.arch << ")\n"
-              << "  Dense Backbone:   " << (engine.dense_backbone_bytes() / 1024) << " KB (in RAM/VRAM zero-copy)\n"
-              << "  Sparse NVMe MoE:  " << (engine.sparse_disk_bytes() / 1024) << " KB (streamed on-demand)\n"
-              << "  Experts / Layer:  " << hp.n_experts << " (active top-" << hp.n_experts_used << ")\n"
-              << "  SIMD Backend:     " << hw.simd_backend << " (" << hw.logical_cores << " threads)\n"
-              << "  Async I/O:        " << hw.io_backend << "\n"
-              << "  Speculative MTP:  " << (enable_speculative ? "ENABLED" : "DISABLED") << "\n\n";
+    if (!use_llama) {
+        std::cout << "[INIT] Loading Model: " << model_path << "...\n";
+        if (!engine.load_model(model_path, err_msg)) {
+            std::cerr << "Failed to load model: " << err_msg << "\n";
+            stop_llama_server(llama_bridge);
+            return 1;
+        }
+
+        const auto& hw = engine.hardware();
+        const auto& hp = engine.hparams();
+        std::cout << "\033[1;32m[ENGINE READY]\033[0m\n"
+                  << "  Model Name:       " << hp.model_name << " (" << hp.arch << ")\n"
+                  << "  Dense Backbone:   " << (engine.dense_backbone_bytes() / 1024) << " KB (in RAM/VRAM zero-copy)\n"
+                  << "  Sparse NVMe MoE:  " << (engine.sparse_disk_bytes() / 1024) << " KB (streamed on-demand)\n"
+                  << "  Experts / Layer:  " << hp.n_experts << " (active top-" << hp.n_experts_used << ")\n"
+                  << "  SIMD Backend:     " << hw.simd_backend << " (" << hw.logical_cores << " threads)\n"
+                  << "  Async I/O:        " << hw.io_backend << "\n"
+                  << "  Speculative MTP:  " << (enable_speculative ? "ENABLED" : "DISABLED") << "\n\n";
+    } else {
+        std::cout << "\033[1;32m[HYBRID READY]\033[0m " << llama_bridge.backend_label << "\n"
+                  << "  Upstream:         http://" << llama_bridge.upstream_host << ":"
+                  << llama_bridge.upstream_port << "\n"
+                  << "  GPU compute:      " << (llama_bridge.using_gpu ? "yes" : "no") << "\n"
+                  << "  Public gateway:   same OpenAI /v1 API (proxied)\n\n";
+    }
 
     if (mode == "chat") {
         if (has_cli_prompt) {
@@ -2197,16 +2252,31 @@ int main(int argc, char* argv[]) {
             }
         }
         std::cout << "\033[1;32m[GATEWAY STARTING]\033[0m Host: " << host << ", Port: " << port << ", Web Root: " << web_dir << "\n";
+        if (use_llama) {
+            std::cout << "  -> Backend:              " << llama_bridge.backend_label
+                      << " (proxied; native CPU unused)\n";
+        } else {
+            std::cout << "  -> Backend:              native moe_engine CPU\n";
+        }
         std::cout << "  -> Web UI:               http://" << host << ":" << port << "/\n"
                   << "  -> OpenAI Chat Endpoint: http://" << host << ":" << port << "/v1/chat/completions\n"
-                  << "  -> Health Endpoint:      http://" << host << ":" << port << "/health\n"
-                  << "  -> Telemetry Profile:    http://" << host << ":" << port << "/profile\n"
-                  << "  -> Cortex Atlas Hitmap:  http://" << host << ":" << port << "/experts\n"
-                  << "  -> SystemOne Classifier: http://" << host << ":" << port << "/v1/systemone\n"
-                  << "  -> Neural Latent Image:  http://" << host << ":" << port << "/v1/images/generations\n\n";
+                  << "  -> Health Endpoint:      http://" << host << ":" << port << "/health\n";
+        if (!use_llama) {
+            std::cout << "  -> Telemetry Profile:    http://" << host << ":" << port << "/profile\n"
+                      << "  -> Cortex Atlas Hitmap:  http://" << host << ":" << port << "/experts\n"
+                      << "  -> SystemOne Classifier: http://" << host << ":" << port << "/v1/systemone\n"
+                      << "  -> Neural Latent Image:  http://" << host << ":" << port << "/v1/images/generations\n";
+        }
+        std::cout << "\n";
 
         HttpServer server(engine, web_dir);
-        if (!server.start(port, err_msg, host, allow_insecure_remote)) {
+        if (use_llama) {
+            server.set_llama_upstream(llama_bridge.upstream_host, llama_bridge.upstream_port,
+                                      llama_bridge.backend_label, llama_bridge.using_gpu);
+        }
+        bool ok = server.start(port, err_msg, host, allow_insecure_remote);
+        stop_llama_server(llama_bridge);
+        if (!ok) {
             std::cerr << "Server error: " << err_msg << "\n";
             return 1;
         }
@@ -2342,6 +2412,8 @@ int main(int argc, char* argv[]) {
             bench_quants += kv.first + " x" + std::to_string(kv.second);
         }
 
+        const auto& hw = engine.hardware();
+        const auto& hp = engine.hparams();
         std::cout << std::fixed << std::setprecision(1)
                   << "[BENCH] model: " << model_path << " (" << hp.arch << ")\n"
                   << "  cpu: " << hw.cpu_brand << " (" << hw.simd_backend << ", " << hw.logical_cores << " cores)\n"
