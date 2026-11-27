@@ -36,6 +36,18 @@ namespace moe {
 
 namespace {
 
+#ifdef _WIN32
+// Winsock must be up before inet_pton / getaddrinfo. Server start already
+// calls WSAStartup; pull/URL policy can run earlier (e.g. moe_engine test).
+bool ensure_winsock() {
+    static const bool ok = [] {
+        WSADATA wsa{};
+        return ::WSAStartup(MAKEWORD(2, 2), &wsa) == 0;
+    }();
+    return ok;
+}
+#endif
+
 // ---------------------------------------------------------------------------
 // Validation helpers. Nothing that reaches a shell or a URL is trusted:
 // the download path below never invokes a shell at all (fork/exec curl on
@@ -204,6 +216,13 @@ bool pull_url_is_safe_impl(const std::string& url, std::string& err_msg) {
         err_msg = "URL has no path (a model file is required): '" + url + "'";
         return false;
     }
+#ifdef _WIN32
+    // inet_pton below needs Winsock initialized on Windows.
+    if (!ensure_winsock()) {
+        err_msg = "WSAStartup failed (cannot validate download URLs on Windows)";
+        return false;
+    }
+#endif
     // Literal IPv4?
     struct in_addr v4 {};
     if (::inet_pton(AF_INET, host.c_str(), &v4) == 1) {
@@ -1104,8 +1123,31 @@ bool pull_url_host_is_public(const std::string& url, std::string& err_msg) {
         err_msg = "URL has no usable host: '" + url + "'";
         return false;
     }
-    // Literal IPs were already checked by pull_url_is_safe(); a hostname
-    // needs a real DNS lookup. Fail closed: unresolvable == rejected.
+#ifdef _WIN32
+    if (!ensure_winsock()) {
+        err_msg = "WSAStartup failed (cannot resolve download hosts on Windows)";
+        return false;
+    }
+#endif
+    // Literal IPs: check without DNS (and without needing a working resolver
+    // on CI). pull_url_is_safe already applied the same public-IP rules.
+    struct in_addr v4 {};
+    if (::inet_pton(AF_INET, host.c_str(), &v4) == 1) {
+        if (!is_public_ipv4(ntohl(v4.s_addr))) {
+            err_msg = "Download host is not a public address: '" + host + "'";
+            return false;
+        }
+        return true;
+    }
+    struct in6_addr v6 {};
+    if (::inet_pton(AF_INET6, host.c_str(), &v6) == 1) {
+        if (!is_public_ipv6(v6.s6_addr)) {
+            err_msg = "Download host is not a public address: '" + host + "'";
+            return false;
+        }
+        return true;
+    }
+    // Hostname: real DNS lookup. Fail closed: unresolvable == rejected.
     // (DNS rebinding is the reason this runs even for huggingface.co:
     // a poisoned resolver could otherwise point the trusted name at a
     // private address and receive the request — and the token.)
@@ -1146,7 +1188,10 @@ bool effective_download_url_is_safe(const std::string& url, std::string& err_msg
     const size_t cut = base.find_first_of("?#");
     if (cut != std::string::npos) base.resize(cut);
     if (!pull_url_is_safe(base, err_msg)) return false;
-    return pull_url_host_is_public(url, err_msg);
+    // Host check uses the stripped base (query/fragment are not part of the
+    // authority). Passing the raw signed URL was fine for url_host(), but
+    // kept an unnecessary dependency on DNS for the public-IP test cases.
+    return pull_url_host_is_public(base, err_msg);
 }
 
 std::string sha256_hex(const uint8_t* data, size_t len) {
