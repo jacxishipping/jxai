@@ -76,8 +76,10 @@ bool pull_url_host_is_public(const std::string& url, std::string& err_msg);
 bool url_is_huggingface(const std::string& url);
 
 // Validate a URL curl actually ended up fetching (after redirects):
-// same rules as pull_url_is_safe() plus the DNS stage. A download whose
-// effective URL fails this check is deleted, not promoted.
+// HTTPS + public host (DNS stage), like pull_url_is_safe(), but query
+// strings / fragments are allowed so Hugging Face CDN signed redirects
+// (*.cdn.hf.co, cdn-lfs) work. A download whose effective URL fails this
+// check is deleted, not promoted. Caller-supplied pull URLs still reject `?`.
 bool effective_download_url_is_safe(const std::string& url, std::string& err_msg);
 
 // SHA-256 (FIPS 180-4, self-contained). Lowercase hex digest.
