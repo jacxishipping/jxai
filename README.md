@@ -122,6 +122,24 @@ Useful options: `./start_jxai.sh --model <path> --port <n> --host <addr>
 --no-build`. `--public` was removed: this launcher never starts Open WebUI
 or a public tunnel.
 
+### JX Calc (mini Gemma calculator UI)
+
+Self-contained calculator at `web/calculator/` — instant local keypad plus
+natural-language Ask → `/v1/chat/completions` on the same origin.
+
+```bash
+# needs a GGUF (default: Gemma 3 1B IT Q4_K_M under models/real/)
+./start_jxai_calc.sh
+# open http://127.0.0.1:8001/
+```
+
+Or manually:
+
+```bash
+./build/moe_engine serve --model models/real/gemma-3-1b-it-Q4_K_M.gguf \
+  --host 127.0.0.1 --port 8001 --web-dir web/calculator
+```
+
 ### Manual serve (no launcher)
 
 ```bash

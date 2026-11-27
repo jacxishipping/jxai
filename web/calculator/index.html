@@ -1,0 +1,630 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>JX Calc — Gemma on the side</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=Syne:wght@600;700;800&display=swap" rel="stylesheet" />
+  <style>
+    :root {
+      --ink: #1a211c;
+      --paper: #e8efe6;
+      --paper-deep: #d4ddd0;
+      --mint: #1f8a6a;
+      --mint-bright: #2db88a;
+      --copper: #c47a3a;
+      --copper-soft: #e0a56a;
+      --muted: #5c6b62;
+      --danger: #b84a3a;
+      --key: rgba(255, 255, 255, 0.55);
+      --key-ink: #1a211c;
+      --shadow: 0 24px 60px rgba(26, 33, 28, 0.18);
+      --radius: 22px;
+    }
+
+    * { box-sizing: border-box; }
+
+    html, body {
+      margin: 0;
+      min-height: 100%;
+      font-family: "Syne", system-ui, sans-serif;
+      color: var(--ink);
+      background:
+        radial-gradient(1200px 700px at 12% -10%, rgba(45, 184, 138, 0.22), transparent 55%),
+        radial-gradient(900px 600px at 100% 0%, rgba(196, 122, 58, 0.18), transparent 50%),
+        linear-gradient(165deg, #f4f7f2 0%, #dfe8db 45%, #cfdccb 100%);
+      background-attachment: fixed;
+    }
+
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: 0.35;
+      background-image:
+        linear-gradient(rgba(26, 33, 28, 0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(26, 33, 28, 0.04) 1px, transparent 1px);
+      background-size: 28px 28px;
+      mask-image: radial-gradient(ellipse at center, black 30%, transparent 75%);
+    }
+
+    .stage {
+      position: relative;
+      min-height: 100vh;
+      display: grid;
+      place-items: center;
+      padding: 28px 18px 40px;
+    }
+
+    .calc {
+      width: min(420px, 100%);
+      display: flex;
+      flex-direction: column;
+      gap: 14px;
+      animation: rise 0.7s cubic-bezier(0.2, 0.8, 0.2, 1) both;
+    }
+
+    @keyframes rise {
+      from { opacity: 0; transform: translateY(18px) scale(0.985); }
+      to { opacity: 1; transform: none; }
+    }
+
+    .brand {
+      display: flex;
+      align-items: baseline;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 0 4px;
+    }
+
+    .brand h1 {
+      margin: 0;
+      font-size: clamp(2.4rem, 8vw, 3.2rem);
+      font-weight: 800;
+      letter-spacing: -0.04em;
+      line-height: 0.95;
+    }
+
+    .brand h1 span {
+      color: var(--mint);
+    }
+
+    .brand p {
+      margin: 0;
+      max-width: 11rem;
+      text-align: right;
+      font-size: 0.78rem;
+      font-weight: 600;
+      letter-spacing: 0.02em;
+      color: var(--muted);
+      line-height: 1.35;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, rgba(255,255,255,0.72), rgba(255,255,255,0.48));
+      border: 1px solid rgba(26, 33, 28, 0.08);
+      border-radius: var(--radius);
+      box-shadow: var(--shadow);
+      backdrop-filter: blur(14px);
+      padding: 16px;
+    }
+
+    .display {
+      min-height: 108px;
+      padding: 18px 18px 14px;
+      border-radius: 16px;
+      background:
+        linear-gradient(160deg, #1f2923 0%, #15201a 100%);
+      color: #edf5ef;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      display: flex;
+      flex-direction: column;
+      justify-content: flex-end;
+      gap: 6px;
+      overflow: hidden;
+      position: relative;
+    }
+
+    .display::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      background: linear-gradient(120deg, transparent 40%, rgba(45, 184, 138, 0.08), transparent 70%);
+      pointer-events: none;
+      animation: sheen 4.5s ease-in-out infinite;
+    }
+
+    @keyframes sheen {
+      0%, 100% { opacity: 0.35; transform: translateX(-8%); }
+      50% { opacity: 0.7; transform: translateX(8%); }
+    }
+
+    .expr {
+      font-size: 0.85rem;
+      color: rgba(237, 245, 239, 0.55);
+      min-height: 1.2em;
+      white-space: nowrap;
+      overflow: hidden;
+      text-overflow: ellipsis;
+    }
+
+    .value {
+      font-size: clamp(2rem, 8vw, 2.6rem);
+      font-weight: 500;
+      letter-spacing: -0.03em;
+      line-height: 1.1;
+      word-break: break-all;
+      transition: transform 0.15s ease, opacity 0.15s ease;
+    }
+
+    .value.pulse {
+      animation: tick 0.18s ease;
+    }
+
+    @keyframes tick {
+      0% { transform: scale(0.98); opacity: 0.7; }
+      100% { transform: none; opacity: 1; }
+    }
+
+    .status {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 10px;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: 0.04em;
+      text-transform: uppercase;
+    }
+
+    .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: var(--danger);
+      box-shadow: 0 0 0 3px rgba(184, 74, 58, 0.15);
+    }
+
+    .dot.ok {
+      background: var(--mint-bright);
+      box-shadow: 0 0 0 3px rgba(45, 184, 138, 0.18);
+    }
+
+    .dot.busy {
+      background: var(--copper);
+      box-shadow: 0 0 0 3px rgba(196, 122, 58, 0.2);
+      animation: blink 0.9s ease infinite;
+    }
+
+    @keyframes blink {
+      50% { opacity: 0.45; }
+    }
+
+    .ask {
+      display: grid;
+      grid-template-columns: 1fr auto;
+      gap: 8px;
+      margin-top: 12px;
+    }
+
+    .ask input {
+      border: 1px solid rgba(26, 33, 28, 0.12);
+      border-radius: 12px;
+      padding: 12px 14px;
+      font: 500 0.92rem/1.2 "Syne", sans-serif;
+      color: var(--ink);
+      background: rgba(255, 255, 255, 0.7);
+      outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+
+    .ask input:focus {
+      border-color: var(--mint);
+      box-shadow: 0 0 0 3px rgba(31, 138, 106, 0.15);
+    }
+
+    .ask button, .key {
+      appearance: none;
+      border: 0;
+      cursor: pointer;
+      font-family: inherit;
+      user-select: none;
+      -webkit-tap-highlight-color: transparent;
+    }
+
+    .ask button {
+      border-radius: 12px;
+      padding: 0 16px;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+      color: white;
+      background: linear-gradient(160deg, var(--mint-bright), var(--mint));
+      box-shadow: 0 8px 18px rgba(31, 138, 106, 0.28);
+      transition: transform 0.12s ease, filter 0.12s ease;
+    }
+
+    .ask button:hover { filter: brightness(1.05); }
+    .ask button:active { transform: scale(0.97); }
+    .ask button:disabled {
+      opacity: 0.55;
+      cursor: wait;
+      transform: none;
+    }
+
+    .gemma-out {
+      margin-top: 10px;
+      min-height: 0;
+      max-height: 120px;
+      overflow: auto;
+      font-family: "IBM Plex Mono", ui-monospace, monospace;
+      font-size: 0.8rem;
+      line-height: 1.45;
+      color: var(--ink);
+      white-space: pre-wrap;
+      opacity: 0;
+      transform: translateY(4px);
+      transition: opacity 0.25s ease, transform 0.25s ease;
+    }
+
+    .gemma-out.show {
+      opacity: 1;
+      transform: none;
+      padding: 10px 12px;
+      border-radius: 12px;
+      background: rgba(31, 138, 106, 0.08);
+      border: 1px solid rgba(31, 138, 106, 0.16);
+    }
+
+    .pad {
+      display: grid;
+      grid-template-columns: repeat(4, 1fr);
+      gap: 10px;
+    }
+
+    .key {
+      height: 62px;
+      border-radius: 16px;
+      font-size: 1.25rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      color: var(--key-ink);
+      background: var(--key);
+      border: 1px solid rgba(26, 33, 28, 0.06);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.65) inset, 0 8px 16px rgba(26, 33, 28, 0.06);
+      transition: transform 0.08s ease, background 0.12s ease, box-shadow 0.12s ease;
+    }
+
+    .key:hover { background: rgba(255, 255, 255, 0.78); }
+    .key:active, .key.pressed {
+      transform: translateY(1px) scale(0.97);
+      box-shadow: 0 1px 0 rgba(255,255,255,0.4) inset;
+    }
+
+    .key.op {
+      color: var(--mint);
+      background: rgba(31, 138, 106, 0.12);
+    }
+
+    .key.util {
+      color: var(--copper);
+      background: rgba(196, 122, 58, 0.12);
+      font-size: 1rem;
+    }
+
+    .key.eq {
+      color: white;
+      background: linear-gradient(160deg, var(--copper-soft), var(--copper));
+      box-shadow: 0 10px 22px rgba(196, 122, 58, 0.28);
+    }
+
+    .key.zero { grid-column: span 2; }
+
+    .foot {
+      text-align: center;
+      font-size: 0.72rem;
+      font-weight: 600;
+      color: var(--muted);
+      letter-spacing: 0.03em;
+    }
+
+    .foot code {
+      font-family: "IBM Plex Mono", monospace;
+      font-size: 0.68rem;
+      background: rgba(26, 33, 28, 0.06);
+      padding: 2px 6px;
+      border-radius: 6px;
+    }
+
+    @media (max-width: 420px) {
+      .key { height: 56px; }
+      .brand { flex-direction: column; align-items: flex-start; }
+      .brand p { text-align: left; max-width: none; }
+    }
+  </style>
+</head>
+<body>
+  <main class="stage">
+    <div class="calc" id="app">
+      <header class="brand">
+        <h1>JX<span>Calc</span></h1>
+        <p>Keypad is instant.<br />Hard questions go to Gemma.</p>
+      </header>
+
+      <section class="panel">
+        <div class="display" aria-live="polite">
+          <div class="expr" id="expr"></div>
+          <div class="value" id="value">0</div>
+        </div>
+
+        <div class="status">
+          <span class="dot" id="dot"></span>
+          <span id="engineLabel">checking engine…</span>
+        </div>
+
+        <form class="ask" id="askForm">
+          <input id="askInput" type="text" autocomplete="off" placeholder="Ask Gemma: 17 chickens, 86 legs…" />
+          <button type="submit" id="askBtn">Ask</button>
+        </form>
+        <div class="gemma-out" id="gemmaOut"></div>
+      </section>
+
+      <section class="panel pad" id="pad" aria-label="Calculator keypad">
+        <button class="key util" data-act="clear">AC</button>
+        <button class="key util" data-act="sign">±</button>
+        <button class="key util" data-act="percent">%</button>
+        <button class="key op" data-act="op" data-op="÷">÷</button>
+
+        <button class="key" data-act="digit" data-d="7">7</button>
+        <button class="key" data-act="digit" data-d="8">8</button>
+        <button class="key" data-act="digit" data-d="9">9</button>
+        <button class="key op" data-act="op" data-op="×">×</button>
+
+        <button class="key" data-act="digit" data-d="4">4</button>
+        <button class="key" data-act="digit" data-d="5">5</button>
+        <button class="key" data-act="digit" data-d="6">6</button>
+        <button class="key op" data-act="op" data-op="−">−</button>
+
+        <button class="key" data-act="digit" data-d="1">1</button>
+        <button class="key" data-act="digit" data-d="2">2</button>
+        <button class="key" data-act="digit" data-d="3">3</button>
+        <button class="key op" data-act="op" data-op="+">+</button>
+
+        <button class="key zero" data-act="digit" data-d="0">0</button>
+        <button class="key" data-act="dot">.</button>
+        <button class="key eq" data-act="eq">=</button>
+      </section>
+
+      <p class="foot">Talks to <code>/v1/chat/completions</code> on this origin · Gemma for word problems</p>
+    </div>
+  </main>
+
+  <script>
+    (() => {
+      const valueEl = document.getElementById("value");
+      const exprEl = document.getElementById("expr");
+      const dotEl = document.getElementById("dot");
+      const engineLabel = document.getElementById("engineLabel");
+      const askForm = document.getElementById("askForm");
+      const askInput = document.getElementById("askInput");
+      const askBtn = document.getElementById("askBtn");
+      const gemmaOut = document.getElementById("gemmaOut");
+
+      let display = "0";
+      let stored = null;
+      let pendingOp = null;
+      let fresh = true;
+      let engineOnline = false;
+
+      const fmt = (n) => {
+        if (!Number.isFinite(n)) return "Error";
+        const s = String(Number(n.toPrecision(12)));
+        return s;
+      };
+
+      const render = () => {
+        valueEl.textContent = display;
+        valueEl.classList.remove("pulse");
+        void valueEl.offsetWidth;
+        valueEl.classList.add("pulse");
+        exprEl.textContent = stored !== null && pendingOp
+          ? `${fmt(stored)} ${pendingOp}`
+          : "";
+      };
+
+      const applyOp = (a, op, b) => {
+        switch (op) {
+          case "+": return a + b;
+          case "−": return a - b;
+          case "×": return a * b;
+          case "÷": return b === 0 ? NaN : a / b;
+          default: return b;
+        }
+      };
+
+      const inputDigit = (d) => {
+        if (fresh || display === "0" || display === "Error") {
+          display = d;
+          fresh = false;
+        } else if (display.length < 16) {
+          display += d;
+        }
+        render();
+      };
+
+      const inputDot = () => {
+        if (fresh || display === "Error") {
+          display = "0.";
+          fresh = false;
+        } else if (!display.includes(".")) {
+          display += ".";
+        }
+        render();
+      };
+
+      const setOp = (op) => {
+        const cur = parseFloat(display);
+        if (stored !== null && pendingOp && !fresh) {
+          stored = applyOp(stored, pendingOp, cur);
+          display = fmt(stored);
+        } else {
+          stored = cur;
+        }
+        pendingOp = op;
+        fresh = true;
+        render();
+      };
+
+      const equals = () => {
+        if (pendingOp === null || stored === null) return;
+        const cur = parseFloat(display);
+        const result = applyOp(stored, pendingOp, cur);
+        exprEl.textContent = `${fmt(stored)} ${pendingOp} ${fmt(cur)} =`;
+        display = fmt(result);
+        stored = null;
+        pendingOp = null;
+        fresh = true;
+        valueEl.textContent = display;
+        valueEl.classList.remove("pulse");
+        void valueEl.offsetWidth;
+        valueEl.classList.add("pulse");
+      };
+
+      const clearAll = () => {
+        display = "0";
+        stored = null;
+        pendingOp = null;
+        fresh = true;
+        render();
+      };
+
+      document.getElementById("pad").addEventListener("click", (e) => {
+        const btn = e.target.closest(".key");
+        if (!btn) return;
+        btn.classList.add("pressed");
+        setTimeout(() => btn.classList.remove("pressed"), 120);
+        const act = btn.dataset.act;
+        if (act === "digit") inputDigit(btn.dataset.d);
+        else if (act === "dot") inputDot();
+        else if (act === "op") setOp(btn.dataset.op);
+        else if (act === "eq") equals();
+        else if (act === "clear") clearAll();
+        else if (act === "sign") {
+          if (display !== "0" && display !== "Error") {
+            display = display.startsWith("-") ? display.slice(1) : "-" + display;
+            render();
+          }
+        } else if (act === "percent") {
+          display = fmt(parseFloat(display) / 100);
+          fresh = true;
+          render();
+        }
+      });
+
+      window.addEventListener("keydown", (e) => {
+        if (e.target === askInput) return;
+        const k = e.key;
+        if (k >= "0" && k <= "9") inputDigit(k);
+        else if (k === ".") inputDot();
+        else if (k === "+") setOp("+");
+        else if (k === "-") setOp("−");
+        else if (k === "*") setOp("×");
+        else if (k === "/") { e.preventDefault(); setOp("÷"); }
+        else if (k === "Enter" || k === "=") { e.preventDefault(); equals(); }
+        else if (k === "Escape" || k === "Delete") clearAll();
+        else if (k === "Backspace" && !fresh) {
+          display = display.length <= 1 ? "0" : display.slice(0, -1);
+          if (display === "-") display = "0";
+          render();
+        }
+      });
+
+      const setEngine = (state, label) => {
+        engineOnline = state === "ok";
+        dotEl.className = "dot" + (state === "ok" ? " ok" : state === "busy" ? " busy" : "");
+        engineLabel.textContent = label;
+        askBtn.disabled = state === "busy" || state === "down";
+      };
+
+      const probe = async () => {
+        try {
+          const r = await fetch("/health", { cache: "no-store" });
+          if (!r.ok) throw new Error("bad health");
+          const j = await r.json();
+          const name = j.model_name || j.architecture || "engine";
+          setEngine("ok", `online · ${name}`);
+        } catch {
+          setEngine("down", "engine offline — start serve with Gemma");
+        }
+      };
+
+      const askGemma = async (question) => {
+        setEngine("busy", "gemma thinking…");
+        gemmaOut.classList.remove("show");
+        gemmaOut.textContent = "";
+        try {
+          const r = await fetch("/v1/chat/completions", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              messages: [
+                {
+                  role: "system",
+                  content:
+                    "You solve arithmetic word problems. Reply with one short line of work, then exactly: Answer: <number>. No other text after that."
+                },
+                { role: "user", content: question }
+              ],
+              stream: false,
+              max_tokens: 128,
+              temperature: 0.0
+            })
+          });
+          if (!r.ok) throw new Error("HTTP " + r.status);
+          const j = await r.json();
+          const text =
+            j?.choices?.[0]?.message?.content ||
+            j?.choices?.[0]?.text ||
+            JSON.stringify(j);
+          gemmaOut.textContent = text.trim();
+          gemmaOut.classList.add("show");
+
+          const m =
+            text.match(/Answer:\s*(-?\d+(?:\.\d+)?)/i) ||
+            text.match(/=\s*(-?\d+(?:\.\d+)?)\s*$/m) ||
+            text.match(/(-?\d+(?:\.\d+)?)\s*$/m);
+          if (m) {
+            const num = parseFloat(m[1]);
+            if (Number.isFinite(num)) {
+              display = fmt(num);
+              stored = null;
+              pendingOp = null;
+              fresh = true;
+              render();
+            }
+          }
+          await probe();
+        } catch (err) {
+          gemmaOut.textContent = "Could not reach Gemma: " + err.message;
+          gemmaOut.classList.add("show");
+          setEngine("down", "engine offline");
+        }
+      };
+
+      askForm.addEventListener("submit", (e) => {
+        e.preventDefault();
+        const q = askInput.value.trim();
+        if (!q) return;
+        askGemma(q);
+      });
+
+      probe();
+      setInterval(probe, 8000);
+      render();
+    })();
+  </script>
+</body>
+</html>
