@@ -47,6 +47,29 @@ if ($studio) {
     Write-Warning "moe_studio.exe not found - packaging engine-only zip"
 }
 
+# OpenMP runtime (vcomp*.dll) — required when moe_engine is built with /openmp.
+# Prefer the VS toolchain copy next to cl.exe; fall back to System32.
+$vcompCandidates = @()
+try {
+    $cl = Get-Command cl.exe -ErrorAction SilentlyContinue
+    if ($cl) {
+        $vsRoot = Split-Path (Split-Path (Split-Path $cl.Source))
+        $vcompCandidates += Get-ChildItem -Path $vsRoot -Recurse -Filter "vcomp140.dll" -ErrorAction SilentlyContinue |
+            Select-Object -ExpandProperty FullName
+    }
+} catch {}
+$vcompCandidates += @(
+    "$env:SystemRoot\System32\vcomp140.dll",
+    "$env:SystemRoot\SysWOW64\vcomp140.dll"
+)
+$vcomp = $vcompCandidates | Where-Object { $_ -and (Test-Path $_) } | Select-Object -First 1
+if ($vcomp) {
+    Copy-Item $vcomp (Join-Path $stage "vcomp140.dll")
+    Write-Host "Bundled OpenMP runtime: $vcomp"
+} else {
+    Write-Warning "vcomp140.dll not found - OpenMP may require the VC++ redistributable"
+}
+
 Copy-Item -Recurse (Join-Path $Root "web\dist\*") (Join-Path $stage "web\dist\")
 Copy-Item (Join-Path $Root "start_jxai.bat") $stage
 Copy-Item (Join-Path $Root "run_studio.bat") $stage

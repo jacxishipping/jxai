@@ -40,7 +40,13 @@ if (MSVC)
     # reports this via `moe_engine doctor`; on a non-AVX2 machine the
     # binary may fault (SIGILL) — the portable baseline + runtime dispatch
     # in src/quant.cpp applies to the GCC/Clang build below.
-    target_compile_options(moe_engine PRIVATE /O2 /arch:AVX2 /W3 /EHsc)
+    #
+    # /openmp unlocks the existing #pragma omp parallel for matmul/attention
+    # loops. Without it, Windows builds were effectively single-threaded on
+    # the hottest path (GPU is not used — Vulkan is detection-only).
+    # Links vcomp*.dll; the packaging script copies it into the release zip
+    # when the VS toolchain provides one.
+    target_compile_options(moe_engine PRIVATE /O2 /arch:AVX2 /W3 /EHsc /openmp)
     target_link_libraries(moe_engine PRIVATE ws2_32 wininet)
 else()
     # Portable baseline: NO -march/-mavx2/-mfma/-mf16c. The SIMD kernels
