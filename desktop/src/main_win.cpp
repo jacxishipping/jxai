@@ -2069,7 +2069,7 @@ private:
             pFormatStatValue_, D2D1::RectF(cardX + 24.0f, cardY + 18.0f, cardX + cardW - 24.0f, cardY + 44.0f),
             pBrushAccentBlue_);
 
-        std::wstring subtitle = L"Hardware Diagnostics • Storage Pipeline • PagedAttention • Vulkan GPU Acceleration";
+        std::wstring subtitle = L"Hardware Diagnostics • CPU SIMD Inference • KV Slots (GPU compute not used yet)";
         current_rt_->DrawText(subtitle.c_str(), static_cast<UINT32>(subtitle.size()),
             pFormatChipText_, D2D1::RectF(cardX + 24.0f, cardY + 44.0f, cardX + cardW - 24.0f, cardY + 62.0f),
             pBrushTextMuted_);
@@ -2090,10 +2090,10 @@ private:
             pFormatAtlasCell_, D2D1::RectF(p1X + 12.0f, p1Y + 10.0f, p1X + colW - 12.0f, p1Y + 26.0f),
             pBrushAccentBlue_);
 
-        std::wstring p1Body = L"• Architecture: x86_64 AVX-512 + AVX2 FMA\r\n"
-                              L"• Vector Width: 256-bit SIMD Super-Blocks\r\n"
-                              L"• Threading: OpenMP Dynamic Pool\r\n"
-                              L"• Async Engine: Win32 IOCP Overlapped I/O";
+        std::wstring p1Body = L"• Architecture: x86_64 AVX2 FMA (runtime dispatch)\r\n"
+                              L"• Vector Width: 256-bit SIMD GEMV kernels\r\n"
+                              L"• Threading: OpenMP over matmul / attention\r\n"
+                              L"• Async Engine: Win32 IOCP overlapped reads";
         current_rt_->DrawText(p1Body.c_str(), static_cast<UINT32>(p1Body.size()),
             pFormatTerminalText_, D2D1::RectF(p1X + 12.0f, p1Y + 30.0f, p1X + colW - 12.0f, p1Y + rowH - 6.0f),
             pBrushTextPrimary_);
@@ -2145,15 +2145,15 @@ private:
         current_rt_->FillRoundedRectangle(p4Rrc, pBrushTerminalBg_);
         current_rt_->DrawRoundedRectangle(p4Rrc, pBrushTerminalBorder_, 1.0f);
 
-        std::wstring p4Title = L"4. GPU VULKAN 1.3 & QUANT ENGINE";
+        std::wstring p4Title = L"4. QUANT ENGINE (CPU) — GPU N/A";
         current_rt_->DrawText(p4Title.c_str(), static_cast<UINT32>(p4Title.size()),
             pFormatAtlasCell_, D2D1::RectF(p4X + 12.0f, p4Y + 10.0f, p4X + colW - 12.0f, p4Y + 26.0f),
             pBrushAccentPink_);
 
-        std::wstring p4Body = L"• Vulkan 1.3: Active (VK_KHR_cooperative_matrix)\r\n"
-                              L"• Subgroups: 32-thread Cooperative Matrix\r\n"
+        std::wstring p4Body = L"• Vulkan: detection only (no compute kernels)\r\n"
+                              L"• Inference: CPU AVX2 OpenMP — GPU idle\r\n"
                               L"• K-Quants: Q4_K, Q5_K, Q6_K, Q4_0, Q8_0\r\n"
-                              L"• Fallback: Zero-Latency AVX2 FMA Core";
+                              L"• Tip: smaller GGUF + OMP_NUM_THREADS=nproc";
         current_rt_->DrawText(p4Body.c_str(), static_cast<UINT32>(p4Body.size()),
             pFormatTerminalText_, D2D1::RectF(p4X + 12.0f, p4Y + 30.0f, p4X + colW - 12.0f, p4Y + rowH - 6.0f),
             pBrushTextPrimary_);
@@ -2310,15 +2310,15 @@ private:
             current_rt_->FillRoundedRectangle(t4Rrc, pBrushTerminalBg_);
             current_rt_->DrawRoundedRectangle(t4Rrc, pBrushTerminalBorder_, 1.0f);
 
-            std::wstring t4Title = L"4. GPU VULKAN 1.3        [AVAILABLE]";
+            std::wstring t4Title = L"4. GPU                    [NOT USED]";
             current_rt_->DrawText(t4Title.c_str(), static_cast<UINT32>(t4Title.size()),
                 pFormatAtlasCell_, D2D1::RectF(t4X + 12.0f, t4Y + 10.0f, t4X + colW - 12.0f, t4Y + 26.0f),
-                pBrushAccentGreen_);
+                pBrushAccentAmber_);
 
-            std::wstring t4Body = L"• Subsystem: SPIR-V Cooperative Matrix API\r\n"
-                                  L"• Quant Support: Q4_K, Q5_K, Q6_K, Q8_0\r\n"
-                                  L"• Dispatch: Non-blocking GPU Stream Compute\r\n"
-                                  L"• Host Bridge: Zero-overhead CPU/GPU handoff";
+            std::wstring t4Body = L"• Vulkan: device detection only\r\n"
+                                  L"• No CUDA / DirectML / Vulkan GEMV yet\r\n"
+                                  L"• All tokens run on CPU SIMD + OpenMP\r\n"
+                                  L"• GPU fans idle — that is expected today";
             current_rt_->DrawText(t4Body.c_str(), static_cast<UINT32>(t4Body.size()),
                 pFormatTerminalText_, D2D1::RectF(t4X + 12.0f, t4Y + 32.0f, t4X + colW - 12.0f, t4Y + rowH - 6.0f),
                 pBrushTextPrimary_);

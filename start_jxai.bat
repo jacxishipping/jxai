@@ -45,9 +45,15 @@ if not exist "%MODEL%" (
 set "ENGINE_HOST=127.0.0.1"
 set "ENGINE_PORT=8001"
 
+:: Use all logical cores for OpenMP matmul unless the user already pinned.
+if not defined OMP_NUM_THREADS (
+    for /f %%N in ('powershell -NoProfile -Command "(Get-CimInstance Win32_ComputerSystem).NumberOfLogicalProcessors"') do set "OMP_NUM_THREADS=%%N"
+)
+
 echo ===================================================================
-echo   JXAI native engine
+echo   JXAI native engine  (CPU SIMD + OpenMP — GPU not used yet)
 echo   Model:  %MODEL%
+echo   Threads: %OMP_NUM_THREADS%
 echo   UI:     http://%ENGINE_HOST%:%ENGINE_PORT%/
 echo ===================================================================
 echo.

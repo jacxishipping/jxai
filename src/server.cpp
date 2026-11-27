@@ -26,6 +26,9 @@
 #include <thread>
 #include <algorithm>
 #include <filesystem>
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
 
 namespace moe {
 
@@ -1602,7 +1605,15 @@ void HttpServer::handle_client(uintptr_t client_sock) {
            << "\"bypass_io\":" << (io.bypass_io_supported() ? "true" : "false") << ","
            << "\"direct_dma\":" << (io.direct_dma_active() ? "true" : "false") << ","
            << "\"vulkan_available\":" << (moe::VulkanComputeBackend::instance().is_available() ? "true" : "false") << ","
-           << "\"vulkan_device\":\"" << json_escape(moe::VulkanComputeBackend::instance().device_info().device_name) << "\""
+           << "\"vulkan_device\":\"" << json_escape(moe::VulkanComputeBackend::instance().device_info().device_name) << "\","
+           << "\"gpu_compute\":false,"
+#if defined(_OPENMP)
+           << "\"openmp\":true,"
+           << "\"openmp_max_threads\":" << omp_get_max_threads()
+#else
+           << "\"openmp\":false,"
+           << "\"openmp_max_threads\":1"
+#endif
            << "},"
            << "\"tiers\":{"
            << "\"vram_experts\":" << tm.vram_resident_count() << ","
