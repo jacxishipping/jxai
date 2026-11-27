@@ -324,7 +324,10 @@ results and the command that produced them.
   no dedicated Test 1 assertions. Opt in with `MOE_AVX512=1` only if you
   measure a win on your hardware.
 - **Vulkan:** device detection only. No Vulkan compute kernels are
-  implemented; inference runs on CPU. Do not expect GPU acceleration.
+  implemented; inference runs on CPU. Do not expect GPU acceleration —
+  a “GPU PC” still runs AVX2 + OpenMP on the host CPU. The Windows MSVC
+  build enables `/openmp` so multi-core matmul matches the Linux path;
+  set `OMP_NUM_THREADS` to pin the pool (default = all logical cores).
 - **I/O (Linux):** synchronous `pread()` + `mmap` with background prefetch
   of the next layer's experts while the current layer computes. This is
   **not** async I/O, io_uring, or DMA — older docs that said otherwise

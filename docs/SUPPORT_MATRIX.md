@@ -199,7 +199,9 @@ a slot does not silently share another slot's state.
    (Not an engine limitation per se — recorded here so it is not
    claimed as one.)
 6. **Vulkan is detection-only.** Device query exists; no compute kernels
-   are implemented. Inference always runs on CPU.
+   are implemented. Inference always runs on CPU (AVX2 + OpenMP). A GPU
+   PC does not accelerate tokens today — use a smaller GGUF and all CPU
+   cores (`OMP_NUM_THREADS`). The MSVC Windows build enables `/openmp`.
 7. **Web UI API key is memory-only** (no `localStorage` persistence since
    the security workstream). The key is re-entered each session and cleared
    on reload; in-page XSS could still read it from memory while loaded.

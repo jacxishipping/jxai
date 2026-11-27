@@ -257,19 +257,35 @@ bool ModelFile::open(const std::string& path, std::string& err_msg) {
     mapped_base_ = static_cast<const uint8_t*>(ptr);
 #endif
 
-#ifndef _WIN32
-    // Ask the kernel to start paging the model in now so the first chat
-    // tokens do not stall on a burst of major faults (smooth TTFT).
-    // Best-effort — ignore failures on kernels/filesystems that reject it.
+    // Warm the mapping so the first chat tokens do not stall on a burst of
+    // major page faults (smooth TTFT). Best-effort on every platform.
     if (mapped_base_ && file_size_ > 0) {
+#ifdef _WIN32
+        // PrefetchVirtualMemory (Win8+) — resolved dynamically so we do not
+        // hard-depend on a newer SDK. Ignore failure.
+        {
+            struct WinMemRange { void* VirtualAddress; SIZE_T NumberOfBytes; };
+            using PrefetchFn = BOOL (WINAPI*)(HANDLE, ULONG_PTR, WinMemRange*, ULONG);
+            HMODULE k32 = ::GetModuleHandleA("kernel32.dll");
+            auto prefetch = k32
+                ? reinterpret_cast<PrefetchFn>(::GetProcAddress(k32, "PrefetchVirtualMemory"))
+                : nullptr;
+            if (prefetch) {
+                WinMemRange range{};
+                range.VirtualAddress = const_cast<uint8_t*>(mapped_base_);
+                range.NumberOfBytes = static_cast<SIZE_T>(file_size_);
+                (void)prefetch(::GetCurrentProcess(), 1, &range, 0);
+            }
+        }
+#else
         (void)madvise(const_cast<uint8_t*>(mapped_base_), static_cast<size_t>(file_size_), MADV_WILLNEED);
 #ifdef MADV_HUGEPAGE
         (void)madvise(const_cast<uint8_t*>(mapped_base_), static_cast<size_t>(file_size_), MADV_HUGEPAGE);
 #endif
-        // MADV_WILLNEED is asynchronous. For large GGUFs (≥512 MiB) the first
-        // decode still stutters on major page faults. Synchronously touch
-        // every 16th page (64 KiB stride) so weights are resident before the
-        // first forward — load is slightly slower; tokens stream smoothly.
+#endif
+        // Async prefetch still leaves large GGUFs (≥512 MiB) stuttering on
+        // first decode. Synchronously touch every 16th page (64 KiB stride)
+        // so weights are resident before the first forward.
         constexpr uint64_t kPrefaultMinBytes = 512ull << 20;
         if (file_size_ >= kPrefaultMinBytes) {
             constexpr size_t kPage = 4096;
@@ -278,13 +294,12 @@ bool ModelFile::open(const std::string& path, std::string& err_msg) {
 #if defined(_OPENMP)
             #pragma omp parallel for schedule(static)
 #endif
-            for (size_t off = 0; off < n; off += kStride) {
-                volatile uint8_t c = mapped_base_[off];
+            for (long long off = 0; off < static_cast<long long>(n); off += static_cast<long long>(kStride)) {
+                volatile uint8_t c = mapped_base_[static_cast<size_t>(off)];
                 (void)c;
             }
         }
     }
-#endif
 
     // Check magic bytes for GGUF ("GGUF" = 0x46554747)
     if (std::memcmp(mapped_base_, "GGUF", 4) == 0) {
