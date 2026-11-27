@@ -52,7 +52,7 @@ jobs:
 
       - name: Package zip
         shell: pwsh
-        run: powershell -File scripts/package_windows.ps1 -OutDir dist -BuildDir build
+        run: pwsh -File scripts/package_windows.ps1 -OutDir dist -BuildDir build
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
