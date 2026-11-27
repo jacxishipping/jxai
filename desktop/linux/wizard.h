@@ -81,11 +81,11 @@ inline const WizardModel kWizardModels[] = {
     {
         "gemma3-1b",
         "Gemma-3-1B-it Q4_K_M",
-        "Verified gemma3 · ~0.8 GB",
-        "bartowski/gemma-3-1b-it-GGUF",
+        "Verified gemma3 · ~769 MB",
+        "ggml-org/gemma-3-1b-it-GGUF",
         "gemma-3-1b-it-Q4_K_M.gguf",
         "models/real/gemma-3-1b-it-Q4_K_M.gguf",
-        850000000ULL,
+        806058240ULL,
     },
     {
         "phi3-mini",
