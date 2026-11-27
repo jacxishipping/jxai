@@ -16,6 +16,16 @@
 #endif
 #endif
 
+// Portable L1 prefetch for weight-row scans. GCC/Clang: __builtin_prefetch.
+// MSVC: _mm_prefetch. Elsewhere: no-op.
+#if defined(__GNUC__) || defined(__clang__)
+#define MOE_PREFETCH(addr) __builtin_prefetch((addr), 0, 3)
+#elif defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
+#define MOE_PREFETCH(addr) _mm_prefetch(reinterpret_cast<const char*>(addr), _MM_HINT_T0)
+#else
+#define MOE_PREFETCH(addr) ((void)0)
+#endif
+
 #if defined(__linux__)
 #include <sys/sysinfo.h>  // sysinfo() for measured available RAM
 #endif
@@ -4410,7 +4420,7 @@ void matmul_quant_f32(
         // Prefetch weight rows ahead — large LM-heads (vocab≈150k) and
         // wide FFN downs otherwise stall on sequential DRAM traffic.
         if (r + 8 < rows) {
-            __builtin_prefetch(base + (r + 8) * row_bytes, 0, 3);
+            MOE_PREFETCH(base + (r + 8) * row_bytes);
         }
         out[r] = vec_dot_row_with_q8(type, base + r * row_bytes, x, x_q8_ptr, cols);
     }
@@ -4452,11 +4462,11 @@ void matmul_qkv_quant_f32(
         // Prefetch the weight row ~8 ahead within the same Q/K/V band.
         if (idx + 8 < total_rows) {
             if (idx + 8 < q_end && q_base) {
-                __builtin_prefetch(q_base + (idx + 8) * q_row_bytes, 0, 3);
+                MOE_PREFETCH(q_base + (idx + 8) * q_row_bytes);
             } else if (idx + 8 < k_end && k_base) {
-                __builtin_prefetch(k_base + (idx + 8 - q_end) * k_row_bytes, 0, 3);
+                MOE_PREFETCH(k_base + (idx + 8 - q_end) * k_row_bytes);
             } else if (v_base) {
-                __builtin_prefetch(v_base + (idx + 8 - k_end) * v_row_bytes, 0, 3);
+                MOE_PREFETCH(v_base + (idx + 8 - k_end) * v_row_bytes);
             }
         }
         if (idx < q_end) {
@@ -4499,8 +4509,8 @@ void matmul_swiglu_quant_f32(
 #endif
     for (int64_t r = 0; r < exp_dim; ++r) {
         if (r + 8 < exp_dim) {
-            __builtin_prefetch(gate_base + (r + 8) * gate_row_bytes, 0, 3);
-            __builtin_prefetch(up_base   + (r + 8) * up_row_bytes,   0, 3);
+            MOE_PREFETCH(gate_base + (r + 8) * gate_row_bytes);
+            MOE_PREFETCH(up_base   + (r + 8) * up_row_bytes);
         }
         float g = vec_dot_row_with_q8(gate_type, gate_base + r * gate_row_bytes, x, x_q8_ptr, cols);
         float u = vec_dot_row_with_q8(up_type,   up_base   + r * up_row_bytes,   x, x_q8_ptr, cols);

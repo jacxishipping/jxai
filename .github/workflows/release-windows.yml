@@ -1,0 +1,99 @@
+name: Windows release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      create_release:
+        description: "Create/update a GitHub Release for this run"
+        type: boolean
+        default: false
+      tag_name:
+        description: "Tag/name for the release when create_release is true (e.g. v0.1.0-windows)"
+        type: string
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  windows:
+    name: Build Windows x64 package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Configure (MSVC Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build moe_engine + moe_studio
+        run: cmake --build build --config Release --parallel --target moe_engine moe_studio
+
+      - name: Smoke moe_engine.exe
+        shell: pwsh
+        run: |
+          $exe = if (Test-Path build/Release/moe_engine.exe) { "build/Release/moe_engine.exe" } else { "build/moe_engine.exe" }
+          & $exe test
+          if ($LASTEXITCODE -ne 0) { throw "moe_engine test failed ($LASTEXITCODE)" }
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package zip
+        shell: pwsh
+        run: powershell -File scripts/package_windows.ps1 -OutDir dist -BuildDir build
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: jxai-windows-x64
+          path: dist/jxai-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Publish GitHub Release (tags)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: dist/jxai-windows-x64.zip
+          generate_release_notes: true
+          body: |
+            ## Windows x64 package
+
+            Download **jxai-windows-x64.zip**, unzip, pull a GGUF model, then run `start_jxai.bat`.
+
+            See `README-WINDOWS.txt` inside the zip.
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish GitHub Release (manual)
+        if: github.event_name == 'workflow_dispatch' && inputs.create_release == true
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag_name != '' && inputs.tag_name || format('windows-{0}', github.run_number) }}
+          name: Windows build ${{ inputs.tag_name != '' && inputs.tag_name || format('#{0}', github.run_number) }}
+          files: dist/jxai-windows-x64.zip
+          generate_release_notes: true
+          draft: false
+          body: |
+            ## Windows x64 package
+
+            Prebuilt `moe_engine.exe` + `moe_studio.exe` + web UI.
+
+            1. Download **jxai-windows-x64.zip**
+            2. Unzip
+            3. `moe_engine.exe pull Qwen/Qwen2.5-0.5B-Instruct-GGUF --out models\real`
+            4. Double-click `start_jxai.bat`
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

@@ -61,3 +61,46 @@ jobs:
       - name: Offline unit tests
         # Live API cases skip without MOE_MODEL; offline gates must pass.
         run: npm test
+
+  windows:
+    name: Windows MSVC package
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      - name: Configure (MSVC Release)
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build moe_engine + moe_studio
+        run: cmake --build build --config Release --parallel --target moe_engine moe_studio
+
+      - name: Smoke moe_engine.exe
+        shell: pwsh
+        run: |
+          $exe = if (Test-Path build/Release/moe_engine.exe) { "build/Release/moe_engine.exe" } else { "build/moe_engine.exe" }
+          & $exe test
+          if ($LASTEXITCODE -ne 0) { throw "moe_engine test failed ($LASTEXITCODE)" }
+
+      - name: Build web UI
+        working-directory: web
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package zip
+        shell: pwsh
+        run: powershell -File scripts/package_windows.ps1 -OutDir dist -BuildDir build
+
+      - name: Upload jxai-windows-x64.zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: jxai-windows-x64
+          path: dist/jxai-windows-x64.zip
+          if-no-files-found: error
+          retention-days: 14

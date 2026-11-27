@@ -4,6 +4,13 @@ project(moe_stream_engine LANGUAGES C CXX)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Static CRT on MSVC so the published .exe zip does not require a separate
+# Visual C++ Redistributable install for most users.
+if (MSVC)
+    cmake_policy(SET CMP0091 NEW)
+    set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+endif()
+
 include_directories(include)
 
 set(SOURCES
@@ -29,7 +36,7 @@ if (MSVC)
     # reports this via `moe_engine doctor`; on a non-AVX2 machine the
     # binary may fault (SIGILL) — the portable baseline + runtime dispatch
     # in src/quant.cpp applies to the GCC/Clang build below.
-    target_compile_options(moe_engine PRIVATE /O2 /arch:AVX2 /W3)
+    target_compile_options(moe_engine PRIVATE /O2 /arch:AVX2 /W3 /EHsc)
     target_link_libraries(moe_engine PRIVATE ws2_32 wininet)
 else()
     # Portable baseline: NO -march/-mavx2/-mfma/-mf16c. The SIMD kernels
@@ -50,7 +57,11 @@ endif()
 if (WIN32)
     add_executable(moe_studio WIN32 desktop/src/main_win.cpp)
     target_include_directories(moe_studio PRIVATE desktop/src include)
-    target_compile_options(moe_studio PRIVATE -O3 -Wall -Wextra)
+    if (MSVC)
+        target_compile_options(moe_studio PRIVATE /O2 /W3 /EHsc)
+    else()
+        target_compile_options(moe_studio PRIVATE -O3 -Wall -Wextra)
+    endif()
     target_link_libraries(moe_studio PRIVATE d2d1 dwrite dwmapi comctl32 ws2_32 ole32 windowscodecs)
 else()
     # Full-screen Linux/macOS terminal client for moe_engine serve.
