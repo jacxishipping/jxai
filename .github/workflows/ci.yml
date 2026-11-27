@@ -30,7 +30,8 @@ jobs:
       - name: jxai_term smoke
         run: |
           test -x ./build/jxai_term
-          ./build/jxai_term --help | grep -q "terminal client"
+          # --help writes to stderr (usage()), so merge streams for the grep.
+          ./build/jxai_term --help 2>&1 | grep -q "terminal client"
           # Non-TTY must refuse cleanly (exit 1), not crash.
           set +e
           ./build/jxai_term --skip-wizard </dev/null >/dev/null 2>term.err
