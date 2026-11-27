@@ -1166,6 +1166,16 @@ bool run_verification_tests() {
             check(!url_is_huggingface("https://huggingface.co.evil.com/x"), "url_is_huggingface: suffix domain");
             check(!effective_download_url_is_safe("https://127.0.0.1/x.gguf", err), "effective URL must reject loopback");
             check(!effective_download_url_is_safe("https://192.168.0.9/x.gguf", err), "effective URL must reject private IP");
+            // Signed CDN redirects (HF Xet / CloudFront-style) carry query strings.
+            check(effective_download_url_is_safe(
+                      "https://1.1.1.1/xet-bridge/file.gguf?Expires=1&Signature=abc%2Fdef&Key-Pair-Id=K", err),
+                  "effective URL allows signed query string on a public host");
+            check(!pull_url_is_safe(
+                      "https://1.1.1.1/file.gguf?Expires=1", err),
+                  "initial pull URL still rejects query strings");
+            check(!effective_download_url_is_safe(
+                      "https://192.168.0.9/file.gguf?Expires=1", err),
+                  "effective URL still rejects private host even with query");
         }
         // --- SHA-256 known vectors (FIPS 180-4) ---
         check(sha256_hex(reinterpret_cast<const uint8_t*>(""), 0) == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "SHA-256 empty string");

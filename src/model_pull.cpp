@@ -1137,7 +1137,15 @@ bool pull_url_host_is_public(const std::string& url, std::string& err_msg) {
 }
 
 bool effective_download_url_is_safe(const std::string& url, std::string& err_msg) {
-    if (!pull_url_is_safe(url, err_msg)) return false;
+    // Hugging Face CDN redirects (cdn-lfs / *.cdn.hf.co / Xet) use signed
+    // URLs with ?Expires=&Signature=… query strings. Caller-supplied pull
+    // URLs still reject `?` (pull_url_is_safe), but the post-redirect
+    // effective URL must allow a query/fragment while keeping the same
+    // HTTPS + public-host rules on the authority/path.
+    std::string base = url;
+    const size_t cut = base.find_first_of("?#");
+    if (cut != std::string::npos) base.resize(cut);
+    if (!pull_url_is_safe(base, err_msg)) return false;
     return pull_url_host_is_public(url, err_msg);
 }
 
