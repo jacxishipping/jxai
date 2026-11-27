@@ -1006,7 +1006,7 @@ public:
     void update(const uint8_t* data, size_t len) {
         total_len_ += len;
         while (len > 0) {
-            size_t take = std::min(len, sizeof(buf_) - buf_len_);
+            size_t take = (std::min)(len, sizeof(buf_) - buf_len_);
             std::memcpy(buf_ + buf_len_, data, take);
             buf_len_ += take;
             data += take;
@@ -1684,7 +1684,7 @@ bool pull_model_from_hub(
             double elapsed_sec = std::chrono::duration<double>(now - t0).count();
             double update_diff = std::chrono::duration<double>(now - last_update).count();
             if (update_diff >= 0.1 || downloaded == total_bytes) {
-                double mb_per_sec = (downloaded / (1024.0 * 1024.0)) / std::max(0.001, elapsed_sec);
+                double mb_per_sec = (downloaded / (1024.0 * 1024.0)) / (std::max)(0.001, elapsed_sec);
                 double eta_sec = (total_bytes > downloaded && mb_per_sec > 0.0)
                     ? (static_cast<double>(total_bytes - downloaded) / (mb_per_sec * 1024.0 * 1024.0)) : 0.0;
                 if (on_progress) on_progress(downloaded, total_bytes, mb_per_sec, eta_sec);

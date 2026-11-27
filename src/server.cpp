@@ -1580,7 +1580,7 @@ void HttpServer::handle_client(uintptr_t client_sock) {
            << "\"architecture\":\"" << json_escape(hp.arch) << "\","
            << "\"format\":\"" << json_escape(engine_.model_file().format()) << "\","
            << "\"active_slots\":" << engine_.active_slot_count() << ","
-           << "\"queued_requests\":" << std::max(0, static_cast<int>(active_requests_.load()) - 1) << ","
+           << "\"queued_requests\":" << (std::max)(0, static_cast<int>(active_requests_.load()) - 1) << ","
            << "\"hparams\":{"
            << "\"vocab_size\":" << hp.vocab_size << ","
            << "\"dim\":" << hp.dim << ","
