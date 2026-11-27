@@ -26,19 +26,41 @@ assuming a model, architecture, or quant type will work.
 
 | Requirement | Notes |
 |---|---|
-| C++20 compiler | GCC 11+ / Clang 14+ on Linux; MSVC on Windows. The Linux/macOS build is a **portable baseline with runtime AVX2 dispatch** — it runs on CPUs without AVX2. The MSVC build still requires AVX2 (see [Acceleration](#6-acceleration-and-io)). |
+| C++20 compiler | GCC 11+ / Clang 14+ on Linux; MSVC on Windows. The Linux/macOS build is a **portable baseline with runtime AVX2 dispatch** — it runs on CPUs without AVX2. The MSVC build still requires AVX2 (see [Acceleration](#7-acceleration-and-io)). |
 | CMake ≥ 3.20 | `cmake -S . -B build` |
 | Python 3 | Used by `start_jxai.sh` to read `moe_config.json`. No Python runtime is needed for inference. |
 | Node.js 22 + npm | Only to build the web UI (`cd web && npm ci && npm run build`). The launcher builds it automatically if the bundle is missing. |
-| A real GGUF model | The engine refuses to start without one — it will not silently forge a toy model as a backend. See [Model setup](#4-model-setup). |
-| Linux (primary) / Windows | Linux is the verified platform. Windows launchers exist (`run_studio.bat`, `run_open_webui.bat`, `install.bat`) but **were rewritten and have not been executed on a Windows host**; treat Windows as best-effort until someone runs them there. |
+| A real GGUF model | The engine refuses to start without one — it will not silently forge a toy model as a backend. See [Model setup](#5-model-setup). |
+| Linux (primary) / Windows | Linux is the verified platform. Prefer the [prebuilt Windows zip](#2-download-windows--no-build-required). Local `.bat` launchers also work after an MSVC build. |
 
 No Ollama installation is needed for the default path. No GPU is needed;
-inference runs on CPU (see [Acceleration](#6-acceleration-and-io)).
+inference runs on CPU (see [Acceleration](#7-acceleration-and-io)).
 
 ---
 
-## 2. Build
+## 2. Download (Windows — no build required)
+
+Prebuilt Windows x64 packages are produced by CI and tagged releases:
+
+- **GitHub Releases** — download `jxai-windows-x64.zip` from
+  [Releases](https://github.com/jacxishipping/jxai/releases) (created on
+  `v*` tags, or via the *Windows release* workflow).
+- **Actions artifacts** — every green CI run on `main` / PRs uploads the same
+  zip as artifact `jxai-windows-x64` (Actions → latest run → Artifacts).
+
+Unzip, pull a GGUF into `models\real\`, then double-click `start_jxai.bat`.
+See `README-WINDOWS.txt` inside the zip. Requires Windows 10/11 x64 with AVX2.
+
+```powershell
+.\moe_engine.exe pull Qwen/Qwen2.5-0.5B-Instruct-GGUF --out models\real
+.\start_jxai.bat
+# Web UI → http://127.0.0.1:8001/
+```
+
+To cut a new public zip from this repo: push a `v*` tag, or run
+**Actions → Windows release → Run workflow** with *create_release* checked.
+
+## 3. Build
 
 ```bash
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
@@ -52,6 +74,7 @@ Windows (MSVC):
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
 cmake --build build --config Release --parallel
 # Produces build\Release\moe_engine.exe
+# Optional portable zip: powershell -File scripts/package_windows.ps1
 ```
 
 Build the web UI (the launcher does this for you if `web/dist` is missing):
@@ -62,7 +85,7 @@ cd web && npm ci && npm run build
 
 ---
 
-## 3. Run — the default path
+## 4. Run — the default path
 
 ```bash
 ./start_jxai.sh
@@ -73,7 +96,7 @@ What it does, in order:
 1. Resolves a model: `--model <path>` → `MOE_MODEL` → `moe_config.json`
    `"model_path"` → `models/real/qwen2.5-0.5b-instruct-q4_0.gguf`.
    If no model file exists it **refuses to start** and tells you how to get
-   one (see [Model setup](#4-model-setup)).
+   one (see [Model setup](#5-model-setup)).
 2. Builds `build/moe_engine` if the binary is missing (unless `--no-build`).
 3. Builds the web UI bundle if `web/dist/index.html` is missing.
 4. Starts `moe_engine serve --model <model> --host 127.0.0.1 --port 8001
@@ -143,7 +166,7 @@ UI. It does not use Ollama.
 
 ---
 
-## 4. Model setup
+## 5. Model setup
 
 ### Download a model (Hugging Face)
 
@@ -201,7 +224,7 @@ of guessed.
 
 ---
 
-## 5. API
+## 6. API
 
 Base URL is the engine itself (`http://127.0.0.1:8001` via the launcher).
 All responses are JSON; errors are `{"error": "...", "message": "..."}`.
@@ -268,9 +291,9 @@ layer/expert index, not derived from the model.
 
 ---
 
-## 6. Acceleration and I/O
+## 7. Acceleration and I/O
 
-Honest numbers only — see [Benchmarks](#8-benchmarks) for the measured
+Honest numbers only — see [Benchmarks](#9-benchmarks) for the measured
 results and the command that produced them.
 
 - **CPU dispatch:** portable baseline build with runtime AVX2 dispatch on
@@ -295,7 +318,7 @@ results and the command that produced them.
 
 ---
 
-## 7. Web UI
+## 8. Web UI
 
 Served by the engine itself at `http://127.0.0.1:8001/` — same origin, so
 the UI calls relative `/v1/*` and `/health` URLs. No separate frontend
@@ -322,7 +345,7 @@ default) and do not load untrusted pages in the same browser profile.
 
 ---
 
-## 8. Benchmarks
+## 9. Benchmarks
 
 Reproducible with the built-in command (no model downloads — use a local
 model):
@@ -351,7 +374,7 @@ fixture, not a benchmark. Older README figures (e.g. "2247 tok/s",
 
 ---
 
-## 9. Security
+## 10. Security
 
 - **Loopback by default.** `moe_engine serve` binds `127.0.0.1` unless
   `--host` says otherwise. Binding a non-loopback address with no key
@@ -389,7 +412,7 @@ fixture, not a benchmark. Older README figures (e.g. "2247 tok/s",
 
 ---
 
-## 10. Tests
+## 11. Tests
 
 ```bash
 # Native engine: 11-section self-test (quant/dot, RoPE, GGUF parser,
@@ -417,7 +440,7 @@ a model) on push/PR to `main`.
 
 ---
 
-## 11. Known limitations
+## 12. Known limitations
 
 Full detail in [`docs/SUPPORT_MATRIX.md`](docs/SUPPORT_MATRIX.md) §8.
 The short list:
@@ -435,9 +458,11 @@ The short list:
 6. **IQ quantizers are simplified** (no importance matrix); IQ
    dequantizers drop remainders on direct calls.
 7. **Vulkan is device detection only**; no GPU compute kernels.
-8. **Windows launchers unexecuted** on a Windows host; Windows WinINet
-   pull path not compile-tested. Desktop UI config still defaults to
-   `models/test_qwen.gguf` (launchers refuse it).
+8. **Windows packages** are built by CI (MSVC) and published as
+   `jxai-windows-x64.zip`; treat end-to-end Windows *runtime* as
+   best-effort until someone validates a downloaded zip on a host.
+   Desktop UI config still defaults to `models/test_qwen.gguf`
+   (launchers refuse it).
 9. **True deepseek/deepseek2 arch unverified** (see §4).
 10. **No default model in a clean clone** — live API tests / launcher
     need a downloaded GGUF or `MOE_MODEL`.

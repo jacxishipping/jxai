@@ -1,5 +1,5 @@
 @echo off
-setlocal
+setlocal enabledelayedexpansion
 cd /d "%~dp0"
 title JXAI - Native Engine + MoE Studio Launcher
 
@@ -7,6 +7,35 @@ echo ===================================================================
 echo   JXAI: NATIVE C++ ENGINE (:8001) ^& MOE STUDIO
 echo ===================================================================
 echo.
+
+:: Resolve binaries: packaged zip (same folder) or local build tree.
+set "ENGINE="
+if exist "%~dp0moe_engine.exe" set "ENGINE=%~dp0moe_engine.exe"
+if not defined ENGINE if exist "%~dp0build\Release\moe_engine.exe" set "ENGINE=%~dp0build\Release\moe_engine.exe"
+if not defined ENGINE if exist "%~dp0build\moe_engine.exe" set "ENGINE=%~dp0build\moe_engine.exe"
+if not defined ENGINE (
+    echo [ERROR] moe_engine.exe not found. Use a release zip or build first.
+    pause
+    exit /b 1
+)
+
+set "STUDIO="
+if exist "%~dp0moe_studio.exe" set "STUDIO=%~dp0moe_studio.exe"
+if not defined STUDIO if exist "%~dp0build\Release\moe_studio.exe" set "STUDIO=%~dp0build\Release\moe_studio.exe"
+if not defined STUDIO if exist "%~dp0build\moe_studio.exe" set "STUDIO=%~dp0build\moe_studio.exe"
+if not defined STUDIO (
+    echo [ERROR] moe_studio.exe not found. Use a release zip or build first.
+    pause
+    exit /b 1
+)
+
+set "WEBDIR="
+if exist "%~dp0web\dist\index.html" set "WEBDIR=%~dp0web\dist"
+if not defined WEBDIR (
+    echo [ERROR] web\dist\index.html missing.
+    pause
+    exit /b 1
+)
 
 :: Pick a real GGUF model. Never start the engine without one, and never
 :: fall back to models\test_qwen.gguf (that file is the forged toy from
@@ -19,7 +48,7 @@ if defined MOE_MODEL (
 if not exist "%MODEL%" (
     echo [ERROR] Model file not found: %MODEL%
     echo Download one first, e.g.:
-    echo   .\build\moe_engine.exe pull Qwen/Qwen2.5-0.5B-Instruct-GGUF
+    echo   "%ENGINE%" pull Qwen/Qwen2.5-0.5B-Instruct-GGUF --out models\real
     echo then re-run with the file under models\real\, or set MOE_MODEL.
     echo Refusing to start with a synthetic toy model.
     pause
@@ -41,7 +70,7 @@ if %ERRORLEVEL% EQU 0 (
 if "%HEALTH_OK%"=="0" (
     echo [LAUNCH] Starting native C++ engine on http://127.0.0.1:8001 ...
     echo          Model: %MODEL%
-    start "JXAI Native Engine" /min "build\moe_engine.exe" serve --model "%MODEL%" --host 127.0.0.1 --port 8001 --web-dir "web\dist"
+    start "JXAI Native Engine" /min "%ENGINE%" serve --model "%MODEL%" --host 127.0.0.1 --port 8001 --web-dir "%WEBDIR%"
     set /a WAITED=0
     :wait_engine
     set "HEALTH_OK=0"
@@ -71,5 +100,5 @@ if "%HEALTH_OK%"=="0" (
 )
 
 echo [LAUNCH] Launching MoE Studio C++ Direct2D Native Desktop App...
-start "" "build\moe_studio.exe"
+start "" "%STUDIO%"
 echo [OK] MoE Studio is running. Built-in web UI: http://127.0.0.1:8001/

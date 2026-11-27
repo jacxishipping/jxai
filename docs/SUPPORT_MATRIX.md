@@ -221,7 +221,11 @@ a slot does not silently share another slot's state.
 - **Server `cache_slot` range** — server and engine both enforce user
   slots `[0, 63]` (server returns 400; engine rejects out-of-range).
 - **GitHub Actions CI** — `.github/workflows/ci.yml` runs
-  `moe_engine test` and `cd web && npm test` on push/PR to `main`.
+  `moe_engine test` and `cd web && npm test` on Linux, plus an MSVC
+  Windows job that builds `moe_engine.exe` / `moe_studio.exe`, packages
+  `jxai-windows-x64.zip`, and uploads it as a CI artifact. Tagged `v*`
+  pushes (and the *Windows release* workflow) publish the same zip to
+  GitHub Releases.
 - **Markdown link scheme filter** — `web/src/utils/markdownParser.tsx`
   only renders `http(s)` / `mailto` / relative / `#` hrefs; `javascript:`
   / `data:` / `vbscript:` links are shown as plain text.
